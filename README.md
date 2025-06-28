@@ -2,7 +2,7 @@
 
 A simple GUI application for planning astronomical observations. It allows you to:
 
-- Load celestial targets from a JSON or CSV/TSV file.
+- Load celestial targets from a JSON file.
 - Select an observation site and date.
 - Calculate visibility curves for each target.
 - Plot the results using Matplotlib.
