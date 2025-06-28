@@ -597,6 +597,8 @@ class MainWindow(QMainWindow):
         self.table_model.site = site
         self.table_model.layoutChanged.emit()
         self._replot_timer.start()
+        # Restart clock worker to update real-time altitudes for the new site
+        self._start_clock_worker()
     def __init__(self):
         super().__init__()
         self.last_payload = None
@@ -1142,12 +1144,6 @@ class MainWindow(QMainWindow):
 
         # Convert times array to that timezone
         times = [t.astimezone(tz) for t in mdates.num2date(data["times"])]
-        # Localise midnight for x-limits
-        midnight_dt = mdates.num2date(data["midnight"]).astimezone(tz)
-        self.ax_alt.set_xlim(midnight_dt - timedelta(hours=12),
-                             midnight_dt + timedelta(hours=12))
-        # Numeric x-limits for filtering shading/events
-        xmin, xmax = self.ax_alt.get_xlim()
         # Generate a distinct color for each target using the tab20 colormap
         num_targets = len(self.targets)
         cmap = plt.get_cmap('tab20', num_targets)
@@ -1245,6 +1241,17 @@ class MainWindow(QMainWindow):
                 ev[key] = dt
             except Exception:
                 continue
+
+        # Center plot on middle of night (DST-aware)
+        if "sunset" in ev and "sunrise" in ev:
+            center_dt = ev["sunset"] + (ev["sunrise"] - ev["sunset"]) / 2
+        else:
+            center_dt = mdates.num2date(data["midnight"]).astimezone(tz)
+        self.ax_alt.set_xlim(
+            center_dt - timedelta(hours=12),
+            center_dt + timedelta(hours=12),
+        )
+        xmin, xmax = self.ax_alt.get_xlim()
 
         # Segments to shade, only if both endpoints exist and start < end, and within window
         segments = [
