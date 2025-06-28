@@ -25,7 +25,7 @@ git clone https://github.com/yourusername/astroplanner.git
 cd astroplanner
 ```
 
-### Conda (recommended)
+### Conda
 
 Create and activate the environment from `environment.yml`:
 
