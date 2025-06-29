@@ -60,12 +60,16 @@ from astropy import units as u
 from astropy.coordinates import EarthLocation, SkyCoord, Angle
 from astropy.time import Time
 from astroplan import FixedTarget, Observer
+
 from astroquery.simbad import Simbad
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
 from timezonefinder import TimezoneFinder
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import warnings
+from astroplan.observer import TargetAlwaysUpWarning
+from typing import Any
 from matplotlib.figure import Figure
 
 # GUI imports (PySide6)
@@ -79,6 +83,7 @@ from PySide6.QtCore import (
     Slot,
     QSize,
     QTimer,
+    QItemSelectionModel,
 )
 from PySide6.QtGui import (
     QAction,
@@ -268,9 +273,6 @@ class AstronomyWorker(QThread):
             events = cached["events"]
         else:
             # compute astronomical dusk/dawn only if it occurs
-            import warnings
-            from astroplan.observer import TargetAlwaysUpWarning
-
             with warnings.catch_warnings():
                 warnings.filterwarnings('error', category=TargetAlwaysUpWarning)
                 try:
@@ -328,11 +330,14 @@ class AstronomyWorker(QThread):
             cache[key] = {"times": times, "events": events}
 
         # Start payload with cached/global events
-        payload: dict[str, list] = {k: v for k, v in {"times": jd, **events}.items()}
+        payload: dict[str, object] = {k: v for k, v in {"times": jd, **events}.items()}
         for tgt in self.targets:
             fixed = FixedTarget(name=tgt.name, coord=tgt.skycoord)
             altaz = observer.altaz(times, fixed)
-            payload[tgt.name] = {"altitude": altaz.alt.deg}     # type: ignore[arg-type]
+            payload[tgt.name] = {
+                "altitude": altaz.alt.deg,    # type: ignore[arg-type]
+                "azimuth": altaz.az.deg  # type: ignore[arg-type]
+            }
         # Tell the GUI which timezone we used
         payload["tz"] = site.timezone_name                      # type: ignore[arg-type]
         self.finished.emit(payload)
@@ -625,6 +630,61 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.table_view.sortByColumn(2, Qt.AscendingOrder))
         self.table_view.setDragDropMode(QTableView.InternalMove)
 
+        # Polar plot for alt-az projection
+        self.polar_canvas = FigureCanvas(Figure(figsize=(4, 4), tight_layout=True))
+        self.polar_ax = self.polar_canvas.figure.add_subplot(projection='polar')
+        self.polar_ax.set_theta_zero_location('N')
+        self.polar_ax.set_theta_direction(-1)
+        # Plot placeholders: targets, selected target, sun, moon
+        self.polar_scatter = self.polar_ax.scatter([], [], c='blue', marker='x', s=20, label='Targets', alpha=0.5, picker=True)
+        self.selected_scatter = self.polar_ax.scatter([], [], c='red', marker='x', s=40, alpha=1, label='Selected')
+        # Placeholder for selected-object path trace
+        self.selected_trace_line = None
+        # Placeholder for altitude limit circle
+        self.limit_circle = None
+        # Placeholder for celestial pole marker
+        self.pole_marker = None
+        self.sun_marker = self.polar_ax.scatter([], [], c='orange', marker='o', s=100, label='Sun')
+        self.moon_marker = self.polar_ax.scatter([], [], c='silver', marker='o', s=100, label='Moon')
+        self.polar_ax.set_rlim(0, 90)
+        self.polar_ax.set_rlabel_position(135)
+        # Will map scatter points to target indices for picking
+        self.polar_indices: list[int] = []
+        # Label cardinal directions on the polar plot
+        self.polar_ax.set_xticks([0, np.pi/2, np.pi, 3*np.pi/2])
+        self.polar_ax.set_xticklabels(['N', 'E', 'S', 'W'])
+        # Draw cardinal labels in white for visibility on dark background
+        self.polar_ax.tick_params(axis='x', colors='white')
+        # Radial ticks for altitudes 20°, 40°, 60°, and 80° (r = 90 - altitude), labels hidden
+        alt_ticks = [20, 40, 60, 80]
+        r_ticks = [90 - a for a in alt_ticks]
+        self.polar_ax.set_yticks(r_ticks)
+        # Hide radial tick labels for a cleaner look
+        self.polar_ax.set_yticklabels([])
+        self.polar_ax.tick_params(pad=1)
+        # Keep the polar axes background white
+        self.polar_ax.set_facecolor('white')
+        self.polar_canvas.figure.patch.set_alpha(0)
+        # Make the canvas widget itself transparent
+        self.polar_canvas.setAttribute(Qt.WA_TranslucentBackground)
+        self.polar_canvas.setStyleSheet("background: transparent;")
+        # Update polar when table selection changes
+        self.table_view.selectionModel().selectionChanged.connect(self._update_polar_selection)
+        # Also highlight visibility curves on selection
+        self.table_view.selectionModel().selectionChanged.connect(self._update_vis_selection)
+        # Holder for visibility line artists per target, with over-limit flag
+        self.vis_lines: list[tuple[str, Any, bool]] = []
+        # Connect pick event for polar scatter
+        self.polar_canvas.mpl_connect('pick_event', self._on_polar_pick)
+        # Make polar plot as narrow as its minimum size
+        self.polar_canvas.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+        # Cap maximum width so plot stays narrow
+        self.polar_canvas.setMaximumWidth(180)
+        # Tiny margins so E/W labels remain visible yet keep plot compact
+        self.polar_canvas.figure.subplots_adjust(left=0.02, right=0.98, bottom=0.06, top=0.94)
+        # Minimal internal padding
+        self.polar_canvas.figure.tight_layout(pad=0)
+
         # Debounce frequent requests for plotting
         self._replot_timer = QTimer(self)
         self._replot_timer.setSingleShot(True)
@@ -795,6 +855,7 @@ class MainWindow(QMainWindow):
         bottom_h.setSpacing(4)
         bottom_h.addWidget(left_w)
         bottom_h.addWidget(self.table_view)
+        bottom_h.addWidget(self.polar_canvas)
         bottom_h.setStretchFactor(left_w, 0)
         bottom_h.setStretchFactor(self.table_view, 1)
 
@@ -1137,6 +1198,10 @@ class MainWindow(QMainWindow):
     def _update_plot(self, data: dict):
         """Redraw the altitude plot with new data from the worker."""
         self.last_payload = data
+        # Keep full visibility data around for polar path plotting
+        self.full_payload = data
+        # Reset stored visibility lines for this redraw
+        self.vis_lines.clear()
         self.ax_alt.clear()
 
         # Localise the timezone
@@ -1169,22 +1234,24 @@ class MainWindow(QMainWindow):
             low_indices = np.where(low_mask)[0]
             for run in np.split(low_indices, np.where(np.diff(low_indices) != 1)[0] + 1):
                 if run.size:
-                    self.ax_alt.plot(
+                    line, = self.ax_alt.plot(
                         times_nums[run], alt[run],
                         color=color, linewidth=1.4,
                         linestyle="--", alpha=0.3, zorder=1
                     )
+                    self.vis_lines.append((tgt.name, line, False))
 
             # Solid segments: altitude >= limit
             high_mask = alt >= limit
             high_indices = np.where(high_mask)[0]
             for run in np.split(high_indices, np.where(np.diff(high_indices) != 1)[0] + 1):
                 if run.size:
-                    self.ax_alt.plot(
+                    line, = self.ax_alt.plot(
                         times_nums[run], alt[run],
                         color=color, linewidth=1.4,
                         linestyle="-", alpha=1.0, zorder=2
                     )
+                    self.vis_lines.append((tgt.name, line, True))
 
         # ------------------------------------------------------------------
         # Compute and cache current alt, az, sep for each target for the table
@@ -1283,7 +1350,7 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------------------
         # Red limiting‑altitude line
         # ------------------------------------------------------------------
-        self.ax_alt.axhline(self.limit_spin.value(), color="red", linestyle="--")
+        self.ax_alt.axhline(self.limit_spin.value(), color="red", linestyle="-", linewidth=0.5, alpha=0.4, label="Limit Altitude")
 
         # Reset line references
         self.sun_line = None
@@ -1331,7 +1398,7 @@ class MainWindow(QMainWindow):
 
         self.ax_alt.set_ylabel("Altitude (°)")
         self.ax_alt.set_xlabel("Time (local)")
-        self.ax_alt.legend(loc="upper right")
+        # self.ax_alt.legend(loc="upper right")
         self.ax_alt.set_ylim(0, 90)
         # Hour labels in the observer's local timezone
         self.ax_alt.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=tz))
@@ -1349,7 +1416,21 @@ class MainWindow(QMainWindow):
         now_utc = datetime.now(timezone.utc)
         self.utctime_label.setText(f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        self.plot_canvas.draw()
+        # Apply default alpha and width based on altitude limit
+        for name, line, is_over in self.vis_lines:
+            line.set_linewidth(1.4)
+            if is_over:
+                line.set_alpha(0.7)
+            else:
+                line.set_alpha(0.3)
+        # Highlight selected targets over limit
+        sel_rows = [i.row() for i in self.table_view.selectionModel().selectedRows()]
+        sel_names = [self.targets[i].name for i in sel_rows]
+        for name, line, is_over in self.vis_lines:
+            if name in sel_names and is_over:
+                line.set_alpha(1.0)
+                line.set_linewidth(2.5)
+        self.plot_canvas.draw_idle()
 
     @Slot()
     def _toggle_visibility(self):
@@ -1397,6 +1478,199 @@ class MainWindow(QMainWindow):
                     float(mdates.date2num(now)), color="magenta", linestyle=":", linewidth=1.2, label="Now"
                 )
             self.plot_canvas.draw_idle()
+            self._update_polar_positions(data)
+
+
+    @Slot()
+    def _update_polar_selection(self, selected, deselected):
+        """Update highlight for selected targets on polar plot."""
+        # Gather selected rows
+        sel_rows = [idx.row() for idx in self.table_view.selectionModel().selectedRows()]
+        # Prepare coordinates for selected targets
+        sel_coords = []
+        for i, tgt in enumerate(self.targets):
+            if i in sel_rows:
+                alt = self.table_model.current_alts[i] if i < len(self.table_model.current_alts) else None
+                az = self.table_model.current_azs[i] if i < len(self.table_model.current_azs) else None
+                if alt is not None and az is not None and alt > 0:
+                    theta = np.deg2rad(az)
+                    r = 90 - alt
+                    sel_coords.append((theta, r))
+        if sel_coords:
+            arr = np.array(sel_coords)
+            self.selected_scatter.set_offsets(arr)
+        else:
+            self.selected_scatter.set_offsets(np.empty((0, 2)))
+        # Plot the full sky path of the selected target from rise to set
+        if self.selected_trace_line:
+            try:
+                self.selected_trace_line.remove()
+            except Exception:
+                pass
+        self.selected_trace_line = None
+
+        if sel_rows:
+            idx0 = sel_rows[0]
+            name = self.targets[idx0].name
+            alt_arr = np.array(self.full_payload[name]["altitude"])
+            az_arr  = np.array(self.full_payload[name]["azimuth"])
+            # Only points above horizon
+            mask = alt_arr > 0
+            theta = np.deg2rad(az_arr[mask])
+            r     = 90 - alt_arr[mask]
+            trace, = self.polar_ax.plot(
+                theta, r,
+                color='green', linewidth=0.8, linestyle=':', alpha=0.7, zorder=1
+            )
+            self.selected_trace_line = trace
+
+    @Slot(object)
+    def _on_polar_pick(self, event):
+        """Select table row when a polar scatter point is clicked."""
+        if event.artist is not self.polar_scatter:
+            return
+        inds = event.ind
+        if not len(inds):
+            return
+        ptr = inds[0]
+        # Map to the actual target index
+        i = self.polar_indices[ptr]
+        # Clear previous selection and select the clicked row
+        sel_model = self.table_view.selectionModel()
+        sel_model.clearSelection()
+        idx = self.table_model.index(i, 0)
+        sel_model.select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        # Update selected scatter marker
+        alt = self.table_model.current_alts[i]
+        az = self.table_model.current_azs[i]
+        theta = np.deg2rad(az)
+        r = 90 - alt
+        self.selected_scatter.set_offsets(np.array([[theta, r]]))
+        self.polar_canvas.draw_idle()
+
+    @Slot(object, object)
+    def _update_vis_selection(self, selected, deselected):
+        """Adjust visibility plot alpha and width based on table selection."""
+        sel_rows = [idx.row() for idx in self.table_view.selectionModel().selectedRows()]
+        sel_names = [self.targets[i].name for i in sel_rows]
+        for name, line, is_over in self.vis_lines:
+            if name in sel_names and is_over:
+                line.set_alpha(1.0)
+                line.set_linewidth(2.5)
+            else:
+                line.set_linewidth(1.4)
+                if is_over:
+                    line.set_alpha(0.7)
+                else:
+                    line.set_alpha(0.3)
+        self.plot_canvas.draw_idle()
+
+    @Slot(dict)
+    def _update_polar_positions(self, data):
+        """Update all markers on the polar plot based on latest alt-az data."""
+        # Build coordinate list and track corresponding target indices
+        tgt_coords: list[tuple[float, float]] = []
+        self.polar_indices = []
+        for i, tgt in enumerate(self.targets):
+            alt = data.get('alts', [])[i] if i < len(data.get('alts', [])) else None
+            az = data.get('azs', [])[i] if i < len(data.get('azs', [])) else None
+            if alt is not None and az is not None and alt > 0:
+                theta = np.deg2rad(az)
+                r = 90 - alt
+                tgt_coords.append((theta, r))
+                self.polar_indices.append(i)
+        if tgt_coords:
+            arr = np.array(tgt_coords)
+            self.polar_scatter.set_offsets(arr)
+        else:
+            self.polar_scatter.set_offsets(np.empty((0, 2)))
+
+        # Sun position (via PyEphem)
+        eph_obs = ephem.Observer()
+        site = self.table_model.site
+        if site is not None:
+            eph_obs.lat = str(site.latitude)
+            eph_obs.lon = str(site.longitude)
+            eph_obs.elevation = site.elevation
+            eph_obs.date = data["now_local"]
+            sun = ephem.Sun(eph_obs)
+            sun_alt = sun.alt * 180.0 / math.pi  # type: ignore[arg-type]
+            sun_az = sun.az * 180.0 / math.pi    # type: ignore[arg-type]
+            if sun_alt > 0:
+                theta_sun = np.deg2rad(sun_az)
+                r_sun = 90 - sun_alt
+                self.sun_marker.set_offsets(np.array([[theta_sun, r_sun]]))
+            else:
+                self.sun_marker.set_offsets(np.empty((0, 2)))
+
+            # Moon position (via PyEphem)
+            eph_obs.date = data["now_local"]
+            moon = ephem.Moon(eph_obs)
+            moon_alt = moon.alt * 180.0 / math.pi  # type: ignore[arg-type]
+            moon_az = moon.az * 180.0 / math.pi    # type: ignore[arg-type]
+            if moon_alt > 0:
+                theta_moon = np.deg2rad(moon_az)
+                r_moon = 90 - moon_alt
+                self.moon_marker.set_offsets(np.array([[theta_moon, r_moon]]))
+            else:
+                self.moon_marker.set_offsets(np.empty((0, 2)))
+        else:
+            self.sun_marker.set_offsets(np.empty((0, 2)))
+            self.moon_marker.set_offsets(np.empty((0, 2)))
+
+        # Draw celestial pole marker (north or south pole if above horizon)
+        if self.pole_marker:
+            try:
+                # Remove previous marker(s)
+                if isinstance(self.pole_marker, (list, tuple)):
+                    for art in self.pole_marker:
+                        art.remove()
+                else:
+                    self.pole_marker.remove()
+            except Exception:
+                pass
+        site = self.table_model.site
+        if site:
+            lat = site.latitude
+            if lat >= 0:
+                pole_alt = lat
+                pole_az = 0.0
+            else:
+                pole_alt = -lat
+                pole_az = 180.0
+            r_pol = 90 - pole_alt
+            theta_pol = np.deg2rad(pole_az)
+            # Plot a purple circle with a dot inside for the celestial pole
+            circle = self.polar_ax.scatter(
+                [theta_pol], [r_pol],
+                facecolors='none', edgecolors='purple',
+                marker='o', s=80, linewidths=1.5, zorder=3, alpha=0.3
+            )
+            dot = self.polar_ax.scatter(
+                [theta_pol], [r_pol],
+                c='purple', marker='.', s=30, zorder=4, alpha=0.3
+            )
+            self.pole_marker = (circle, dot)
+        else:
+            self.pole_marker = None
+
+        # Draw or update altitude limit circle
+        if self.limit_circle:
+            try:
+                self.limit_circle.remove()
+            except Exception:
+                pass
+        lim = self.limit_spin.value()
+        r_lim = 90 - lim
+        theta_full = np.linspace(0, 2 * math.pi, 200)
+        r_full = np.full_like(theta_full, r_lim)
+        circle_line, = self.polar_ax.plot(
+            theta_full, r_full,
+            color='red', linestyle='-', linewidth=0.5, alpha=0.4
+        )
+        self.limit_circle = circle_line
+
+        self.polar_canvas.draw_idle()
 
     @Slot()
     def _toggle_dark(self):
@@ -1530,6 +1804,22 @@ class MainWindow(QMainWindow):
         # Replot visibility with updated limit
         if self.last_payload is not None:
             self._update_plot(self.last_payload)
+            # Update only the polar limit circle when limit altitude changes
+            lim = self.limit_spin.value()
+            r_lim = 90 - lim
+            # Remove old limit circle
+            if self.limit_circle:
+                try:
+                    self.limit_circle.remove()
+                except Exception:
+                    pass
+            theta_full = np.linspace(0, 2 * math.pi, 200)
+            r_full = np.full_like(theta_full, r_lim)
+            circle_line, = self.polar_ax.plot(
+                theta_full, r_full,
+                color='red', linestyle='-', linewidth=0.5, alpha=0.4
+            )
+            self.limit_circle = circle_line
 
 # --------------------------------------------------
 # --- Main entry -----------------------------------
@@ -1559,4 +1849,4 @@ if __name__ == "__main__":
             QMessageBox.critical(None, "Startup Load Error", f"Failed to load plan '{args.plan}': {e}")
 
     win.show()
-    sys.exit(app.exec())
+sys.exit(app.exec())
