@@ -84,6 +84,7 @@ from PySide6.QtCore import (
     QSize,
     QTimer,
     QItemSelectionModel,
+    QSettings,
 )
 from PySide6.QtGui import (
     QAction,
@@ -117,6 +118,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QInputDialog,
+    QColorDialog,
+    QDialog,
+    QDialogButtonBox,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -125,6 +129,7 @@ from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToo
 # --- Custom delegate to preserve model background for column 0 even when selected ---
 from PySide6.QtWidgets import QStyledItemDelegate, QStyle
 
+
 class NoSelectBackgroundDelegate(QStyledItemDelegate):
     """Delegate that preserves model background for column 0 even when selected."""
     def paint(self, painter, option, index):
@@ -132,6 +137,112 @@ class NoSelectBackgroundDelegate(QStyledItemDelegate):
         if option.state & QStyle.State_Selected:
             option.state &= ~QStyle.State_Selected
         super().paint(painter, option, index)
+
+# --- Table Settings Dialog ---
+class TableSettingsDialog(QDialog):
+    """Dialog to configure table parameters."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Table Settings")
+        layout = QFormLayout(self)
+        # Row height
+        self.row_height_spin = QSpinBox(self)
+        self.row_height_spin.setRange(10, 100)
+        init_h = parent.settings.value("table/rowHeight", 24, type=int)
+        self.row_height_spin.setValue(init_h)
+        layout.addRow("Row height:", self.row_height_spin)
+        # First-column width
+        self.first_col_width_spin = QSpinBox(self)
+        self.first_col_width_spin.setRange(50, 500)
+        init_w = parent.settings.value("table/firstColumnWidth", 100, type=int)
+        self.first_col_width_spin.setValue(init_w)
+        layout.addRow("First-column width:", self.first_col_width_spin)
+
+        # Font size
+        self.font_spin = QSpinBox(self)
+        self.font_spin.setRange(8, 16)
+        init_fs = parent.settings.value("table/fontSize", 11, type=int)
+        self.font_spin.setValue(init_fs)
+        layout.addRow("Font size:", self.font_spin)
+
+        # Column visibility
+        self.col_checks = {}
+        for idx, lbl in enumerate(parent.table_model.headers[:-1]):
+            chk = QCheckBox(lbl, self)
+            val = parent.settings.value(f"table/col{idx}", True, type=bool)
+            chk.setChecked(val)
+            layout.addRow(f"Show {lbl}:", chk)
+            self.col_checks[idx] = chk
+
+        # Highlight colors
+        default_colors = {"below":"#ff8080","limit":"#ffff80","above":"#b3ffb3"}
+        def _pick_color(key, btn):
+            col = QColorDialog.getColor(QColor(parent.settings.value(f"table/color/{key}", default_colors[key])), self, f"Pick {key} color")
+            if col.isValid():
+                btn.setStyleSheet(f"background:{col.name()}")
+        for key in ("below","limit","above"):
+            btn = QPushButton(f"{key.capitalize()} highlight", self)
+            init = parent.settings.value(f"table/color/{key}", default_colors[key])
+            btn.setStyleSheet(f"background:{init}")
+            btn.clicked.connect(lambda _,k=key,b=btn: _pick_color(k,b))
+            layout.addRow(f"{key.capitalize()} color:", btn)
+            setattr(self, f"{key}_btn", btn)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+    def accept(self):
+        s = self.parent().settings
+        s.setValue("table/rowHeight", self.row_height_spin.value())
+        s.setValue("table/firstColumnWidth", self.first_col_width_spin.value())
+        s.setValue("table/fontSize", self.font_spin.value())
+        for idx, chk in self.col_checks.items():
+            s.setValue(f"table/col{idx}", chk.isChecked())
+        for key in ("below","limit","above"):
+            btn = getattr(self, f"{key}_btn")
+            col = btn.palette().color(btn.backgroundRole()).name()
+            s.setValue(f"table/color/{key}", col)
+        self.parent()._apply_table_settings()
+        super().accept()
+
+# --- General Settings Dialog ---
+class GeneralSettingsDialog(QDialog):
+    """Configure default site, date, samples & clock refresh."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("General Settings")
+        layout = QFormLayout(self)
+
+        # Default Observatory
+        self.site_combo = QComboBox(self)
+        self.site_combo.addItems(parent.observatories.keys())
+        init_site = parent.settings.value("general/defaultSite", parent.obs_combo.currentText(), type=str)
+        self.site_combo.setCurrentText(init_site)
+        layout.addRow("Default Observatory:", self.site_combo)
+
+        # Visibility samples
+        self.ts_spin = QSpinBox(self)
+        self.ts_spin.setRange(50, 1000)
+        init_ts = parent.settings.value("general/timeSamples", 240, type=int)
+        self.ts_spin.setValue(init_ts)
+        layout.addRow("Visibility samples:", self.ts_spin)
+
+        # OK / Cancel
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def accept(self):
+        s = self.parent().settings
+        s.setValue("general/defaultSite", self.site_combo.currentText())
+        s.setValue("general/timeSamples", self.ts_spin.value())
+        self.parent()._apply_general_settings()
+        # Immediately re-run the plan so samples take effect
+        self.parent()._replot_timer.start()
+        super().accept()
 
 # Number of time samples for visibility curve (lower = faster)
 TIME_SAMPLES = 240 
@@ -237,6 +348,7 @@ class SessionSettings(BaseModel):
     date: QDate
     site: Site
     limit_altitude: float = 35.0  # deg
+    time_samples: int = 240       # user-configurable resolution
 
     # <‑‑ make Pydantic happy with Qt types
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -292,7 +404,8 @@ class AstronomyWorker(QThread):
                 except (TargetAlwaysUpWarning, Exception):
                     astro_ok = False
             # Build a ±12-hour grid around midnight (lower resolution for speed)
-            times = midnight + np.linspace(-12, 12, TIME_SAMPLES) * u.hour
+            ts = self.settings.time_samples
+            times = midnight + np.linspace(-12, 12, ts) * u.hour
             jd = times.plot_date
 
             # Precompute all solar/lunar/twilight event floats
@@ -648,6 +761,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Astronomical Observation Planner")
         self.resize(1100, 680)
 
+        # Persistent user settings
+        self.settings = QSettings("YourCompany", "AstroPlanner")
+
         # state holders
         self.targets: List[Target] = []
         self.worker: Optional[AstronomyWorker] = None  # keep reference!
@@ -663,6 +779,8 @@ class MainWindow(QMainWindow):
         self.table_view.verticalHeader().setVisible(False)
         self.table_view.setShowGrid(False)
         self.table_view.setModel(self.table_model)
+        # # Apply saved settings now that table_view exists
+        # self._load_settings()
         # Enable click‐to‐sort and default‐sort by HA (column 2)
         self.table_view.setSortingEnabled(True)
         self.table_view.horizontalHeader().setSectionsClickable(True)
@@ -749,6 +867,8 @@ class MainWindow(QMainWindow):
         # Ensure observatory names are fully visible
         self.obs_combo.setMinimumWidth(140)
         self.obs_combo.setMinimumContentsLength(8)
+        # Now that observatories and date widget exist, load settings
+        self._load_settings()
 
         self.lat_edit = QLineEdit("-24.59")
         self.lat_edit.setMaximumWidth(90)
@@ -1100,6 +1220,58 @@ class MainWindow(QMainWindow):
         target_menu = menubar.addMenu("&Targets")
         target_menu.addAction(self.add_act)
 
+        # Settings menu
+        settings_menu = menubar.addMenu("&Settings")
+        gen_act = QAction("General Settings…", self)
+        gen_act.triggered.connect(self.open_general_settings)
+        settings_menu.addAction(gen_act)
+        tbl_act = QAction("Table Settings…", self)
+        tbl_act.triggered.connect(self.open_table_settings)
+        settings_menu.addAction(tbl_act)
+
+    def _load_settings(self):
+        """Load saved settings and apply both Table and General."""
+        self._apply_table_settings()
+        self._apply_general_settings()
+
+    def _apply_table_settings(self):
+        """Apply table row height and first-column width."""
+        row_h = self.settings.value("table/rowHeight", 24, type=int)
+        self.table_view.verticalHeader().setDefaultSectionSize(row_h)
+        col_w = self.settings.value("table/firstColumnWidth", 100, type=int)
+        self.table_view.setColumnWidth(0, col_w)
+        # Font size
+        fs = self.settings.value("table/fontSize", 11, type=int)
+        fnt = self.table_view.font()
+        fnt.setPointSize(fs)
+        self.table_view.setFont(fnt)
+        # Column visibility
+        for col in range(self.table_model.columnCount()):
+            show = self.settings.value(f"table/col{col}", True, type=bool)
+            self.table_view.setColumnHidden(col, not show)
+        # Highlight colors in model
+        default_colors = {"below":"#ff8080","limit":"#ffff80","above":"#b3ffb3"}
+        self.table_model.highlight_colors = {
+            k: QColor(self.settings.value(f"table/color/{k}", default_colors[k]))
+            for k in default_colors
+        }
+
+    def open_table_settings(self):
+        """Open the Table Settings dialog."""
+        dlg = TableSettingsDialog(self)
+        dlg.exec()
+
+    def _apply_general_settings(self):
+        """Apply default site."""
+        s = self.settings
+        ds = s.value("general/defaultSite", type=str)
+        if ds in self.observatories:
+            self.obs_combo.setCurrentText(ds)
+
+    def open_general_settings(self):
+        dlg = GeneralSettingsDialog(self)
+        dlg.exec()
+
     @Slot()
     def _load_plan(self):
         """Load a saved plan (JSON targets)."""
@@ -1194,6 +1366,7 @@ class MainWindow(QMainWindow):
                 date=self.date_edit.date(),
                 site=site,
                 limit_altitude=float(self.limit_spin.value()),
+                time_samples=self.settings.value("general/timeSamples", 240, type=int),
             )
         except ValidationError as exc:
             QMessageBox.critical(self, "Invalid input", str(exc))
