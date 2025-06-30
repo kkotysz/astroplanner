@@ -146,7 +146,6 @@ class TargetTableView(QTableView):
         combinations are swallowed so Qt’s default handler never sees them.
         """
         key = event.key()
-        print(f"Key pressed: {key} (modifiers: {event.modifiers()})")
         # We care only about the two physical keys that map to “erase” on macOS
         if key in (Qt.Key_Backspace, Qt.Key_Delete):
             mods = event.modifiers()
@@ -180,38 +179,39 @@ class TableSettingsDialog(QDialog):
         # Row height
         self.row_height_spin = QSpinBox(self)
         self.row_height_spin.setRange(10, 100)
-        init_h = parent.settings.value("table/rowHeight", 24, type=int)
+        init_h = parent.settings.value("table/rowHeight", 24, type=int) if parent and hasattr(parent, "settings") else 24
         self.row_height_spin.setValue(init_h)
         layout.addRow("Row height:", self.row_height_spin)
         # First-column width
         self.first_col_width_spin = QSpinBox(self)
         self.first_col_width_spin.setRange(50, 500)
-        init_w = parent.settings.value("table/firstColumnWidth", 100, type=int)
+        init_w = parent.settings.value("table/firstColumnWidth", 100, type=int) if parent and hasattr(parent, "settings") else 100
         self.first_col_width_spin.setValue(init_w)
         layout.addRow("First-column width:", self.first_col_width_spin)
 
         # Font size
         self.font_spin = QSpinBox(self)
         self.font_spin.setRange(8, 16)
-        init_fs = parent.settings.value("table/fontSize", 11, type=int)
+        init_fs = parent.settings.value("table/fontSize", 11, type=int) if parent and hasattr(parent, "settings") else 11
         self.font_spin.setValue(init_fs)
         layout.addRow("Font size:", self.font_spin)
 
         # Column visibility
         self.col_checks = {}
-        for idx, lbl in enumerate(parent.table_model.headers[:-1]):
-            chk = QCheckBox(lbl, self)
-            val = parent.settings.value(f"table/col{idx}", True, type=bool)
-            chk.setChecked(val)
-            layout.addRow(f"Show {lbl}:", chk)
-            self.col_checks[idx] = chk
+        if parent is not None and hasattr(parent, "table_model"):
+            for idx, lbl in enumerate(parent.table_model.headers[:-1]):
+                chk = QCheckBox(lbl, self)
+                val = parent.settings.value(f"table/col{idx}", True, type=bool) if parent and hasattr(parent, "settings") else True
+                chk.setChecked(val)
+                layout.addRow(f"Show {lbl}:", chk)
+                self.col_checks[idx] = chk
 
         # Default sort column
         self.sort_combo = QComboBox(self)
         # Populate with column headers
-        headers = parent.table_model.headers
+        headers = parent.table_model.headers if parent and hasattr(parent, "table_model") else []
         self.sort_combo.addItems(headers)
-        init_sort = parent.settings.value("table/defaultSortColumn", 2, type=int)
+        init_sort = parent.settings.value("table/defaultSortColumn", 2, type=int) if parent and hasattr(parent, "settings") else 2
         # Clamp to valid range
         if 0 <= init_sort < len(headers):
             self.sort_combo.setCurrentIndex(init_sort)
@@ -220,12 +220,12 @@ class TableSettingsDialog(QDialog):
         # Highlight colors
         default_colors = {"below":"#ff8080","limit":"#ffff80","above":"#b3ffb3"}
         def _pick_color(key, btn):
-            col = QColorDialog.getColor(QColor(parent.settings.value(f"table/color/{key}", default_colors[key])), self, f"Pick {key} color")
+            col = QColorDialog.getColor(QColor(parent.settings.value(f"table/color/{key}", default_colors[key])), self, f"Pick {key} color") # type: ignore[arg-type]
             if col.isValid():
                 btn.setStyleSheet(f"background:{col.name()}")
         for key in ("below","limit","above"):
             btn = QPushButton(f"{key.capitalize()} highlight", self)
-            init = parent.settings.value(f"table/color/{key}", default_colors[key])
+            init = parent.settings.value(f"table/color/{key}", default_colors[key]) if parent and hasattr(parent, "settings") else default_colors[key]
             btn.setStyleSheet(f"background:{init}")
             btn.clicked.connect(lambda _,k=key,b=btn: _pick_color(k,b))
             layout.addRow(f"{key.capitalize()} color:", btn)
@@ -263,15 +263,15 @@ class GeneralSettingsDialog(QDialog):
 
         # Default Observatory
         self.site_combo = QComboBox(self)
-        self.site_combo.addItems(parent.observatories.keys())
-        init_site = parent.settings.value("general/defaultSite", parent.obs_combo.currentText(), type=str)
+        self.site_combo.addItems(parent.observatories.keys()) # type: ignore[attr-defined]
+        init_site = parent.settings.value("general/defaultSite", parent.obs_combo.currentText(), type=str) if parent and hasattr(parent, "settings") else "Custom"
         self.site_combo.setCurrentText(init_site)
         layout.addRow("Default Observatory:", self.site_combo)
 
         # Visibility samples
         self.ts_spin = QSpinBox(self)
         self.ts_spin.setRange(50, 1000)
-        init_ts = parent.settings.value("general/timeSamples", 240, type=int)
+        init_ts = parent.settings.value("general/timeSamples", 240, type=int) if parent and hasattr(parent, "settings") else 240
         self.ts_spin.setValue(init_ts)
         layout.addRow("Visibility samples:", self.ts_spin)
 
@@ -1237,15 +1237,6 @@ class MainWindow(QMainWindow):
         worker.updated.connect(lambda data, w=worker: self._handle_clock_update(data) if self.clock_worker is w else None)
         # Start the new worker
         worker.start()
-    def closeEvent(self, event):
-        # Stop background threads cleanly on exit
-        if hasattr(self, 'clock_worker') and self.clock_worker:
-            self.clock_worker.stop()
-        if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait()
-        super().closeEvent(event)
-
     def __del__(self):
         # Ensure clock worker thread is stopped before this object is destroyed
         if hasattr(self, 'clock_worker') and self.clock_worker:
