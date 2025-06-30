@@ -95,6 +95,7 @@ from PySide6.QtGui import (
     QFontDatabase,
     QIcon,
     QKeySequence,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -130,6 +131,35 @@ from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToo
 # --- Custom delegate to preserve model background for column 0 even when selected ---
 from PySide6.QtWidgets import QStyledItemDelegate, QStyle
 
+# --- Custom QTableView to manage delete shortcut (macOS only) ----------
+class TargetTableView(QTableView):
+    """
+    Emit `deleteRequested` when ⌘+Backspace is pressed, and suppress
+    Ctrl+Backspace so that only the macOS-native shortcut deletes rows.
+    """
+    deleteRequested = Signal()
+
+    def keyPressEvent(self, event):
+        """
+        Only a *pure* ⌘‑Backspace / ⌘‑Delete on macOS (or Ctrl‑Backspace / Ctrl‑Delete
+        on other platforms) triggers row deletion.  All other Backspace/Delete
+        combinations are swallowed so Qt’s default handler never sees them.
+        """
+        key = event.key()
+        print(f"Key pressed: {key} (modifiers: {event.modifiers()})")
+        # We care only about the two physical keys that map to “erase” on macOS
+        if key in (Qt.Key_Backspace, Qt.Key_Delete):
+            mods = event.modifiers()
+            # On macOS the Command (⌘) key is reported as Qt.ControlModifier,
+            # while the physical Control key is Qt.MetaModifier.  Everywhere
+            # else Ctrl is Qt.ControlModifier.
+            desired_mod = Qt.ControlModifier if sys.platform == "darwin" else Qt.ControlModifier
+            if mods == desired_mod:
+                self.deleteRequested.emit()
+            # Swallow the event in every case so nothing else processes it
+            return
+        # All other keys → default processing
+        super().keyPressEvent(event)
 
 class NoSelectBackgroundDelegate(QStyledItemDelegate):
     """Delegate that preserves model background for column 0 even when selected."""
@@ -789,7 +819,9 @@ class MainWindow(QMainWindow):
 
         # UI ------------------------------------------------
         self.table_model = TargetTableModel(self.targets, site=None)
-        self.table_view = QTableView(selectionBehavior=QTableView.SelectRows)
+        self.table_view = TargetTableView()
+        self.table_view.setSelectionBehavior(QTableView.SelectRows)
+        self.table_view.deleteRequested.connect(self._delete_selected_targets)
         # Use custom delegate for Name column to preserve its background on selection
         self.table_view.setItemDelegateForColumn(0, NoSelectBackgroundDelegate(self.table_view))
         # Make columns only as wide as their contents
@@ -1476,6 +1508,15 @@ class MainWindow(QMainWindow):
         self._refresh_table_buttons()
         # Debounce and update plot after removing a target
         self._replot_timer.start()
+
+    @Slot()
+    def _delete_selected_targets(self):
+        """Delete all currently selected targets via Ctrl/Cmd+Delete."""
+        # Collect selected rows, sort descending to avoid reindexing issues
+        sel = self.table_view.selectionModel().selectedRows()
+        rows = sorted((idx.row() for idx in sel), reverse=True)
+        for row in rows:
+            self._remove_target(row)
 
     def _refresh_table_buttons(self):
         # Place a Remove button in the 'Actions' column for each row
