@@ -60,6 +60,7 @@ from astropy import units as u
 from astropy.coordinates import EarthLocation, SkyCoord, Angle
 from astropy.time import Time
 from astroplan import FixedTarget, Observer
+from astroplan.observer import TargetAlwaysUpWarning
 
 from astroquery.simbad import Simbad
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
@@ -67,10 +68,18 @@ from timezonefinder import TimezoneFinder
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import warnings
-from astroplan.observer import TargetAlwaysUpWarning
-from typing import Any
 from matplotlib.figure import Figure
+from typing import Any
+import warnings
+import logging
+
+# ── Logging configuration ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,                              # default level
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # GUI imports (PySide6)
 from PySide6.QtCore import (
@@ -275,6 +284,19 @@ class GeneralSettingsDialog(QDialog):
         self.ts_spin.setValue(init_ts)
         layout.addRow("Visibility samples:", self.ts_spin)
 
+        # Polar-plot path options
+        self.sun_path_chk  = QCheckBox("Plot Sun path",  self)
+        self.moon_path_chk = QCheckBox("Plot Moon path", self)
+        self.obj_path_chk  = QCheckBox("Plot object paths", self)
+
+        self.sun_path_chk.setChecked(parent.settings.value("general/showSunPath",  True, type=bool)) if parent and hasattr(parent, "settings") else True
+        self.moon_path_chk.setChecked(parent.settings.value("general/showMoonPath", True, type=bool)) if parent and hasattr(parent, "settings") else True
+        self.obj_path_chk.setChecked(parent.settings.value("general/showObjPath",  True, type=bool)) if parent and hasattr(parent, "settings") else True
+
+        layout.addRow(self.sun_path_chk)
+        layout.addRow(self.moon_path_chk)
+        layout.addRow(self.obj_path_chk)
+
         # OK / Cancel
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         btns.accepted.connect(self.accept)
@@ -285,6 +307,9 @@ class GeneralSettingsDialog(QDialog):
         s = self.parent().settings
         s.setValue("general/defaultSite", self.site_combo.currentText())
         s.setValue("general/timeSamples", self.ts_spin.value())
+        s.setValue("general/showSunPath",  self.sun_path_chk.isChecked())
+        s.setValue("general/showMoonPath", self.moon_path_chk.isChecked())
+        s.setValue("general/showObjPath",  self.obj_path_chk.isChecked())
         self.parent()._apply_general_settings()
         # Immediately re-run the plan so samples take effect
         self.parent()._run_plan()
@@ -485,6 +510,7 @@ class AstronomyWorker(QThread):
             moon = ephem.Moon()
 
             sun_alts = []
+            sun_azs = []
             moon_alts = []
             moon_azs = []
             for t in times.datetime:
@@ -494,10 +520,12 @@ class AstronomyWorker(QThread):
                 moon.compute(eph_observer)
                 # convert radians to degrees
                 sun_alts.append(sun.alt * 180.0 / math.pi)
+                sun_azs.append(sun.az * 180.0 / math.pi)
                 moon_alts.append(moon.alt * 180.0 / math.pi)
                 moon_azs.append(moon.az * 180.0 / math.pi)
 
             events["sun_alt"] = np.array(sun_alts)
+            events["sun_az"] = np.array(sun_azs)
             events["moon_alt"] = np.array(moon_alts)
             events["moon_az"] = np.array(moon_azs)
             # Moon phase from PyEphem (0–100%)
@@ -514,7 +542,10 @@ class AstronomyWorker(QThread):
                 "azimuth": altaz.az.deg  # type: ignore[arg-type]
             }
         # Tell the GUI which timezone we used
-        payload["tz"] = site.timezone_name                      # type: ignore[arg-type]
+        payload["tz"] = site.timezone_name   
+        logger.info("AstronomyWorker finished (%d targets, date %s)",
+            len(self.targets),
+            obs_date.toString("yyyy-MM-dd"))                   # type: ignore[arg-type]
         self.finished.emit(payload)
 
 
@@ -813,6 +844,11 @@ class MainWindow(QMainWindow):
         # Persistent user settings
         self.settings = QSettings("YourCompany", "AstroPlanner")
 
+        # ── Polar-path visibility flags (persisted) ───────────────────────────
+        self.show_sun_path  = self.settings.value("general/showSunPath",  True, type=bool)
+        self.show_moon_path = self.settings.value("general/showMoonPath", True, type=bool)
+        self.show_obj_path  = self.settings.value("general/showObjPath",  True, type=bool)
+        
         # state holders
         self.targets: List[Target] = []
         self.worker: Optional[AstronomyWorker] = None  # keep reference!
@@ -855,6 +891,9 @@ class MainWindow(QMainWindow):
         self.pole_marker = None
         self.sun_marker = self.polar_ax.scatter([], [], c='orange', marker='o', s=100, label='Sun')
         self.moon_marker = self.polar_ax.scatter([], [], c='silver', marker='o', s=100, label='Moon')
+        # Place-holders for path lines
+        self.sun_path_line  = None
+        self.moon_path_line = None
         self.polar_ax.set_rlim(0, 90)
         self.polar_ax.set_rlabel_position(135)
         # Will map scatter points to target indices for picking
@@ -1341,6 +1380,12 @@ class MainWindow(QMainWindow):
     def _apply_general_settings(self):
         """Apply default site."""
         s = self.settings
+        self.show_sun_path  = self.settings.value("general/showSunPath",  True, type=bool)
+        self.show_moon_path = self.settings.value("general/showMoonPath", True, type=bool)
+        self.show_obj_path  = self.settings.value("general/showObjPath",  True, type=bool)
+        # If a payload is already cached, refresh the polar plot right away
+        if getattr(self, "last_payload", None):
+            self._update_polar_positions(self.last_payload)
         ds = s.value("general/defaultSite", type=str)
         if ds in self.observatories:
             self.obs_combo.setCurrentText(ds)
@@ -1453,6 +1498,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _run_plan(self):
         """Kick off the worker thread unless one is already running."""
+        logger.info("Starting new visibility calculation …")
         if self.worker and self.worker.isRunning():
             # Stop existing calculation and start a new one
             self.worker.quit()
@@ -1523,6 +1569,7 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def _update_plot(self, data: dict):
         """Redraw the altitude plot with new data from the worker."""
+        logger.info("Altitude plot refresh (%d targets)", len(self.targets))
         self.last_payload = data
         # Keep full visibility data around for polar path plotting
         self.full_payload = data
@@ -1837,6 +1884,16 @@ class MainWindow(QMainWindow):
             self.selected_scatter.set_offsets(arr)
         else:
             self.selected_scatter.set_offsets(np.empty((0, 2)))
+        # Skip drawing trace if user turned object paths off
+        if not self.show_obj_path:
+            if self.selected_trace_line:
+                try:
+                    self.selected_trace_line.remove()
+                except Exception:
+                    pass
+                self.selected_trace_line = None
+            self.polar_canvas.draw_idle()
+            return
         # Plot the full sky path of the selected target from rise to set
         if self.selected_trace_line:
             try:
@@ -1926,6 +1983,15 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def _update_polar_positions(self, data):
         """Update all markers on the polar plot based on latest alt-az data."""
+        # Clear any old path lines
+        for _attr in ("sun_path_line", "moon_path_line"):
+            line = getattr(self, _attr, None)
+            if line is not None:
+                try:
+                    line.remove()
+                except Exception:
+                    pass
+                setattr(self, _attr, None)
         tgt_coords = []
         self.polar_indices = []
         # Determine target alt/az lists (ClockWorker uses 'alts'/'azs', AstronomyWorker payload uses per-target entries)
@@ -1988,31 +2054,71 @@ class MainWindow(QMainWindow):
                 self.moon_marker.set_offsets(np.array([[theta_moon, r_moon]]))
             else:
                 self.moon_marker.set_offsets(np.empty((0, 2)))
+
+            # ── Sun path ───────────────────────────────────────────────
+            if self.show_sun_path and "sun_alt" in data and "sun_az" in data:
+                sun_alt = np.array(data["sun_alt"])
+                sun_az  = np.array(data["sun_az"])
+                mask    = sun_alt > 0
+                if mask.any():
+                    theta = np.deg2rad(sun_az[mask])
+                    r     = 90 - sun_alt[mask]
+
+                    # break the line where azimuth wraps
+                    dtheta   = np.abs(np.diff(theta))
+                    wrap_pts = np.where(dtheta > np.pi)[0] + 1
+                    theta = np.insert(theta, wrap_pts, np.nan)
+                    r     = np.insert(r,     wrap_pts, np.nan)
+
+                    self.sun_path_line, = self.polar_ax.plot(
+                        theta, r,
+                        color="gold", linewidth=0.9, linestyle="--", alpha=0.7, zorder=1,
+                    )
+
+            # ── Moon path ──────────────────────────────────────────────
+            if self.show_moon_path and "moon_alt" in data and "moon_az" in data:
+                moon_alt = np.array(data["moon_alt"])
+                moon_az  = np.array(data["moon_az"])
+                mask     = moon_alt > 0
+                if mask.any():
+                    theta = np.deg2rad(moon_az[mask])
+                    r     = 90 - moon_alt[mask]
+
+                    dtheta   = np.abs(np.diff(theta))
+                    wrap_pts = np.where(dtheta > np.pi)[0] + 1
+                    theta = np.insert(theta, wrap_pts, np.nan)
+                    r     = np.insert(r,     wrap_pts, np.nan)
+
+                    self.moon_path_line, = self.polar_ax.plot(
+                        theta, r,
+                        color="silver", linewidth=0.9, linestyle="--", alpha=0.7, zorder=1,
+                    )
+
             # Plot moon path on the polar plot
-            if hasattr(self, 'moon_path_line'):
-                try:
-                    self.moon_path_line.remove()
-                except Exception:
-                    pass
-            if hasattr(self, 'full_payload') and 'moon_alt' in self.full_payload and 'moon_az' in self.full_payload:
-                alt_arr = np.array(self.full_payload['moon_alt'])
-                az_arr = np.array(self.full_payload['moon_az'])
-                mask = alt_arr > 0
-                # Build continuous segments without wrapping artifacts
-                vis_indices = np.where(mask)[0]
-                theta_full = np.deg2rad(az_arr[mask])
-                r_full = 90 - alt_arr[mask]
-                # Insert NaNs at wrap discontinuities greater than π
-                dtheta = np.abs(np.diff(theta_full))
-                wrap_points = np.where(dtheta > np.pi)[0] + 1
-                for wp in reversed(wrap_points):
-                    theta_full = np.insert(theta_full, wp, np.nan)
-                    r_full = np.insert(r_full, wp, np.nan)
-                # Plot moon path on polar plot without straight wrap lines
-                self.moon_path_line, = self.polar_ax.plot(
-                    theta_full, r_full,
-                    color='silver', linestyle=':', linewidth=0.8, alpha=0.7, zorder=1
-                )
+            # if hasattr(self, 'moon_path_line'):
+            #     try:
+            #         self.moon_path_line.remove()
+            #     except Exception:
+            #         pass
+            # if hasattr(self, 'full_payload') and 'moon_alt' in self.full_payload and 'moon_az' in self.full_payload:
+            #     alt_arr = np.array(self.full_payload['moon_alt'])
+            #     az_arr = np.array(self.full_payload['moon_az'])
+            #     mask = alt_arr > 0
+            #     # Build continuous segments without wrapping artifacts
+            #     vis_indices = np.where(mask)[0]
+            #     theta_full = np.deg2rad(az_arr[mask])
+            #     r_full = 90 - alt_arr[mask]
+            #     # Insert NaNs at wrap discontinuities greater than π
+            #     dtheta = np.abs(np.diff(theta_full))
+            #     wrap_points = np.where(dtheta > np.pi)[0] + 1
+            #     for wp in reversed(wrap_points):
+            #         theta_full = np.insert(theta_full, wp, np.nan)
+            #         r_full = np.insert(r_full, wp, np.nan)
+            #     # Plot moon path on polar plot without straight wrap lines
+            #     self.moon_path_line, = self.polar_ax.plot(
+            #         theta_full, r_full,
+            #         color='silver', linestyle=':', linewidth=0.8, alpha=0.7, zorder=1
+            #     )
         else:
             self.sun_marker.set_offsets(np.empty((0, 2)))
             self.moon_marker.set_offsets(np.empty((0, 2)))
@@ -2068,7 +2174,9 @@ class MainWindow(QMainWindow):
             color='red', linestyle='-', linewidth=0.5, alpha=0.4
         )
         self.limit_circle = circle_line
-
+        logger.debug("Polar plot updated "
+                    "(Sun=%s, Moon=%s, Objects=%s)",
+                    self.show_sun_path, self.show_moon_path, self.show_obj_path)
         self.polar_canvas.draw_idle()
 
     @Slot()
