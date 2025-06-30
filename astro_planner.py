@@ -119,9 +119,19 @@ from PySide6.QtWidgets import (
     QInputDialog,
 )
 
-# Matplotlib Qt backend
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
+
+# --- Custom delegate to preserve model background for column 0 even when selected ---
+from PySide6.QtWidgets import QStyledItemDelegate, QStyle
+
+class NoSelectBackgroundDelegate(QStyledItemDelegate):
+    """Delegate that preserves model background for column 0 even when selected."""
+    def paint(self, painter, option, index):
+        # Disable the selected state to preserve background
+        if option.state & QStyle.State_Selected:
+            option.state &= ~QStyle.State_Selected
+        super().paint(painter, option, index)
 
 # Number of time samples for visibility curve (lower = faster)
 TIME_SAMPLES = 240 
@@ -314,6 +324,7 @@ class AstronomyWorker(QThread):
 
             sun_alts = []
             moon_alts = []
+            moon_azs = []
             for t in times.datetime:
                 # PyEphem expects UTC datetime
                 eph_observer.date = t
@@ -322,9 +333,11 @@ class AstronomyWorker(QThread):
                 # convert radians to degrees
                 sun_alts.append(sun.alt * 180.0 / math.pi)
                 moon_alts.append(moon.alt * 180.0 / math.pi)
+                moon_azs.append(moon.az * 180.0 / math.pi)
 
             events["sun_alt"] = np.array(sun_alts)
             events["moon_alt"] = np.array(moon_alts)
+            events["moon_az"] = np.array(moon_azs)
             # Moon phase from PyEphem (0–100%)
             events["moon_phase"] = moon.phase
             cache[key] = {"times": times, "events": events}
@@ -373,8 +386,11 @@ class TargetTableModel(QAbstractTableModel):
         tgt = self.targets[index.row()]
         col = index.column()
 
-        # Center-align all cell text
+        # Center-align all cell text except left-align names
         if role == Qt.TextAlignmentRole:
+            # Left-align names, center others
+            if index.column() == 0:
+                return Qt.AlignLeft | Qt.AlignVCenter
             return Qt.AlignCenter | Qt.AlignVCenter
         
         # Column 2: Hour Angle (hours, sexagesimal)
@@ -426,9 +442,26 @@ class TargetTableModel(QAbstractTableModel):
                 return QBrush(QColor("#fff5d4"))
             return QBrush(QColor("#ffd4d4"))
 
-        # Ensure text is visible against colored backgrounds
+        # Always render text in black for all columns
         if role == Qt.ForegroundRole:
             return QBrush(QColor("#000000"))
+
+        # FontRole: Use condensed bold font for Name, monospace for numeric columns
+        if role == Qt.FontRole:
+            if index.column() == 0:
+                # Condensed bold font for Name column
+                font = QFont("Arial Narrow", 13, QFont.Thin)
+                font.setStretch(95)
+                return font
+            # Monospace font for numeric columns to align digits
+            if index.column() in [1, 2, 3, 4, 5, 6]:
+                # Use the system fixed-width font
+                font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+                return font
+
+        # Tooltip for full name in Name column
+        if role == Qt.ToolTipRole and index.column() == 0:
+            return tgt.name
 
         # Tooltip for altitude status in column 3
         if role == Qt.ToolTipRole and col == 3 and self.site:
@@ -577,7 +610,12 @@ class MainWindow(QMainWindow):
                 min-width: 120px;
             }
             QTableView {
-                selection-background-color: #cce5ff;
+                /* Preserve custom cell backgrounds by disabling selection background */
+                selection-background-color: transparent;
+            }
+            QTableView::item:selected {
+                /* Ensure no override of model-set backgrounds on selection */
+                background: transparent;
             }
             QHeaderView::section {
                 background-color: #444444;
@@ -617,6 +655,8 @@ class MainWindow(QMainWindow):
         # UI ------------------------------------------------
         self.table_model = TargetTableModel(self.targets, site=None)
         self.table_view = QTableView(selectionBehavior=QTableView.SelectRows)
+        # Use custom delegate for Name column to preserve its background on selection
+        self.table_view.setItemDelegateForColumn(0, NoSelectBackgroundDelegate(self.table_view))
         # Make columns only as wide as their contents
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
@@ -1224,34 +1264,30 @@ class MainWindow(QMainWindow):
             color = colors[idx % len(colors)]
             limit = self.limit_spin.value()
 
-            # Only points above horizon
+            # Points above horizon
             vis_mask = alt > 0
             if not vis_mask.any():
                 continue
-
-            # Dashed segments: altitude >0 and < limit
-            low_mask = (alt > 0) & (alt < limit)
-            low_indices = np.where(low_mask)[0]
-            for run in np.split(low_indices, np.where(np.diff(low_indices) != 1)[0] + 1):
-                if run.size:
-                    line, = self.ax_alt.plot(
-                        times_nums[run], alt[run],
-                        color=color, linewidth=1.4,
-                        linestyle="--", alpha=0.3, zorder=1
-                    )
-                    self.vis_lines.append((tgt.name, line, False))
-
-            # Solid segments: altitude >= limit
+            # Dashed base path for full visible range
+            times_vis = times_nums[vis_mask]
+            alt_vis = alt[vis_mask]
+            base_line, = self.ax_alt.plot(
+                times_vis, alt_vis,
+                color=color, linewidth=1.4,
+                linestyle="--", alpha=0.3, zorder=1
+            )
+            self.vis_lines.append((tgt.name, base_line, False))
+            # Solid overlay for portions above limit
             high_mask = alt >= limit
-            high_indices = np.where(high_mask)[0]
-            for run in np.split(high_indices, np.where(np.diff(high_indices) != 1)[0] + 1):
-                if run.size:
-                    line, = self.ax_alt.plot(
-                        times_nums[run], alt[run],
-                        color=color, linewidth=1.4,
-                        linestyle="-", alpha=1.0, zorder=2
-                    )
-                    self.vis_lines.append((tgt.name, line, True))
+            if high_mask.any():
+                times_high = times_nums[high_mask]
+                alt_high = alt[high_mask]
+                solid_line, = self.ax_alt.plot(
+                    times_high, alt_high,
+                    color=color, linewidth=1.4,
+                    linestyle="-", alpha=1.0, zorder=2
+                )
+                self.vis_lines.append((tgt.name, solid_line, True))
 
         # ------------------------------------------------------------------
         # Compute and cache current alt, az, sep for each target for the table
@@ -1516,10 +1552,29 @@ class MainWindow(QMainWindow):
             az_arr  = np.array(self.full_payload[name]["azimuth"])
             # Only points above horizon
             mask = alt_arr > 0
-            theta = np.deg2rad(az_arr[mask])
-            r     = 90 - alt_arr[mask]
+            vis_idx = np.where(mask)[0]
+            if vis_idx.size == 0:
+                self.selected_trace_line = None
+                return
+            # Build full theta/r arrays by handling each visible segment separately
+            theta_full = np.array([], dtype=float)
+            r_full = np.array([], dtype=float)
+            # Split into contiguous runs of indices (rise/set segmentation)
+            runs = np.split(vis_idx, np.where(np.diff(vis_idx) != 1)[0] + 1)
+            for run in runs:
+                theta_seg = np.deg2rad(az_arr[run])
+                r_seg = 90 - alt_arr[run]
+                # Break at azimuth wrap discontinuities
+                dtheta = np.abs(np.diff(theta_seg))
+                wrap_pts = np.where(dtheta > np.pi)[0] + 1
+                for wp in reversed(wrap_pts):
+                    theta_seg = np.insert(theta_seg, wp, np.nan)
+                    r_seg = np.insert(r_seg, wp, np.nan)
+                # Append segment, then a NaN to separate from next
+                theta_full = np.concatenate([theta_full, theta_seg, [np.nan]])
+                r_full = np.concatenate([r_full, r_seg, [np.nan]])
             trace, = self.polar_ax.plot(
-                theta, r,
+                theta_full, r_full,
                 color='green', linewidth=0.8, linestyle=':', alpha=0.7, zorder=1
             )
             self.selected_trace_line = trace
@@ -1614,6 +1669,31 @@ class MainWindow(QMainWindow):
                 self.moon_marker.set_offsets(np.array([[theta_moon, r_moon]]))
             else:
                 self.moon_marker.set_offsets(np.empty((0, 2)))
+            # Plot moon path on the polar plot
+            if hasattr(self, 'moon_path_line'):
+                try:
+                    self.moon_path_line.remove()
+                except Exception:
+                    pass
+            if hasattr(self, 'full_payload') and 'moon_alt' in self.full_payload and 'moon_az' in self.full_payload:
+                alt_arr = np.array(self.full_payload['moon_alt'])
+                az_arr = np.array(self.full_payload['moon_az'])
+                mask = alt_arr > 0
+                # Build continuous segments without wrapping artifacts
+                vis_indices = np.where(mask)[0]
+                theta_full = np.deg2rad(az_arr[mask])
+                r_full = 90 - alt_arr[mask]
+                # Insert NaNs at wrap discontinuities greater than π
+                dtheta = np.abs(np.diff(theta_full))
+                wrap_points = np.where(dtheta > np.pi)[0] + 1
+                for wp in reversed(wrap_points):
+                    theta_full = np.insert(theta_full, wp, np.nan)
+                    r_full = np.insert(r_full, wp, np.nan)
+                # Plot moon path on polar plot without straight wrap lines
+                self.moon_path_line, = self.polar_ax.plot(
+                    theta_full, r_full,
+                    color='silver', linestyle=':', linewidth=0.8, alpha=0.7, zorder=1
+                )
         else:
             self.sun_marker.set_offsets(np.empty((0, 2)))
             self.moon_marker.set_offsets(np.empty((0, 2)))
