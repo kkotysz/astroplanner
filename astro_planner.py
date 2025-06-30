@@ -83,6 +83,7 @@ from PySide6.QtCore import (
     Slot,
     QSize,
     QTimer,
+    QCoreApplication,
     QItemSelectionModel,
     QSettings,
 )
@@ -143,6 +144,7 @@ class TableSettingsDialog(QDialog):
     """Dialog to configure table parameters."""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("Table Settings")
         layout = QFormLayout(self)
         # Row height
@@ -174,6 +176,17 @@ class TableSettingsDialog(QDialog):
             layout.addRow(f"Show {lbl}:", chk)
             self.col_checks[idx] = chk
 
+        # Default sort column
+        self.sort_combo = QComboBox(self)
+        # Populate with column headers
+        headers = parent.table_model.headers
+        self.sort_combo.addItems(headers)
+        init_sort = parent.settings.value("table/defaultSortColumn", 2, type=int)
+        # Clamp to valid range
+        if 0 <= init_sort < len(headers):
+            self.sort_combo.setCurrentIndex(init_sort)
+        layout.addRow("Default sort column:", self.sort_combo)
+
         # Highlight colors
         default_colors = {"below":"#ff8080","limit":"#ffff80","above":"#b3ffb3"}
         def _pick_color(key, btn):
@@ -204,6 +217,8 @@ class TableSettingsDialog(QDialog):
             btn = getattr(self, f"{key}_btn")
             col = btn.palette().color(btn.backgroundRole()).name()
             s.setValue(f"table/color/{key}", col)
+        # Save default sort column
+        s.setValue("table/defaultSortColumn", self.sort_combo.currentIndex())
         self.parent()._apply_table_settings()
         super().accept()
 
@@ -212,6 +227,7 @@ class GeneralSettingsDialog(QDialog):
     """Configure default site, date, samples & clock refresh."""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("General Settings")
         layout = QFormLayout(self)
 
@@ -241,7 +257,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("general/timeSamples", self.ts_spin.value())
         self.parent()._apply_general_settings()
         # Immediately re-run the plan so samples take effect
-        self.parent()._replot_timer.start()
+        self.parent()._run_plan()
         super().accept()
 
 # Number of time samples for visibility curve (lower = faster)
@@ -252,6 +268,7 @@ class ClockWorker(QThread):
 
     def __init__(self, site: Site, targets: list[Target], parent=None):
         super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
         self.site = site
         self.targets = targets
         self.running = True
@@ -366,6 +383,7 @@ class AstronomyWorker(QThread):
 
     def __init__(self, targets: List[Target], settings: SessionSettings, parent=None):
         super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
         self.targets = targets
         self.settings = settings
 
@@ -375,10 +393,11 @@ class AstronomyWorker(QThread):
         site = self.settings.site
         observer = Observer(location=site.to_earthlocation(), timezone=site.timezone_name)
 
-        # Caching key: site coords + elevation + calendar date
+        # Caching key: site coords + elevation + calendar date + sample count
         key = (
             site.latitude, site.longitude, site.elevation,
-            obs_date.toString("yyyy-MM-dd")
+            obs_date.toString("yyyy-MM-dd"),
+            self.settings.time_samples
         )
         cache = AstronomyWorker._cache
 
@@ -477,7 +496,8 @@ class TargetTableModel(QAbstractTableModel):
 
     def __init__(self, targets: List[Target], site: Optional[Site] = None):
         super().__init__()
-        self.targets = targets
+        self.setObjectName(self.__class__.__name__)
+        self._targets = targets
         self.site = site
         self.limit: float | None = None
         # Cached current values for table display
@@ -488,7 +508,7 @@ class TargetTableModel(QAbstractTableModel):
 
     # basic model plumbing
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
-        return len(self.targets)
+        return len(self._targets)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return len(self.headers)
@@ -496,7 +516,7 @@ class TargetTableModel(QAbstractTableModel):
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):  # noqa: N802
         if not index.isValid():
             return None
-        tgt = self.targets[index.row()]
+        tgt = self._targets[index.row()]
         col = index.column()
 
         # Center-align all cell text except left-align names
@@ -511,7 +531,7 @@ class TargetTableModel(QAbstractTableModel):
             now = Time.now()
             loc = self.site.to_earthlocation()
             lst = now.sidereal_time('apparent', loc.lon).hour    # LST in hours
-            ra_h = self.targets[index.row()].ra / 15.0           # RA in hours
+            ra_h = self._targets[index.row()].ra / 15.0           # RA in hours
             ha = (lst - ra_h + 24) % 24
             # Hour Angle in sexagesimal
             ha_angle = Angle(ha, u.hour)
@@ -531,13 +551,14 @@ class TargetTableModel(QAbstractTableModel):
             plot_css = colors[row % len(colors)]
             plot_color = QColor(plot_css)
 
-            # 1) Cause highlight in Alt column (col 3)
-            if col == 3:
+            # Highlight in Alt column (col 4) using user-configured colors
+            if col == 4:
+                hc = getattr(self, "highlight_colors", {})
                 if alt < 0:
-                    return QBrush(QColor("#ff8080"))  # red
+                    return QBrush(hc.get("below", QColor("#ff8080")))
                 if alt < self.limit:
-                    return QBrush(QColor("#ffff80"))  # yellow
-                return QBrush(QColor("#b3ffb3"))      # green
+                    return QBrush(hc.get("limit", QColor("#ffff80")))
+                return QBrush(hc.get("above", QColor("#b3ffb3")))
 
             # 2) Name cell colored by plot color (col 0)
             if col == 0:
@@ -558,19 +579,6 @@ class TargetTableModel(QAbstractTableModel):
         # Always render text in black for all columns
         if role == Qt.ForegroundRole:
             return QBrush(QColor("#000000"))
-
-        # FontRole: Use condensed bold font for Name, monospace for numeric columns
-        if role == Qt.FontRole:
-            if index.column() == 0:
-                # Condensed bold font for Name column
-                font = QFont("Arial Narrow", 13, QFont.Thin)
-                font.setStretch(95)
-                return font
-            # Monospace font for numeric columns to align digits
-            if index.column() in [1, 2, 3, 4, 5, 6]:
-                # Use the system fixed-width font
-                font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-                return font
 
         # Tooltip for full name in Name column
         if role == Qt.ToolTipRole and index.column() == 0:
@@ -630,9 +638,9 @@ class TargetTableModel(QAbstractTableModel):
         seps = getattr(self, "current_seps", [])
 
         if column == 0:
-            self.targets.sort(key=lambda t: t.name, reverse=reverse)
+            self._targets.sort(key=lambda t: t.name, reverse=reverse)
         elif column == 1:
-            self.targets.sort(key=lambda t: t.ra, reverse=reverse)
+            self._targets.sort(key=lambda t: t.ra, reverse=reverse)
         elif column == 2 and self.site:
             # Hour Angle
             now = Time.now()
@@ -640,21 +648,21 @@ class TargetTableModel(QAbstractTableModel):
             lst = now.sidereal_time('apparent', lon).hour
             def ha(tgt: Target) -> float:
                 return (float(lst) - (tgt.ra / 15.0) + 24.0) % 24.0                             # type: ignore[arg-type]
-            self.targets.sort(key=ha, reverse=reverse)
+            self._targets.sort(key=ha, reverse=reverse)
         elif column == 3:
-            self.targets.sort(key=lambda t: t.dec, reverse=reverse)
-        elif column == 4 and len(alts) == len(self.targets):
+            self._targets.sort(key=lambda t: t.dec, reverse=reverse)
+        elif column == 4 and len(alts) == len(self._targets):
             # Map by target name to avoid unhashable Target instances
-            mapping = dict(zip((t.name for t in self.targets), alts))
-            self.targets.sort(key=lambda t: mapping.get(t.name, float("-inf")), reverse=reverse)
-        elif column == 5 and len(azs) == len(self.targets):
+            mapping = dict(zip((t.name for t in self._targets), alts))
+            self._targets.sort(key=lambda t: mapping.get(t.name, float("-inf")), reverse=reverse)
+        elif column == 5 and len(azs) == len(self._targets):
             # Map by target name to avoid unhashable Target instances
-            mapping = dict(zip((t.name for t in self.targets), azs))
-            self.targets.sort(key=lambda t: mapping.get(t.name, float("-inf")), reverse=reverse)
-        elif column == 6 and len(seps) == len(self.targets):
+            mapping = dict(zip((t.name for t in self._targets), azs))
+            self._targets.sort(key=lambda t: mapping.get(t.name, float("-inf")), reverse=reverse)
+        elif column == 6 and len(seps) == len(self._targets):
             # Map by target name to avoid unhashable Target instances
-            mapping = dict(zip((t.name for t in self.targets), seps))
-            self.targets.sort(key=lambda t: mapping.get(t.name, float("-inf")), reverse=reverse)
+            mapping = dict(zip((t.name for t in self._targets), seps))
+            self._targets.sort(key=lambda t: mapping.get(t.name, float("-inf")), reverse=reverse)
         # Else: do nothing for Actions column
 
         self.layoutChanged.emit()
@@ -682,10 +690,10 @@ class TargetTableModel(QAbstractTableModel):
             return False
         rows = json.loads(bytes(mimedata.data("application/x-target-row")).decode())
         rows.sort(reverse=True)
-        insert_row = parent.row() if parent.isValid() else len(self.targets)
-        moving = [self.targets.pop(r) for r in rows]
+        insert_row = parent.row() if parent.isValid() else len(self._targets)
+        moving = [self._targets.pop(r) for r in rows]
         for tgt in reversed(moving):
-            self.targets.insert(insert_row, tgt)
+            self._targets.insert(insert_row, tgt)
         self.layoutChanged.emit()
         return True
 
@@ -751,12 +759,23 @@ class MainWindow(QMainWindow):
         self.elev_edit.setText(f"{site.elevation}")
         # Update the table model and replot with debounce
         self.table_model.site = site
+        # Clear stale altitude/azimuth/separation data to avoid coloring artifacts
+        self.table_model.current_alts.clear()
+        self.table_model.current_azs.clear()
+        self.table_model.current_seps.clear()
+        # Reset color mapping until new calculation assigns fresh colors
+        self.table_model.color_map.clear()
         self.table_model.layoutChanged.emit()
         self._replot_timer.start()
-        # Restart clock worker to update real-time altitudes for the new site
-        self._start_clock_worker()
+        # Restart clock worker to update real-time altitudes for the new site (only in interactive mode)
+        args = QCoreApplication.arguments()
+        if '--plan' not in args:
+            self._start_clock_worker()
     def __init__(self):
         super().__init__()
+        self.setObjectName(self.__class__.__name__)
+        # Initialize clock_worker early so callbacks can safely reference it
+        self.clock_worker = None
         self.last_payload = None
         self.setWindowTitle("Astronomical Observation Planner")
         self.resize(1100, 680)
@@ -779,13 +798,13 @@ class MainWindow(QMainWindow):
         self.table_view.verticalHeader().setVisible(False)
         self.table_view.setShowGrid(False)
         self.table_view.setModel(self.table_model)
+        # NOTE: Reapply table settings and default sort are now handled explicitly after layoutChanged.emit()
         # # Apply saved settings now that table_view exists
         # self._load_settings()
-        # Enable click‐to‐sort and default‐sort by HA (column 2)
+        # Enable click‐to‐sort
         self.table_view.setSortingEnabled(True)
         self.table_view.horizontalHeader().setSectionsClickable(True)
-        # Defer initial sort by HA to after the UI is shown
-        QTimer.singleShot(0, lambda: self.table_view.sortByColumn(2, Qt.AscendingOrder))
+        # Do not override user default sort here; let _load_settings() apply the saved sort
         self.table_view.setDragDropMode(QTableView.InternalMove)
 
         # Polar plot for alt-az projection
@@ -855,6 +874,16 @@ class MainWindow(QMainWindow):
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setMaximumWidth(100)
 
+        # Site coordinate inputs and limit-altitude
+        self.lat_edit = QLineEdit("-24.59")
+        self.lat_edit.setMaximumWidth(90)
+        self.lon_edit = QLineEdit("-70.19")
+        self.lon_edit.setMaximumWidth(90)
+        self.elev_edit = QLineEdit("2800")
+        self.elev_edit.setMaximumWidth(90)
+        self.limit_spin = QSpinBox(minimum=0, maximum=90, value=35)
+        self.limit_spin.setMaximumWidth(80)
+
         # Observatory selection
         self.observatories = {
             "OCM": Site(name="OCM", latitude=-24.59, longitude=-70.19, elevation=2800),
@@ -869,18 +898,6 @@ class MainWindow(QMainWindow):
         self.obs_combo.setMinimumContentsLength(8)
         # Now that observatories and date widget exist, load settings
         self._load_settings()
-
-        self.lat_edit = QLineEdit("-24.59")
-        self.lat_edit.setMaximumWidth(90)
-        # site/date widgets
-        self.lat_edit = QLineEdit("-24.59")
-        self.lat_edit.setMaximumWidth(90)
-        self.lon_edit = QLineEdit("-70.19")
-        self.lon_edit.setMaximumWidth(90)
-        self.elev_edit = QLineEdit("2800")
-        self.elev_edit.setMaximumWidth(90)
-        self.limit_spin = QSpinBox(minimum=0, maximum=90, value=35)
-        self.limit_spin.setMaximumWidth(80)
 
         # Debounced connections for date and limit spin
         self.date_edit.dateChanged.connect(lambda _: self._replot_timer.start())
@@ -1150,6 +1167,12 @@ class MainWindow(QMainWindow):
 
         # Apply custom GUI styles
         self._apply_styles()
+        # Build the menu bar and shortcuts
+        self._build_actions()
+        # Ensure threads are cleaned up on application exit
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._cleanup_threads)
 
         # Progress indicator for calculations
         self.progress = QProgressDialog("Calculating visibility...", "", 0, 0, self)
@@ -1160,26 +1183,41 @@ class MainWindow(QMainWindow):
         self.progress.setAutoReset(False)
         self.progress.hide()
 
-        # Start real-time clock updates for time labels
+        # Start real-time clock updates for time labels (skip in headless --plan mode)
         self.clock_worker = None
-        if self.table_model.site:
-            self._start_clock_worker()
-        self._clock_timer = QTimer(self)
-        self._clock_timer.timeout.connect(self._update_clock)
-        self._clock_timer.start(1000)
+        args = QCoreApplication.arguments()
+        if '--plan' not in args:
+            if self.table_model.site:
+                self._start_clock_worker()
+            self._clock_timer = QTimer(self)
+            self._clock_timer.timeout.connect(self._update_clock)
+            self._clock_timer.start(1000)
     def _start_clock_worker(self):
+        # Stop any existing clock worker
         if self.clock_worker:
             self.clock_worker.stop()
-        site = self.table_model.site
-        if site is None:
-            # Provide a default site if none is set
-            site = Site(name="Default", latitude=0.0, longitude=0.0, elevation=0.0)
-        self.clock_worker = ClockWorker(site, self.targets, self)
-        self.clock_worker.updated.connect(self._handle_clock_update)
-        self.clock_worker.start()
+        # Determine site, fallback to default if none
+        site = self.table_model.site or Site(name="Default", latitude=0.0, longitude=0.0, elevation=0.0)
+        # Create and track new worker instance
+        worker = ClockWorker(site, self.targets, self)
+        self.clock_worker = worker
+        # Connect updates only from this specific worker to avoid stale threads
+        worker.updated.connect(lambda data, w=worker: self._handle_clock_update(data) if self.clock_worker is w else None)
+        # Start the new worker
+        worker.start()
+    def closeEvent(self, event):
+        # Stop background threads cleanly on exit
+        if hasattr(self, 'clock_worker') and self.clock_worker:
+            self.clock_worker.stop()
+        if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
+            self.worker.quit()
+            self.worker.wait()
+        super().closeEvent(event)
 
-        # actions / shortcuts
-        self._build_actions()
+    def __del__(self):
+        # Ensure clock worker thread is stopped before this object is destroyed
+        if hasattr(self, 'clock_worker') and self.clock_worker:
+            self.clock_worker.stop()
 
     # .....................................................
     # menu & shortcuts
@@ -1232,14 +1270,30 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         """Load saved settings and apply both Table and General."""
         self._apply_table_settings()
+        # Apply default sort column
+        val = self.settings.value("table/defaultSortColumn", 2)
+        try:
+            default_sort = int(val)
+        except (TypeError, ValueError):
+            default_sort = 2
+        # Validate index
+        ncols = self.table_model.columnCount()
+        if 0 <= default_sort < ncols:
+            self.table_view.sortByColumn(default_sort, Qt.AscendingOrder)
         self._apply_general_settings()
 
     def _apply_table_settings(self):
         """Apply table row height and first-column width."""
         row_h = self.settings.value("table/rowHeight", 24, type=int)
         self.table_view.verticalHeader().setDefaultSectionSize(row_h)
+        # Lock row height and apply to all existing rows
+        for r in range(self.table_model.rowCount()):
+            self.table_view.setRowHeight(r, row_h)
         col_w = self.settings.value("table/firstColumnWidth", 100, type=int)
         self.table_view.setColumnWidth(0, col_w)
+        # Lock the first column so Stretch mode doesn’t override it
+        header = self.table_view.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
         # Font size
         fs = self.settings.value("table/fontSize", 11, type=int)
         fnt = self.table_view.font()
@@ -1272,6 +1326,21 @@ class MainWindow(QMainWindow):
         dlg = GeneralSettingsDialog(self)
         dlg.exec()
 
+    def _cleanup_threads(self):
+        """Stop background threads cleanly on exit."""
+        if hasattr(self, 'clock_worker') and self.clock_worker:
+            self.clock_worker.stop()
+        if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
+            self.worker.quit()
+            self.worker.wait()
+
+    def _apply_default_sort(self):
+        """Apply default sort column from settings."""
+        default_sort = self.settings.value("table/defaultSortColumn", 2, type=int)
+        cols = self.table_model.columnCount()
+        if 0 <= default_sort < cols:
+            self.table_view.sortByColumn(default_sort, Qt.AscendingOrder)
+
     @Slot()
     def _load_plan(self):
         """Load a saved plan (JSON targets)."""
@@ -1287,6 +1356,9 @@ class MainWindow(QMainWindow):
             for entry in data:
                 self.targets.append(Target(**entry))
             self.table_model.layoutChanged.emit()
+            # Reapply settings & default sort after layout change
+            self._apply_table_settings()
+            self._apply_default_sort()
             self._refresh_table_buttons()
             # Automatically redraw the visibility plot after loading a plan
             self._run_plan()
@@ -1328,6 +1400,9 @@ class MainWindow(QMainWindow):
 
         # Refresh table view after successful load
         self.table_model.layoutChanged.emit()
+        # Reapply settings & default sort after layout change
+        self._apply_table_settings()
+        self._apply_default_sort()
         self._refresh_table_buttons()
 
     @Slot()
@@ -1345,6 +1420,9 @@ class MainWindow(QMainWindow):
             return
         self.targets.append(target)
         self.table_model.layoutChanged.emit()
+        # Reapply settings & default sort after layout change
+        self._apply_table_settings()
+        self._apply_default_sort()
         self._refresh_table_buttons()
         # Debounce and update plot after adding a target
         self._replot_timer.start()
@@ -1392,6 +1470,9 @@ class MainWindow(QMainWindow):
     def _remove_target(self, row: int):
         del self.targets[row]
         self.table_model.layoutChanged.emit()
+        # Reapply settings & default sort after layout change
+        self._apply_table_settings()
+        self._apply_default_sort()
         self._refresh_table_buttons()
         # Debounce and update plot after removing a target
         self._replot_timer.start()
@@ -1404,7 +1485,7 @@ class MainWindow(QMainWindow):
             btn.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
             btn.setToolTip("Remove")
             btn.setAutoRaise(True)
-            btn.clicked.connect(lambda _, r=row: self._remove_target(r))
+            btn.clicked.connect(lambda _, row=row: self._remove_target(row))
             self.table_view.setIndexWidget(idx, btn)
 
     @Slot(dict)
@@ -1500,6 +1581,18 @@ class MainWindow(QMainWindow):
         self.table_model.current_azs = current_azs
         self.table_model.current_seps = current_seps
         self.table_model.layoutChanged.emit()
+
+        # Compute and display current sun and moon altitudes
+        sun_obs = ephem.Sun(eph_obs)
+        moon_obs = ephem.Moon(eph_obs)
+        sun_alt_curr = sun_obs.alt * 180.0 / math.pi
+        moon_alt_curr = moon_obs.alt * 180.0 / math.pi
+        self.sun_alt_label.setText(f"{sun_alt_curr:.1f}°")
+        self.moon_alt_label.setText(f"{moon_alt_curr:.1f}°")
+
+        # Compute and display sidereal time
+        sidereal = Time(now_dt).sidereal_time('apparent', site.to_earthlocation().lon)
+        self.sidereal_label.setText(sidereal.to_string(unit=u.hour, sep=":", pad=True, precision=0))
 
         # ------------------------------------------------------------------
         # Twilight shading (civil, nautical, astronomical), only when valid
@@ -1616,6 +1709,7 @@ class MainWindow(QMainWindow):
         self.ax_alt.set_title(f"Date: {date_str}")
         # Current time indicator
         now = datetime.now(tz)
+        data["now_local"] = now
         self.now_line = self.ax_alt.axvline(float(mdates.date2num(now)), color="magenta", linestyle=":", linewidth=1.2, label="Now")
 
         # Update time labels
@@ -1640,6 +1734,7 @@ class MainWindow(QMainWindow):
                 line.set_alpha(1.0)
                 line.set_linewidth(2.5)
         self.plot_canvas.draw_idle()
+        self._update_polar_positions(data)
 
     @Slot()
     def _toggle_visibility(self):
@@ -1728,6 +1823,7 @@ class MainWindow(QMainWindow):
             vis_idx = np.where(mask)[0]
             if vis_idx.size == 0:
                 self.selected_trace_line = None
+                self.polar_canvas.draw_idle()
                 return
             # Build full theta/r arrays by handling each visible segment separately
             theta_full = np.array([], dtype=float)
@@ -1751,6 +1847,8 @@ class MainWindow(QMainWindow):
                 color='green', linewidth=0.8, linestyle=':', alpha=0.7, zorder=1
             )
             self.selected_trace_line = trace
+        # Redraw the polar canvas to reflect changes
+        self.polar_canvas.draw_idle()
 
     @Slot(object)
     def _on_polar_pick(self, event):
@@ -1796,22 +1894,38 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def _update_polar_positions(self, data):
         """Update all markers on the polar plot based on latest alt-az data."""
-        # Build coordinate list and track corresponding target indices
-        tgt_coords: list[tuple[float, float]] = []
+        tgt_coords = []
         self.polar_indices = []
+        # Determine target alt/az lists (ClockWorker uses 'alts'/'azs', AstronomyWorker payload uses per-target entries)
+        if "alts" in data and "azs" in data:
+            alt_list = data["alts"]
+            az_list  = data["azs"]
+        else:
+            # Fallback to the instantaneous values we already computed
+            alt_list = self.table_model.current_alts
+            az_list  = self.table_model.current_azs
+
         for i, tgt in enumerate(self.targets):
-            alt = data.get('alts', [])[i] if i < len(data.get('alts', [])) else None
-            az = data.get('azs', [])[i] if i < len(data.get('azs', [])) else None
-            if alt is not None and az is not None and alt > 0:
+            if i < len(alt_list) and i < len(az_list):
+                alt = alt_list[i]
+                az  = az_list[i]
+                # only plot if above horizon
+                if alt is None or alt <= 0:
+                    continue
                 theta = np.deg2rad(az)
-                r = 90 - alt
+                r     = 90 - alt
                 tgt_coords.append((theta, r))
                 self.polar_indices.append(i)
+
+        # feed into the scatter
         if tgt_coords:
-            arr = np.array(tgt_coords)
-            self.polar_scatter.set_offsets(arr)
+            coords_arr = np.array(tgt_coords)
         else:
-            self.polar_scatter.set_offsets(np.empty((0, 2)))
+            coords_arr = np.empty((0, 2))
+        self.polar_scatter.set_offsets(coords_arr)
+
+        # (Sun, Moon and pole markers are handled elsewhere in your update_plot,
+        # so you don’t need to touch those here.)
 
         # Sun position (via PyEphem)
         eph_obs = ephem.Observer()
@@ -2096,6 +2210,8 @@ if __name__ == "__main__":
                 win.targets.append(Target(**entry))
             win.table_model.layoutChanged.emit()
             win._refresh_table_buttons()
+            win._apply_table_settings()
+            win._apply_default_sort()
             # Now run the plot (also sets the site and refreshes buttons)
             win._run_plan()
         except Exception as e:
