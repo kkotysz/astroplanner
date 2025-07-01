@@ -52,7 +52,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
-# Third-party imports
 import numpy as np
 import pytz
 import ephem
@@ -72,6 +71,7 @@ from matplotlib.figure import Figure
 from typing import Any
 import warnings
 import logging
+import shiboken6 as shb   # PySide6 helper (isValid,objId)
 
 # ── Logging configuration ─────────────────────────────────────────────
 logging.basicConfig(
@@ -88,6 +88,7 @@ from PySide6.QtCore import (
     QModelIndex,
     Qt,
     QThread,
+    QMutex, QWaitCondition,
     Signal,
     Slot,
     QSize,
@@ -327,6 +328,9 @@ class ClockWorker(QThread):
         self.site = site
         self.targets = targets
         self.running = True
+        # Interruptible sleep infrastructure
+        self._mutex = QMutex()
+        self._wait_cond = QWaitCondition()
 
     def run(self):
         tz_name = self.site.timezone_name
@@ -372,10 +376,14 @@ class ClockWorker(QThread):
                 "seps": current_seps
             })
 
-            self.msleep(1000)
+            # Sleep until either 1 s passes or stop() wakes us early
+            self._mutex.lock()
+            self._wait_cond.wait(self._mutex, 1000)
+            self._mutex.unlock()
 
     def stop(self):
         self.running = False
+        self._wait_cond.wakeAll()  # interrupt the 1‑second wait
         self.quit()
         self.wait()
 
@@ -789,7 +797,7 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
                 padding: 2px 4px;
                 min-height: 22px;
-                min-width: 120px;
+                min-width: 40px;
             }
             QTableView {
                 /* Preserve custom cell backgrounds by disabling selection background */
@@ -828,16 +836,18 @@ class MainWindow(QMainWindow):
         self.table_model.color_map.clear()
         self.table_model.layoutChanged.emit()
         self._replot_timer.start()
-        # Restart clock worker to update real-time altitudes for the new site (only in interactive mode)
-        args = QCoreApplication.arguments()
-        if '--plan' not in args:
-            self._start_clock_worker()
+        # Restart clock worker to update real-time altitudes for the new site
+        self._start_clock_worker()
     def __init__(self):
         super().__init__()
         self.setObjectName(self.__class__.__name__)
         # Initialize clock_worker early so callbacks can safely reference it
         self.clock_worker = None
+        # Keep references to every ClockWorker we create so they can all be stopped
+        self._clock_workers: list[ClockWorker] = []
         self.last_payload = None
+        # Prevent new workers once we start shutting down
+        self._shutting_down = False
         self.setWindowTitle("Astronomical Observation Planner")
         self.resize(1100, 680)
 
@@ -943,17 +953,17 @@ class MainWindow(QMainWindow):
         # Initialize to current observing night
         self._change_to_today()
         self.date_edit.setCalendarPopup(True)
-        self.date_edit.setMaximumWidth(100)
+        self.date_edit.setMaximumWidth(95)
 
         # Site coordinate inputs and limit-altitude
         self.lat_edit = QLineEdit("-24.59")
-        self.lat_edit.setMaximumWidth(90)
+        self.lat_edit.setMaximumWidth(95)
         self.lon_edit = QLineEdit("-70.19")
-        self.lon_edit.setMaximumWidth(90)
+        self.lon_edit.setMaximumWidth(95)
         self.elev_edit = QLineEdit("2800")
-        self.elev_edit.setMaximumWidth(90)
-        self.limit_spin = QSpinBox(minimum=0, maximum=90, value=35)
-        self.limit_spin.setMaximumWidth(80)
+        self.elev_edit.setMaximumWidth(55)
+        self.limit_spin = QSpinBox(minimum=-90, maximum=90, value=35)
+        self.limit_spin.setMaximumWidth(55)
 
         # Observatory selection
         self.observatories = {
@@ -964,8 +974,10 @@ class MainWindow(QMainWindow):
         self.obs_combo.addItems(self.observatories.keys())
         self.obs_combo.currentTextChanged.connect(self._on_obs_change)
         self.obs_combo.setCurrentText("OCM")
-        # Ensure observatory names are fully visible
-        self.obs_combo.setMinimumWidth(140)
+        # Ensure site fields & clock worker start immediately
+        self._on_obs_change(self.obs_combo.currentText())
+        # Make observatory selector slimmer
+        self.obs_combo.setMinimumWidth(95)
         self.obs_combo.setMinimumContentsLength(8)
         # Now that observatories and date widget exist, load settings
         self._load_settings()
@@ -998,7 +1010,7 @@ class MainWindow(QMainWindow):
         form.setHorizontalSpacing(2)
         form.setVerticalSpacing(2)
         # Observatory dropdown
-        form.addRow("Observatory", self.obs_combo)
+        form.addRow("🔭", self.obs_combo)
         # Date selector with previous/next day buttons
         prev_day_btn = QToolButton()
         prev_day_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowLeft))
@@ -1015,21 +1027,31 @@ class MainWindow(QMainWindow):
         next_day_btn.setToolTip("Next day")
         next_day_btn.clicked.connect(lambda: self._change_date(1))
 
+        # --- Date chooser with buttons stacked above ---
         date_widget = QWidget()
-        date_layout = QHBoxLayout()
-        date_layout.setContentsMargins(0, 0, 0, 0)
-        date_layout.setSpacing(2)
-        date_layout.addWidget(prev_day_btn)
-        date_layout.addWidget(today_btn)
-        date_layout.addWidget(self.date_edit)
-        date_layout.addWidget(next_day_btn)
-        date_widget.setLayout(date_layout)
+        date_vlayout = QVBoxLayout()
+        date_vlayout.setContentsMargins(0, 0, 0, 0)
+        date_vlayout.setSpacing(2)
 
-        form.addRow("Date", date_widget)
-        form.addRow("Latitude", self.lat_edit)
-        form.addRow("Longitude", self.lon_edit)
-        form.addRow("Elevation (m)", self.elev_edit)
-        form.addRow("Lim. Altitude (°)", self.limit_spin)
+        # Row of navigation buttons
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(2)
+        btn_row.addWidget(prev_day_btn)
+        btn_row.addWidget(today_btn)
+        btn_row.addWidget(next_day_btn)
+
+        date_vlayout.addLayout(btn_row)
+        # Add only the date_edit widget (no inner layout for the emoji)
+        date_vlayout.addWidget(self.date_edit)
+        date_widget.setLayout(date_vlayout)
+
+        # Add to form
+        form.addRow("📅", date_widget)
+        form.addRow("Lat.", self.lat_edit)
+        form.addRow("Lon.", self.lon_edit)
+        form.addRow("Elev.", self.elev_edit)
+        form.addRow("Alt.", self.limit_spin)
 
         # Sun/Moon visibility toggles
         self.sun_check = QCheckBox("Show Sun")
@@ -1043,12 +1065,12 @@ class MainWindow(QMainWindow):
         self.moon_check.stateChanged.connect(self._toggle_visibility)
 
         add_btn = QPushButton("Add Target…")
-        add_btn.setMaximumWidth(100)
+        add_btn.setMaximumWidth(130)
         add_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
         add_btn.clicked.connect(self._add_target_dialog)
 
         load_plan_btn = QPushButton("Load Plan…")
-        load_plan_btn.setMaximumWidth(100)
+        load_plan_btn.setMaximumWidth(130)
         load_plan_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         load_plan_btn.clicked.connect(self._load_plan)
 
@@ -1061,7 +1083,7 @@ class MainWindow(QMainWindow):
         left.addWidget(add_btn)
         left.addWidget(load_plan_btn)
         save_btn = QPushButton("Save Plan…")
-        save_btn.setMaximumWidth(100)
+        save_btn.setMaximumWidth(130)
         save_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
         save_btn.clicked.connect(self._export_plan)
         left.addWidget(save_btn)
@@ -1071,7 +1093,8 @@ class MainWindow(QMainWindow):
         left_w.layout().setContentsMargins(0, 0, 0, 0)
         # Fix left pane width so controls (date, coords, buttons) stay compact
         left_w.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        left_w.setMaximumWidth(300)
+        # Narrow the control column so the table gets more space
+        left_w.setMaximumWidth(150)
 
         # right pane (plot + toolbar)
         right = QVBoxLayout()
@@ -1254,16 +1277,17 @@ class MainWindow(QMainWindow):
         self.progress.setAutoReset(False)
         self.progress.hide()
 
-        # Start real-time clock updates for time labels (skip in headless --plan mode)
+        # Start real-time clock updates for time labels
         self.clock_worker = None
-        args = QCoreApplication.arguments()
-        if '--plan' not in args:
-            if self.table_model.site:
-                self._start_clock_worker()
-            self._clock_timer = QTimer(self)
-            self._clock_timer.timeout.connect(self._update_clock)
-            self._clock_timer.start(1000)
+        if self.table_model.site:
+            self._start_clock_worker()
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(1000)
     def _start_clock_worker(self):
+        # Don’t create new workers while exiting
+        if getattr(self, "_shutting_down", False):
+            return
         # Stop any existing clock worker
         if self.clock_worker:
             self.clock_worker.stop()
@@ -1272,14 +1296,28 @@ class MainWindow(QMainWindow):
         # Create and track new worker instance
         worker = ClockWorker(site, self.targets, self)
         self.clock_worker = worker
+        self._clock_workers.append(worker)
         # Connect updates only from this specific worker to avoid stale threads
         worker.updated.connect(lambda data, w=worker: self._handle_clock_update(data) if self.clock_worker is w else None)
         # Start the new worker
         worker.start()
-    def __del__(self):
-        # Ensure clock worker thread is stopped before this object is destroyed
-        if hasattr(self, 'clock_worker') and self.clock_worker:
-            self.clock_worker.stop()
+        # Ensure finished threads clean themselves up
+        worker.finished.connect(worker.deleteLater)
+
+    # --------------------------------------------------
+    # Qt close handler – ensure threads are stopped
+    # --------------------------------------------------
+    def closeEvent(self, event):
+        """Stop background threads before the window closes."""
+        try:
+            self._cleanup_threads()
+        except Exception as exc:
+            logger.exception("Error during thread cleanup: %s", exc)
+        super().closeEvent(event)
+
+    # --------------------------------------------------
+    # Qt close handler – ensure threads are stopped
+    # --------------------------------------------------
 
     # .....................................................
     # menu & shortcuts
@@ -1395,12 +1433,49 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _cleanup_threads(self):
-        """Stop background threads cleanly on exit."""
-        if hasattr(self, 'clock_worker') and self.clock_worker:
-            self.clock_worker.stop()
-        if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait()
+        """Stop timer and threads cleanly on exit (order matters)."""
+        # Signal that shutdown has begun
+        self._shutting_down = True
+        # 1) Kill the periodic timer *first* so it can’t spawn new workers
+        clock_timer = getattr(self, "_clock_timer", None)
+        if clock_timer is not None:
+            try:
+                # Disconnect to avoid late-queued timeouts spawning new workers
+                if hasattr(clock_timer, "timeout"):
+                    clock_timer.timeout.disconnect(self._update_clock)
+                clock_timer.stop()
+            except Exception:
+                pass
+            self._clock_timer = None
+
+        # 2) Stop *all* ClockWorkers created during this session
+        for w in list(getattr(self, "_clock_workers", [])):
+            try:
+                # Skip if C++ object is already destroyed
+                if shb.isValid(w) and w.isRunning():
+                    # Ask it to stop only if still alive
+                    w.running = False
+                    if hasattr(w, "_wait_cond"):
+                        w._wait_cond.wakeAll()
+                    w.quit()
+                    w.wait()
+            except RuntimeError:
+                # Already deleted; nothing to do
+                pass
+            except Exception as exc:
+                logger.exception("Failed to stop ClockWorker: %s", exc)
+        # Clear list
+        self._clock_workers = []
+        self.clock_worker = None
+
+        # 3) Stop the AstronomyWorker if it’s still running
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            try:
+                worker.quit()
+                worker.wait()
+            except Exception as exc:
+                logger.exception("Failed to stop AstronomyWorker: %s", exc)
 
     def _apply_default_sort(self):
         """Apply default sort column from settings."""
@@ -1827,6 +1902,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _update_clock(self):
+        # Skip if we’re in the middle of shutdown
+        if self._shutting_down:
+            return
         if self.clock_worker is None and self.table_model.site:
             self._start_clock_worker()
 
@@ -2264,15 +2342,6 @@ class MainWindow(QMainWindow):
         ra_deg = self._parse_angle(ra_str)
         dec_deg = self._parse_angle(dec_str)
         return Target(name=query, ra=ra_deg, dec=dec_deg)
-
-    # Ensure thread finishes before app closes
-    def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait()
-        if self.clock_worker:
-            self.clock_worker.stop()
-        super().closeEvent(event)
 
     @Slot(int)
     def _change_date(self, offset_days: int):
