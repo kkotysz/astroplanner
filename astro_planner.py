@@ -335,6 +335,7 @@ class ClockWorker(QThread):
     def run(self):
         tz_name = self.site.timezone_name
         tz = pytz.timezone(tz_name)
+        logger.info("ClockWorker started for site %s", self.site.name)
 
         while self.running:
             now_local = datetime.now(tz)
@@ -381,7 +382,10 @@ class ClockWorker(QThread):
             self._wait_cond.wait(self._mutex, 1000)
             self._mutex.unlock()
 
+        logger.info("ClockWorker exiting for site %s", self.site.name)
+
     def stop(self):
+        logger.info("ClockWorker stop requested for site %s", self.site.name)
         self.running = False
         self._wait_cond.wakeAll()  # interrupt the 1‑second wait
         self.quit()
@@ -821,6 +825,7 @@ class MainWindow(QMainWindow):
         self.setIconSize(QSize(20, 20))
     @Slot(str)
     def _on_obs_change(self, name: str):
+        logger.info("Observatory switched to %s", name)
         """Populate site fields when an observatory is selected."""
         site = self.observatories[name]
         self.lat_edit.setText(f"{site.latitude}")
@@ -1277,9 +1282,9 @@ class MainWindow(QMainWindow):
         self.progress.setAutoReset(False)
         self.progress.hide()
 
-        # Start real-time clock updates for time labels
-        self.clock_worker = None
-        if self.table_model.site:
+        # Start real‑time clock updates for time labels (but avoid double‑launch)
+        self.clock_worker = getattr(self, "clock_worker", None)
+        if self.table_model.site and self.clock_worker is None:
             self._start_clock_worker()
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_clock)
@@ -1293,6 +1298,7 @@ class MainWindow(QMainWindow):
             self.clock_worker.stop()
         # Determine site, fallback to default if none
         site = self.table_model.site or Site(name="Default", latitude=0.0, longitude=0.0, elevation=0.0)
+        logger.info("Launching new ClockWorker for site %s", site.name)
         # Create and track new worker instance
         worker = ClockWorker(site, self.targets, self)
         self.clock_worker = worker
@@ -1434,6 +1440,7 @@ class MainWindow(QMainWindow):
 
     def _cleanup_threads(self):
         """Stop timer and threads cleanly on exit (order matters)."""
+        logger.info("Begin cleanup_threads")
         # Signal that shutdown has begun
         self._shutting_down = True
         # 1) Kill the periodic timer *first* so it can’t spawn new workers
@@ -1446,6 +1453,7 @@ class MainWindow(QMainWindow):
                 clock_timer.stop()
             except Exception:
                 pass
+            logger.debug("Clock timer stopped")
             self._clock_timer = None
 
         # 2) Stop *all* ClockWorkers created during this session
@@ -1464,6 +1472,7 @@ class MainWindow(QMainWindow):
                 pass
             except Exception as exc:
                 logger.exception("Failed to stop ClockWorker: %s", exc)
+        logger.debug("All ClockWorkers stopped (%d total)", len(getattr(self, "_clock_workers", [])))
         # Clear list
         self._clock_workers = []
         self.clock_worker = None
@@ -1474,6 +1483,7 @@ class MainWindow(QMainWindow):
             try:
                 worker.quit()
                 worker.wait()
+                logger.debug("AstronomyWorker stopped")
             except Exception as exc:
                 logger.exception("Failed to stop AstronomyWorker: %s", exc)
 
@@ -2061,15 +2071,22 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def _update_polar_positions(self, data):
         """Update all markers on the polar plot based on latest alt-az data."""
-        # Clear any old path lines
-        for _attr in ("sun_path_line", "moon_path_line"):
-            line = getattr(self, _attr, None)
-            if line is not None:
-                try:
-                    line.remove()
-                except Exception:
-                    pass
-                setattr(self, _attr, None)
+        # Do we actually have full arrays in this payload?
+        has_sun_path  = "sun_alt"  in data and "sun_az"  in data
+        has_moon_path = "moon_alt" in data and "moon_az" in data
+
+        # Only clear existing path lines when the incoming data *does* carry a
+        # complete path; lightweight refreshes (like live marker updates) leave
+        # the existing paths alone so they don’t disappear.
+        if has_sun_path or has_moon_path:
+            for _line_attr in ("sun_path_line", "moon_path_line"):
+                line = getattr(self, _line_attr, None)
+                if line is not None:
+                    try:
+                        line.remove()
+                    except Exception:
+                        pass
+                    setattr(self, _line_attr, None)
         tgt_coords = []
         self.polar_indices = []
         # Determine target alt/az lists (ClockWorker uses 'alts'/'azs', AstronomyWorker payload uses per-target entries)
