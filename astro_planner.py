@@ -974,6 +974,7 @@ class MainWindow(QMainWindow):
         self.observatories = {
             "OCM": Site(name="OCM", latitude=-24.59, longitude=-70.19, elevation=2800),
             "Białków": Site(name="Białków", latitude=51.474248, longitude=16.657821, elevation=128),
+            "Roque de los Muchachos": Site(name="Roque de los Muchachos", latitude=28.4522, longitude=-17.5330, elevation=2426),
         }
         self.obs_combo = QComboBox()
         self.obs_combo.addItems(self.observatories.keys())
