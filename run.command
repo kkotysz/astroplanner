@@ -3,8 +3,8 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Use the venv's python directly (no need to "activate")
-PY="/Users/krzkot/miniconda3/envs/astroplanner/bin/python"
+# Use explicit PYTHON env var if provided, otherwise fall back to python3.
+PY="${PYTHON:-python3}"
 
-# Run your program (adjust entrypoint)
-exec "$PY" "$APP_DIR/astro_planner.py"
+# Forward optional CLI args (e.g. --plan plan_targets.json).
+exec "$PY" "$APP_DIR/astro_planner.py" "$@"

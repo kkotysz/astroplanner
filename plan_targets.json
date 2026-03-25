@@ -1,14 +1,50 @@
 [
-  { "name": "NGC3109",        "ra": 150.777917,  "dec": -26.158889 },
-  { "name": "NGC6822",        "ra": 296.240417,  "dec": -14.803333 },
-  { "name": "ASASSN-15kf",    "ra": 234.659333,  "dec": -30.597139 },
-  { "name": "NGC3201",        "ra": 154.340833,  "dec": -46.412500 },
-  { "name": "Omega Centauri", "ra": 201.697917,  "dec": -47.479722 },
-  { "name": "NGC5904",        "ra": 229.638750,  "dec":   2.081667 },
-  { "name": "NGC6101",        "ra": 248.719167,  "dec": -72.898611 },
-  { "name": "NGC6171",        "ra": 250.720000,  "dec": -13.963333 },
-  { "name": "NGC6333",        "ra": 259.256875,  "dec": -26.525000 },
-  { "name": "NGC6362",        "ra": 261.456875,  "dec": -67.021389 },
-  { "name": "NGC6584",        "ra": 275.979583,  "dec": -44.918056 },
-  { "name": "NGC6402",        "ra": 265.039583,  "dec": -23.639444 }
+  {
+    "name": "V* FU Ori",
+    "ra": 86.34318660106,
+    "dec": 9.07008092224,
+    "object_type": "Or*",
+    "magnitude": 9.600000381469727,
+    "size_arcmin": null,
+    "priority": 3,
+    "observed": false,
+    "notes": "",
+    "plot_color": ""
+  },
+  {
+    "name": "V* T CrB",
+    "ra": 239.87567594413002,
+    "dec": 25.92017038415,
+    "object_type": "Sy*",
+    "magnitude": 10.246999740600586,
+    "size_arcmin": null,
+    "priority": 3,
+    "observed": false,
+    "notes": "",
+    "plot_color": ""
+  },
+  {
+    "name": "NGC  6823",
+    "ra": 295.79708333333326,
+    "dec": 23.30888888888889,
+    "object_type": "OpC",
+    "magnitude": 7.099999904632568,
+    "size_arcmin": null,
+    "priority": 3,
+    "observed": false,
+    "notes": "",
+    "plot_color": ""
+  },
+  {
+    "name": "AT2025acft",
+    "ra": 295.93983333333324,
+    "dec": 40.36788888888889,
+    "object_type": "trans",
+    "magnitude": 14.93,
+    "size_arcmin": null,
+    "priority": 3,
+    "observed": false,
+    "notes": "",
+    "plot_color": ""
+  }
 ]
