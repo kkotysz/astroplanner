@@ -45,6 +45,7 @@ from __future__ import annotations
 # Standard library imports
 import argparse
 import csv
+import html as html_module
 import json
 import math
 import sys
@@ -348,7 +349,10 @@ class GeneralSettingsDialog(QDialog):
         # Immediately re-run the plan so samples take effect
         self.parent()._run_plan()
         super().accept()
-TIME_SAMPLES = 240 
+
+
+# Number of time samples for visibility curve (lower = faster)
+TIME_SAMPLES = 240
 
 class ClockWorker(QThread):
     updated = Signal(dict)
@@ -679,7 +683,7 @@ class LLMWorker(QThread):
                 "Start BitNet/llama.cpp server and configure the URL in Settings → General Settings."
             )
         except Exception as exc:  # noqa: BLE001
-            self.errorOccurred.emit(str(exc))
+            self.errorOccurred.emit(f"LLM request failed ({type(exc).__name__}): {exc}")
 
 
 # --------------------------------------------------
@@ -2636,6 +2640,7 @@ class MainWindow(QMainWindow):
         input_col.addWidget(self.ai_input)
 
         send_btn = QPushButton("Send ↵")
+        send_btn.setAccessibleName("Send message to AI assistant")
         send_btn.clicked.connect(self._send_ai_query)
         input_col.addWidget(send_btn)
 
@@ -2704,10 +2709,9 @@ class MainWindow(QMainWindow):
         # Target list
         if self.targets:
             tgt_lines = []
-            for t in self.targets:
+            for idx, t in enumerate(self.targets):
                 alt_str = ""
-                idx = next((i for i, x in enumerate(self.targets) if x.name == t.name), None)
-                if idx is not None and idx < len(self.table_model.current_alts):
+                if idx < len(self.table_model.current_alts):
                     alt_str = f", current alt {self.table_model.current_alts[idx]:.1f}°"
                 tgt_lines.append(f"  - {t.name} (RA {t.ra:.2f}°, Dec {t.dec:.2f}°{alt_str})")
             parts.append("Current targets:\n" + "\n".join(tgt_lines))
@@ -2736,16 +2740,27 @@ class MainWindow(QMainWindow):
         full_prompt = f"Current session context:\n{context}\n\nUser question: {text}"
         self._dispatch_llm(full_prompt, tag="chat", label=f"You: {text}")
 
+    def _get_source_row(self, proxy_index) -> int:
+        """Map a proxy QModelIndex to the underlying source row index.
+
+        Works whether the table uses a proxy sort model or exposes the
+        source model directly.
+        """
+        model = self.table_view.model()
+        if hasattr(model, "mapToSource"):
+            return model.mapToSource(proxy_index).row()
+        return proxy_index.row()
+
     def _ai_describe_target(self) -> None:
         """Ask the LLM to describe the currently selected target."""
         indexes = self.table_view.selectionModel().selectedRows()
         if not indexes:
             QMessageBox.information(self, "No selection", "Please select a target in the table first.")
             return
-        row = indexes[0].row()
-        # Map visual row to model row via proxy sort
-        source_row = self.table_view.model().mapToSource(indexes[0]).row() if hasattr(self.table_view.model(), "mapToSource") else row
-        tgt = self.targets[source_row] if source_row < len(self.targets) else self.targets[row]
+        source_row = self._get_source_row(indexes[0])
+        if source_row >= len(self.targets):
+            source_row = indexes[0].row()
+        tgt = self.targets[source_row]
         context = self._build_session_context()
         prompt = (
             f"Current session context:\n{context}\n\n"
@@ -2834,15 +2849,14 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Append a formatted message to the AI chat output widget."""
         if is_user:
-            html = f'<p style="color:#89b4fa;margin:2px 0"><b>{text}</b></p>'
+            msg_html = f'<p style="color:#89b4fa;margin:2px 0"><b>{html_module.escape(text)}</b></p>'
         elif is_error:
-            html = f'<p style="color:#f38ba8;margin:2px 0">{text}</p>'
+            msg_html = f'<p style="color:#f38ba8;margin:2px 0">{html_module.escape(text)}</p>'
         else:
             # Convert plain newlines to <br> for AI responses
-            body = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            body = body.replace("\n", "<br>")
-            html = f'<p style="color:#cdd6f4;margin:2px 0">{body}</p>'
-        self.ai_output.append(html)
+            body = html_module.escape(text).replace("\n", "<br>")
+            msg_html = f'<p style="color:#cdd6f4;margin:2px 0">{body}</p>'
+        self.ai_output.append(msg_html)
         # Scroll to bottom
         self.ai_output.verticalScrollBar().setValue(
             self.ai_output.verticalScrollBar().maximum()
