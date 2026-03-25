@@ -48,6 +48,8 @@ import csv
 import json
 import math
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -113,6 +115,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QFormLayout,
+    QGroupBox,
     QHeaderView,
     QFileDialog,
     QHBoxLayout,
@@ -126,6 +129,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QSizePolicy,
     QTableView,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -298,6 +302,33 @@ class GeneralSettingsDialog(QDialog):
         layout.addRow(self.moon_path_chk)
         layout.addRow(self.obj_path_chk)
 
+        # ── AI / BitNet settings ───────────────────────────────────────────
+        ai_box = QGroupBox("🤖 AI Assistant (BitNet/llama.cpp server)", self)
+        ai_layout = QFormLayout(ai_box)
+        ai_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.llm_url_edit = QLineEdit(self)
+        init_url = (
+            parent.settings.value("llm/serverUrl", LLMConfig.DEFAULT_URL, type=str)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_URL
+        )
+        self.llm_url_edit.setText(init_url)
+        self.llm_url_edit.setPlaceholderText("http://localhost:8080")
+        ai_layout.addRow("Server URL:", self.llm_url_edit)
+
+        self.llm_model_edit = QLineEdit(self)
+        init_model = (
+            parent.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_MODEL
+        )
+        self.llm_model_edit.setText(init_model)
+        self.llm_model_edit.setPlaceholderText(LLMConfig.DEFAULT_MODEL)
+        ai_layout.addRow("Model name:", self.llm_model_edit)
+
+        layout.addRow(ai_box)
+
         # OK / Cancel
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         btns.accepted.connect(self.accept)
@@ -311,12 +342,12 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("general/showSunPath",  self.sun_path_chk.isChecked())
         s.setValue("general/showMoonPath", self.moon_path_chk.isChecked())
         s.setValue("general/showObjPath",  self.obj_path_chk.isChecked())
+        s.setValue("llm/serverUrl", self.llm_url_edit.text().strip() or LLMConfig.DEFAULT_URL)
+        s.setValue("llm/model", self.llm_model_edit.text().strip() or LLMConfig.DEFAULT_MODEL)
         self.parent()._apply_general_settings()
         # Immediately re-run the plan so samples take effect
         self.parent()._run_plan()
         super().accept()
-
-# Number of time samples for visibility curve (lower = faster)
 TIME_SAMPLES = 240 
 
 class ClockWorker(QThread):
@@ -559,6 +590,96 @@ class AstronomyWorker(QThread):
             len(self.targets),
             obs_date.toString("yyyy-MM-dd"))                   # type: ignore[arg-type]
         self.finished.emit(payload)
+
+
+# --------------------------------------------------
+# --- Local LLM / BitNet integration ---------------
+# --------------------------------------------------
+
+class LLMConfig:
+    """Configuration for a local BitNet / llama.cpp inference server.
+
+    The server must expose an OpenAI-compatible ``/v1/chat/completions``
+    endpoint (e.g. ``bitnet.cpp`` started with ``-srv`` flag, or any
+    llama.cpp server build).
+    """
+
+    DEFAULT_URL = "http://localhost:8080"
+    DEFAULT_MODEL = "bitnet-b1.58-3b"
+
+    def __init__(
+        self,
+        url: str = DEFAULT_URL,
+        model: str = DEFAULT_MODEL,
+        timeout: int = 60,
+    ) -> None:
+        self.url = url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+
+
+class LLMWorker(QThread):
+    """Send a prompt to a local OpenAI-compatible LLM and emit the reply.
+
+    Runs in a background thread so the GUI stays responsive.
+    Uses only the Python standard-library ``urllib`` so no extra
+    dependencies are required.
+    """
+
+    responseReady = Signal(str, str)  # (tag, text)
+    errorOccurred = Signal(str)       # error message
+
+    def __init__(
+        self,
+        config: LLMConfig,
+        prompt: str,
+        system_prompt: str = "",
+        tag: str = "chat",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.config = config
+        self.prompt = prompt
+        self.system_prompt = system_prompt
+        self.tag = tag
+
+    def run(self) -> None:  # noqa: D401
+        messages: list[dict] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": self.prompt})
+
+        payload = json.dumps(
+            {
+                "model": self.config.model,
+                "messages": messages,
+                "max_tokens": 1024,
+                "temperature": 0.7,
+                "stream": False,
+            }
+        ).encode("utf-8")
+
+        url = f"{self.config.url}/v1/chat/completions"
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                text = data["choices"][0]["message"]["content"]
+                self.responseReady.emit(self.tag, text.strip())
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", str(exc))
+            self.errorOccurred.emit(
+                f"Cannot reach LLM server at {self.config.url}: {reason}\n"
+                "Start BitNet/llama.cpp server and configure the URL in Settings → General Settings."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.errorOccurred.emit(str(exc))
 
 
 # --------------------------------------------------
@@ -863,7 +984,15 @@ class MainWindow(QMainWindow):
         self.show_sun_path  = self.settings.value("general/showSunPath",  True, type=bool)
         self.show_moon_path = self.settings.value("general/showMoonPath", True, type=bool)
         self.show_obj_path  = self.settings.value("general/showObjPath",  True, type=bool)
-        
+
+        # LLM configuration (loaded from settings; updated when settings are saved)
+        self.llm_config = LLMConfig(
+            url=self.settings.value("llm/serverUrl", LLMConfig.DEFAULT_URL, type=str),
+            model=self.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str),
+        )
+        # Reference to any running LLM worker so we can guard against double-fire
+        self._llm_worker: Optional[LLMWorker] = None
+
         # state holders
         self.targets: List[Target] = []
         self.worker: Optional[AstronomyWorker] = None  # keep reference!
@@ -1093,6 +1222,19 @@ class MainWindow(QMainWindow):
         save_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
         save_btn.clicked.connect(self._export_plan)
         left.addWidget(save_btn)
+
+        # AI Assistant toggle button
+        self.ai_toggle_btn = QPushButton("🤖 AI Assistant")
+        self.ai_toggle_btn.setMaximumWidth(130)
+        self.ai_toggle_btn.setCheckable(True)
+        self.ai_toggle_btn.setChecked(False)
+        self.ai_toggle_btn.setToolTip(
+            "Toggle the AI assistant panel (requires a running BitNet/llama.cpp server)"
+        )
+        self.ai_toggle_btn.toggled.connect(self._toggle_ai_panel)
+        left.addWidget(self.ai_toggle_btn)
+        left.addStretch()
+
         left_w = QWidget()
         left_w.setLayout(left)
         # Remove default widget margins
@@ -1254,12 +1396,17 @@ class MainWindow(QMainWindow):
         # Add it to the bottom row on the right
         bottom_h.addWidget(self.info_widget)
 
+        # ── AI Assistant panel (collapsed by default) ─────────────────────
+        self.ai_panel = self._build_ai_panel()
+        self.ai_panel.setVisible(False)
+
         # Main vertical layout: plot on top, bottom row beneath
         main_l = QVBoxLayout()
         main_l.setContentsMargins(0, 0, 0, 0)
         main_l.setSpacing(4)
         main_l.addWidget(plot_w, stretch=3)
         main_l.addLayout(bottom_h, stretch=1)
+        main_l.addWidget(self.ai_panel)
 
         container = QWidget()
         container.setLayout(main_l)
@@ -1365,6 +1512,29 @@ class MainWindow(QMainWindow):
         target_menu = menubar.addMenu("&Targets")
         target_menu.addAction(self.add_act)
 
+        # AI menu
+        ai_menu = menubar.addMenu("🤖 &AI")
+        self.ai_describe_act = QAction("🔭 Describe Selected Object", self, shortcut=QKeySequence("Ctrl+I"))
+        self.ai_describe_act.triggered.connect(self._ai_describe_target)
+        ai_menu.addAction(self.ai_describe_act)
+
+        self.ai_suggest_act = QAction("💡 Suggest Targets for Tonight", self, shortcut=QKeySequence("Ctrl+Shift+I"))
+        self.ai_suggest_act.triggered.connect(self._ai_suggest_targets)
+        ai_menu.addAction(self.ai_suggest_act)
+
+        self.ai_optimize_act = QAction("📋 Optimize Observation Order", self)
+        self.ai_optimize_act.triggered.connect(self._ai_optimize_plan)
+        ai_menu.addAction(self.ai_optimize_act)
+
+        ai_menu.addSeparator()
+        ai_toggle_act = QAction("Toggle AI Panel", self)
+        ai_toggle_act.triggered.connect(lambda: self.ai_toggle_btn.setChecked(not self.ai_toggle_btn.isChecked()))
+        ai_menu.addAction(ai_toggle_act)
+
+        # Register shortcuts so they work even without the menu being open
+        for act in (self.ai_describe_act, self.ai_suggest_act):
+            self.addAction(act)
+
         # Settings menu
         settings_menu = menubar.addMenu("&Settings")
         gen_act = QAction("General Settings…", self)
@@ -1423,7 +1593,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _apply_general_settings(self):
-        """Apply default site."""
+        """Apply default site and reload LLM configuration."""
         s = self.settings
         self.show_sun_path  = self.settings.value("general/showSunPath",  True, type=bool)
         self.show_moon_path = self.settings.value("general/showMoonPath", True, type=bool)
@@ -1434,6 +1604,10 @@ class MainWindow(QMainWindow):
         ds = s.value("general/defaultSite", type=str)
         if ds in self.observatories:
             self.obs_combo.setCurrentText(ds)
+        # Reload LLM configuration from persisted settings
+        if hasattr(self, "llm_config"):
+            self.llm_config.url = s.value("llm/serverUrl", LLMConfig.DEFAULT_URL, type=str)
+            self.llm_config.model = s.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str)
 
     def open_general_settings(self):
         dlg = GeneralSettingsDialog(self)
@@ -1487,6 +1661,16 @@ class MainWindow(QMainWindow):
                 logger.debug("AstronomyWorker stopped")
             except Exception as exc:
                 logger.exception("Failed to stop AstronomyWorker: %s", exc)
+
+        # 4) Stop any running LLM worker
+        llm_worker = getattr(self, "_llm_worker", None)
+        if llm_worker is not None and llm_worker.isRunning():
+            try:
+                llm_worker.quit()
+                llm_worker.wait(2000)
+                logger.debug("LLMWorker stopped")
+            except Exception as exc:
+                logger.exception("Failed to stop LLMWorker: %s", exc)
 
     def _apply_default_sort(self):
         """Apply default sort column from settings."""
@@ -2387,6 +2571,282 @@ class MainWindow(QMainWindow):
             new_date = QDate.currentDate()
         self.date_edit.setDate(new_date)
         self._replot_timer.start()
+
+    # --------------------------------------------------
+    # --- AI Assistant methods -------------------------
+    # --------------------------------------------------
+
+    def _build_ai_panel(self) -> QWidget:
+        """Build the collapsible AI Assistant panel widget."""
+        panel = QWidget()
+        panel.setObjectName("AIAssistantPanel")
+        panel.setMinimumHeight(160)
+        panel.setMaximumHeight(220)
+
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        # ── Quick-action buttons ───────────────────────────────────────────
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(4)
+
+        describe_btn = QPushButton("🔭 Describe Object")
+        describe_btn.setToolTip("Ask the AI to describe the selected target and give observation tips")
+        describe_btn.clicked.connect(self._ai_describe_target)
+        btn_col.addWidget(describe_btn)
+
+        suggest_btn = QPushButton("💡 Suggest Targets")
+        suggest_btn.setToolTip("Ask the AI to suggest additional targets suitable for tonight")
+        suggest_btn.clicked.connect(self._ai_suggest_targets)
+        btn_col.addWidget(suggest_btn)
+
+        optimize_btn = QPushButton("📋 Optimize Order")
+        optimize_btn.setToolTip("Ask the AI to suggest an optimal observation order for the current target list")
+        optimize_btn.clicked.connect(self._ai_optimize_plan)
+        btn_col.addWidget(optimize_btn)
+
+        btn_col.addStretch()
+
+        btn_widget = QWidget()
+        btn_widget.setLayout(btn_col)
+        btn_widget.setFixedWidth(140)
+        layout.addWidget(btn_widget)
+
+        # ── Chat output ────────────────────────────────────────────────────
+        self.ai_output = QTextEdit()
+        self.ai_output.setReadOnly(True)
+        self.ai_output.setPlaceholderText(
+            "AI responses will appear here.\n"
+            "Make sure your BitNet/llama.cpp server is running and configured in\n"
+            "Settings → General Settings (LLM Server URL)."
+        )
+        self.ai_output.setStyleSheet(
+            "QTextEdit { background: #1e1e2e; color: #cdd6f4; border-radius: 4px; padding: 4px; }"
+        )
+        layout.addWidget(self.ai_output, stretch=1)
+
+        # ── Input area ─────────────────────────────────────────────────────
+        input_col = QVBoxLayout()
+        input_col.setSpacing(4)
+
+        self.ai_input = QLineEdit()
+        self.ai_input.setPlaceholderText("Ask anything about astronomy…")
+        self.ai_input.returnPressed.connect(self._send_ai_query)
+        input_col.addWidget(self.ai_input)
+
+        send_btn = QPushButton("Send ↵")
+        send_btn.clicked.connect(self._send_ai_query)
+        input_col.addWidget(send_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.ai_output.clear)
+        input_col.addWidget(clear_btn)
+
+        self.ai_status_label = QLabel("Ready")
+        self.ai_status_label.setStyleSheet("color: grey; font-size: 10pt;")
+        input_col.addWidget(self.ai_status_label)
+
+        input_col.addStretch()
+
+        input_widget = QWidget()
+        input_widget.setLayout(input_col)
+        input_widget.setFixedWidth(170)
+        layout.addWidget(input_widget)
+
+        return panel
+
+    @Slot(bool)
+    def _toggle_ai_panel(self, checked: bool) -> None:
+        """Show or hide the AI assistant panel."""
+        self.ai_panel.setVisible(checked)
+        self.ai_toggle_btn.setText("🤖 Hide AI" if checked else "🤖 AI Assistant")
+
+    def _build_session_context(self) -> str:
+        """Return a concise text summary of the current observing session for LLM prompts."""
+        parts: list[str] = []
+
+        # Date and site
+        site = self.table_model.site
+        date_str = self.date_edit.date().toString("yyyy-MM-dd")
+        parts.append(f"Observation date: {date_str}")
+        if site:
+            parts.append(
+                f"Site: {site.name} (lat {site.latitude:.2f}°, lon {site.longitude:.2f}°, "
+                f"elev {site.elevation:.0f} m, timezone {site.timezone_name})"
+            )
+        parts.append(f"Altitude limit: {self.limit_spin.value()}°")
+
+        # Astronomical events from last payload
+        payload = getattr(self, "last_payload", None)
+        if payload:
+            tz_name = payload.get("tz", "UTC")
+            tz = pytz.timezone(tz_name)
+
+            def _fmt(key: str) -> str:
+                val = payload.get(key)
+                if val is None:
+                    return "N/A"
+                try:
+                    dt = mdates.num2date(float(val)).astimezone(tz)
+                    return dt.strftime("%H:%M")
+                except Exception:
+                    return "N/A"
+
+            parts.append(
+                f"Sunset: {_fmt('sunset')}, Sunrise: {_fmt('sunrise')}, "
+                f"Astronomical dusk: {_fmt('dusk')}, dawn: {_fmt('dawn')}"
+            )
+            moon_phase = payload.get("moon_phase")
+            if moon_phase is not None:
+                parts.append(f"Moon phase: {float(moon_phase):.1f}%")
+
+        # Target list
+        if self.targets:
+            tgt_lines = []
+            for t in self.targets:
+                alt_str = ""
+                idx = next((i for i, x in enumerate(self.targets) if x.name == t.name), None)
+                if idx is not None and idx < len(self.table_model.current_alts):
+                    alt_str = f", current alt {self.table_model.current_alts[idx]:.1f}°"
+                tgt_lines.append(f"  - {t.name} (RA {t.ra:.2f}°, Dec {t.dec:.2f}°{alt_str})")
+            parts.append("Current targets:\n" + "\n".join(tgt_lines))
+        else:
+            parts.append("No targets loaded yet.")
+
+        return "\n".join(parts)
+
+    _SYSTEM_PROMPT = (
+        "You are an expert astronomical observation assistant. "
+        "You help amateur and professional astronomers plan their observations. "
+        "You have deep knowledge of celestial objects, telescopes, eyepieces, filters, "
+        "observing conditions, and astrophotography techniques. "
+        "Provide concise, practical, and accurate answers. "
+        "When suggesting objects use their common catalogue names (Messier, NGC, IC, etc.). "
+        "Always take into account the observer's site latitude and the current season."
+    )
+
+    def _send_ai_query(self) -> None:
+        """Send the text from the input field to the LLM."""
+        text = self.ai_input.text().strip()
+        if not text:
+            return
+        self.ai_input.clear()
+        context = self._build_session_context()
+        full_prompt = f"Current session context:\n{context}\n\nUser question: {text}"
+        self._dispatch_llm(full_prompt, tag="chat", label=f"You: {text}")
+
+    def _ai_describe_target(self) -> None:
+        """Ask the LLM to describe the currently selected target."""
+        indexes = self.table_view.selectionModel().selectedRows()
+        if not indexes:
+            QMessageBox.information(self, "No selection", "Please select a target in the table first.")
+            return
+        row = indexes[0].row()
+        # Map visual row to model row via proxy sort
+        source_row = self.table_view.model().mapToSource(indexes[0]).row() if hasattr(self.table_view.model(), "mapToSource") else row
+        tgt = self.targets[source_row] if source_row < len(self.targets) else self.targets[row]
+        context = self._build_session_context()
+        prompt = (
+            f"Current session context:\n{context}\n\n"
+            f"Please provide an observing guide for the object '{tgt.name}' "
+            f"(RA {tgt.ra:.2f}°, Dec {tgt.dec:.2f}°). Include: object type, distance, "
+            f"apparent size/magnitude, what it looks like in a small telescope, best eyepiece "
+            f"magnification, any filters that help, and interesting historical or scientific facts."
+        )
+        self._dispatch_llm(prompt, tag="describe", label=f"🔭 Describe: {tgt.name}")
+
+    def _ai_suggest_targets(self) -> None:
+        """Ask the LLM to suggest additional targets for tonight's session."""
+        context = self._build_session_context()
+        current_names = ", ".join(t.name for t in self.targets) if self.targets else "none"
+        prompt = (
+            f"Current session context:\n{context}\n\n"
+            f"Based on the site, date, and current target list ({current_names}), "
+            f"suggest 5–8 additional deep-sky objects or planets that would be well-placed "
+            f"for observation tonight. For each object include: name, type, approximate "
+            f"altitude at midnight, required aperture, and a one-sentence description. "
+            f"Prioritise objects above {self.limit_spin.value()}° altitude and with good "
+            f"separation from the Moon."
+        )
+        self._dispatch_llm(prompt, tag="suggest", label="💡 Suggest targets for tonight")
+
+    def _ai_optimize_plan(self) -> None:
+        """Ask the LLM to suggest an optimal observation order."""
+        if not self.targets:
+            QMessageBox.information(self, "No targets", "Load some targets first.")
+            return
+        context = self._build_session_context()
+        prompt = (
+            f"Current session context:\n{context}\n\n"
+            f"Suggest an optimal observation order for the targets listed above. "
+            f"Consider: rising/setting times, transit times, current altitude, "
+            f"Moon separation, and efficient telescope slewing. "
+            f"Explain the reasoning for the recommended order. "
+            f"Also flag any targets that will be below the altitude limit for most of the night."
+        )
+        self._dispatch_llm(prompt, tag="optimize", label="📋 Optimize observation order")
+
+    def _dispatch_llm(self, prompt: str, tag: str, label: str) -> None:
+        """Start an LLM worker for the given prompt (one at a time)."""
+        if self._llm_worker and self._llm_worker.isRunning():
+            self._append_ai_message("⚠️ The AI is still processing the previous request. Please wait.", is_error=True)
+            return
+
+        # Make the AI panel visible and show a spinner-style status
+        self.ai_panel.setVisible(True)
+        self.ai_toggle_btn.setChecked(True)
+        self._append_ai_message(f"**{label}**", is_user=True)
+        self.ai_status_label.setText("⏳ Thinking…")
+
+        worker = LLMWorker(
+            config=self.llm_config,
+            prompt=prompt,
+            system_prompt=self._SYSTEM_PROMPT,
+            tag=tag,
+            parent=self,
+        )
+        worker.responseReady.connect(self._on_ai_response)
+        worker.errorOccurred.connect(self._on_ai_error)
+        worker.finished.connect(lambda: self.ai_status_label.setText("Ready"))
+        self._llm_worker = worker
+        worker.start()
+
+    @Slot(str, str)
+    def _on_ai_response(self, tag: str, text: str) -> None:
+        """Handle a successful LLM response."""
+        logger.info("LLM response received (tag=%s, length=%d)", tag, len(text))
+        self._append_ai_message(text, is_ai=True)
+
+    @Slot(str)
+    def _on_ai_error(self, message: str) -> None:
+        """Handle an LLM error."""
+        logger.warning("LLM error: %s", message)
+        self._append_ai_message(f"❌ {message}", is_error=True)
+
+    def _append_ai_message(
+        self,
+        text: str,
+        *,
+        is_user: bool = False,
+        is_ai: bool = False,
+        is_error: bool = False,
+    ) -> None:
+        """Append a formatted message to the AI chat output widget."""
+        if is_user:
+            html = f'<p style="color:#89b4fa;margin:2px 0"><b>{text}</b></p>'
+        elif is_error:
+            html = f'<p style="color:#f38ba8;margin:2px 0">{text}</p>'
+        else:
+            # Convert plain newlines to <br> for AI responses
+            body = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            body = body.replace("\n", "<br>")
+            html = f'<p style="color:#cdd6f4;margin:2px 0">{body}</p>'
+        self.ai_output.append(html)
+        # Scroll to bottom
+        self.ai_output.verticalScrollBar().setValue(
+            self.ai_output.verticalScrollBar().maximum()
+        )
 
     @Slot()
     def _update_limit(self):
