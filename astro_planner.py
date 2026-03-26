@@ -45,13 +45,14 @@ from __future__ import annotations
 # Standard library imports
 import argparse
 import csv
+import html as html_module
 import io
 import json
 import math
 import os
 import sys
 import threading
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
@@ -317,9 +318,9 @@ def _cutout_survey_hips(key: object) -> str:
 def _finder_survey_candidates(key: object) -> list[str]:
     norm = _normalize_cutout_survey_key(key)
     mapping: dict[str, list[str]] = {
-        "dss2": ["DSS2 Red"],
-        "panstarrs": ["PanSTARRS g", "DSS2 Red"],
-        "2mass": ["2MASS-K", "DSS2 Red"],
+        "dss2": ["DSS2 Red", "DSS", "DSS1 Red", "DSS2 IR", "2MASS-K"],
+        "panstarrs": ["PanSTARRS g", "DSS2 Red", "DSS", "2MASS-K"],
+        "2mass": ["2MASS-K", "DSS2 Red", "DSS"],
     }
     return mapping.get(norm, ["DSS"])
 
@@ -381,11 +382,19 @@ def _plot_finder_image_compat(
             try:
                 plot_finder_image(target, **kwargs)
                 return
+            except IndexError as exc:
+                # astroplan blindly indexes SkyView.get_images()[0][0].
+                # SkyView occasionally returns an empty list for a field/survey pair.
+                raise LookupError(f"SkyView returned no image for survey '{survey}'") from exc
             except TypeError as exc:
                 # astroplan<->astroquery API mismatch: newer astroquery dropped "grid"
                 if "grid" not in str(exc).lower():
                     raise
-                plot_finder_image(target, **kwargs)
+                try:
+                    plot_finder_image(target, **kwargs)
+                    return
+                except IndexError as inner_exc:
+                    raise LookupError(f"SkyView returned no image for survey '{survey}'") from inner_exc
         finally:
             SkyView.get_images = original
             SkyView._request = original_request
@@ -412,7 +421,7 @@ def _render_finder_chart_png_bytes(
         coord=SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg),
     )
     fov_radius = max(1.0, float(fov_arcmin) / 2.0) * u.arcmin
-    last_exc: Optional[Exception] = None
+    failures: list[str] = []
 
     for survey in _finder_survey_candidates(survey_key):
         fig = Figure(figsize=(inches_w, inches_h), dpi=dpi)
@@ -438,15 +447,15 @@ def _render_finder_chart_png_bytes(
             if payload:
                 return payload
         except Exception as exc:  # noqa: BLE001
-            last_exc = exc
+            failures.append(f"{survey}: {exc}")
         finally:
             try:
                 plt.close(fig)
             except Exception:
                 pass
 
-    if last_exc is not None:
-        raise RuntimeError(str(last_exc))
+    if failures:
+        raise RuntimeError(" / ".join(failures))
     raise RuntimeError("Finder chart unavailable")
 
 
@@ -632,7 +641,7 @@ def _normalized_css_color(value: object) -> str:
 
 
 class NoSelectBackgroundDelegate(QStyledItemDelegate):
-    """Delegate that preserves model background for column 0 even when selected."""
+    """Delegate that preserves model background for the target-name column when selected."""
     def paint(self, painter, option, index):
         # Disable the selected state to preserve background
         if option.state & QStyle.State_Selected:
@@ -828,6 +837,28 @@ class GeneralSettingsDialog(QDialog):
         layout.addRow("Cutout FOV:", self.cutout_fov_spin)
         layout.addRow("Cutout size:", self.cutout_size_spin)
 
+        # Local LLM defaults
+        self.llm_url_edit = QLineEdit(self)
+        self.llm_url_edit.setPlaceholderText(LLMConfig.DEFAULT_URL)
+        self.llm_url_edit.setText(
+            parent.settings.value("llm/serverUrl", LLMConfig.DEFAULT_URL, type=str)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_URL
+        )
+        self.llm_model_edit = QLineEdit(self)
+        self.llm_model_edit.setPlaceholderText(LLMConfig.DEFAULT_MODEL)
+        self.llm_model_edit.setText(
+            parent.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_MODEL
+        )
+
+        llm_hdr = QLabel("Local AI assistant (optional)")
+        llm_hdr.setObjectName("SectionHint")
+        layout.addRow(llm_hdr)
+        layout.addRow("LLM server URL:", self.llm_url_edit)
+        layout.addRow("LLM model:", self.llm_model_edit)
+
         # TNS credentials (optional, used for TNS resolver)
         self.tns_api_edit = QLineEdit(self)
         self.tns_api_edit.setEchoMode(QLineEdit.Password)
@@ -899,6 +930,10 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("general/cutoutSurvey", _normalize_cutout_survey_key(self.cutout_survey_combo.currentData()))
         s.setValue("general/cutoutFovArcmin", _sanitize_cutout_fov_arcmin(self.cutout_fov_spin.value()))
         s.setValue("general/cutoutSizePx", _sanitize_cutout_size_px(self.cutout_size_spin.value()))
+        llm_url = self.llm_url_edit.text().strip() or LLMConfig.DEFAULT_URL
+        llm_model = self.llm_model_edit.text().strip() or LLMConfig.DEFAULT_MODEL
+        s.setValue("llm/serverUrl", llm_url)
+        s.setValue("llm/model", llm_model)
         s.setValue("general/tnsApiKey", self.tns_api_edit.text().strip())
         s.setValue("general/tnsBotId", self.tns_bot_id_edit.text().strip())
         s.setValue("general/tnsBotName", self.tns_bot_name_edit.text().strip())
@@ -1522,6 +1557,208 @@ class AstronomyWorker(QThread):
             len(self.targets),
             obs_date.toString("yyyy-MM-dd"))                   # type: ignore[arg-type]
         self.finished.emit(payload)
+
+
+# --------------------------------------------------
+# --- Local LLM integration ------------------------
+# --------------------------------------------------
+class LLMConfig:
+    """Configuration for a local OpenAI-compatible inference server."""
+
+    DEFAULT_URL = "http://localhost:8080"
+    DEFAULT_MODEL = "bitnet-b1.58-3b"
+    DEFAULT_TIMEOUT_S = 45
+
+    def __init__(
+        self,
+        url: str = DEFAULT_URL,
+        model: str = DEFAULT_MODEL,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
+    ) -> None:
+        normalized_url = str(url or self.DEFAULT_URL).strip().rstrip("/")
+        normalized_model = str(model or self.DEFAULT_MODEL).strip()
+        self.url = normalized_url or self.DEFAULT_URL
+        self.model = normalized_model or self.DEFAULT_MODEL
+        self.timeout_s = max(5, int(timeout_s))
+
+
+class LLMWorker(QThread):
+    """Send a single prompt to a local OpenAI-compatible server."""
+
+    responseReady = Signal(str, str)  # (tag, text)
+    responseChunk = Signal(str, str)  # (tag, delta)
+    errorOccurred = Signal(str)  # message
+
+    def __init__(
+        self,
+        config: LLMConfig,
+        prompt: str,
+        system_prompt: str = "",
+        tag: str = "chat",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.config = config
+        self.prompt = prompt
+        self.system_prompt = system_prompt
+        self.tag = tag
+
+    @staticmethod
+    def _extract_content(data: object) -> str:
+        if not isinstance(data, dict):
+            return ""
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict):
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    return content.strip()
+                if isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "text":
+                            txt = item.get("text", "")
+                            if isinstance(txt, str) and txt.strip():
+                                parts.append(txt.strip())
+                    if parts:
+                        return "\n".join(parts)
+            text = first.get("text")
+            if isinstance(text, str):
+                return text.strip()
+        return ""
+
+    @staticmethod
+    def _extract_delta_content(data: object) -> str:
+        if not isinstance(data, dict):
+            return ""
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        delta = first.get("delta")
+        if not isinstance(delta, dict):
+            return ""
+        content = delta.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    txt = item.get("text", "")
+                    if isinstance(txt, str) and txt:
+                        parts.append(txt)
+            if parts:
+                return "".join(parts)
+        return ""
+
+    def _consume_sse_stream(self, response) -> str:
+        chunks: list[str] = []
+        event_lines: list[str] = []
+
+        def _flush_event() -> bool:
+            if not event_lines:
+                return False
+            payload_text = "\n".join(event_lines).strip()
+            event_lines.clear()
+            if not payload_text:
+                return False
+            if payload_text == "[DONE]":
+                return True
+            try:
+                decoded = json.loads(payload_text)
+            except json.JSONDecodeError:
+                return False
+            delta = self._extract_delta_content(decoded)
+            if delta:
+                chunks.append(delta)
+                self.responseChunk.emit(self.tag, delta)
+                return False
+            if not chunks:
+                fallback = self._extract_content(decoded)
+                if fallback:
+                    chunks.append(fallback)
+                    self.responseChunk.emit(self.tag, fallback)
+            return False
+
+        for raw_line in response:
+            if self.isInterruptionRequested():
+                break
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                if _flush_event():
+                    break
+                continue
+            if line.startswith("data:"):
+                event_lines.append(line[5:].lstrip())
+
+        if not self.isInterruptionRequested() and event_lines:
+            _flush_event()
+        return "".join(chunks)
+
+    def run(self) -> None:  # noqa: D401
+        if self.isInterruptionRequested():
+            return
+        messages: list[dict[str, str]] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": self.prompt})
+        payload = json.dumps(
+            {
+                "model": self.config.model,
+                "messages": messages,
+                "max_tokens": 1024,
+                "temperature": 0.7,
+                "stream": True,
+            }
+        ).encode("utf-8")
+        request = Request(
+            f"{self.config.url}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.config.timeout_s) as response:
+                content_type = response.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    text = self._consume_sse_stream(response)
+                else:
+                    body = response.read().decode("utf-8", errors="replace")
+                    decoded = json.loads(body)
+                    text = self._extract_content(decoded)
+            if not text:
+                raise RuntimeError("LLM response does not contain message content.")
+            self.responseReady.emit(self.tag, text)
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                detail = ""
+            if detail:
+                self.errorOccurred.emit(f"LLM HTTP {exc.code}: {detail[:280]}")
+            else:
+                self.errorOccurred.emit(f"LLM HTTP {exc.code}.")
+        except URLError as exc:
+            reason = getattr(exc, "reason", str(exc))
+            self.errorOccurred.emit(
+                f"Cannot reach LLM server at {self.config.url}: {reason}\n"
+                "Start your local server and verify URL/model in Settings -> General Settings."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.errorOccurred.emit(f"LLM request failed ({type(exc).__name__}): {exc}")
 
 
 # --------------------------------------------------
@@ -2917,6 +3154,14 @@ class MainWindow(QMainWindow):
         self._cutout_size_px = _sanitize_cutout_size_px(
             self.settings.value("general/cutoutSizePx", CUTOUT_DEFAULT_SIZE_PX, type=int)
         )
+        self.llm_config = LLMConfig(
+            url=self.settings.value("llm/serverUrl", LLMConfig.DEFAULT_URL, type=str),
+            model=self.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str),
+            timeout_s=LLMConfig.DEFAULT_TIMEOUT_S,
+        )
+        self._llm_worker: Optional[LLMWorker] = None
+        self._ai_messages: list[dict[str, str]] = []
+        self._ai_stream_message_index: Optional[int] = None
         self._cutout_manager = QNetworkAccessManager(self)
         self._cutout_manager.finished.connect(self._on_cutout_reply)
         self._cutout_request_id = 0
@@ -2949,7 +3194,7 @@ class MainWindow(QMainWindow):
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.deleteRequested.connect(self._delete_selected_targets)
         # Use custom delegate for Name column to preserve its background on selection
-        self.table_view.setItemDelegateForColumn(0, NoSelectBackgroundDelegate(self.table_view))
+        self.table_view.setItemDelegateForColumn(TargetTableModel.COL_NAME, NoSelectBackgroundDelegate(self.table_view))
         # Make columns only as wide as their contents
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
@@ -3267,6 +3512,12 @@ class MainWindow(QMainWindow):
         table_settings_btn.setMinimumHeight(28)
         table_settings_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogListView))
         table_settings_btn.clicked.connect(self.open_table_settings)
+        self.ai_toggle_btn = QPushButton("AI Assistant")
+        self.ai_toggle_btn.setMinimumHeight(28)
+        self.ai_toggle_btn.setCheckable(True)
+        self.ai_toggle_btn.setChecked(False)
+        self.ai_toggle_btn.setToolTip("Toggle the local AI assistant panel")
+        self.ai_toggle_btn.toggled.connect(self._toggle_ai_panel)
 
         session_strip = QWidget()
         session_strip.setObjectName("SessionStrip")
@@ -3302,6 +3553,7 @@ class MainWindow(QMainWindow):
         actions_l.addWidget(save_btn)
         actions_l.addWidget(settings_btn)
         actions_l.addWidget(table_settings_btn)
+        actions_l.addWidget(self.ai_toggle_btn)
         actions_l.addStretch(1)
         actions_bar.setLayout(actions_l)
         actions_bar.setMinimumHeight(46)
@@ -3568,6 +3820,8 @@ class MainWindow(QMainWindow):
         main_l.setSpacing(0)
         main_l.addWidget(main_vertical)
         main_area.setLayout(main_l)
+        self.ai_panel = self._build_ai_panel()
+        self.ai_panel.setVisible(False)
 
         container = QWidget()
         container.setObjectName("RootContainer")
@@ -3576,6 +3830,7 @@ class MainWindow(QMainWindow):
         container_l.setSpacing(2)
         container_l.addWidget(top_controls)
         container_l.addWidget(main_area, 1)
+        container_l.addWidget(self.ai_panel)
         container_l.addWidget(actions_bar)
         container.setLayout(container_l)
         self.setCentralWidget(container)
@@ -3685,6 +3940,16 @@ class MainWindow(QMainWindow):
 
         self.dark_act = QAction("Toggle dark mode", self, shortcut=QKeySequence("Ctrl+D"))
         self.dark_act.triggered.connect(self._toggle_dark)
+        self.ai_describe_act = QAction("Describe selected object", self, shortcut=QKeySequence("Ctrl+I"))
+        self.ai_describe_act.triggered.connect(self._ai_describe_target)
+        self.ai_suggest_act = QAction("Suggest targets for tonight", self, shortcut=QKeySequence("Ctrl+Shift+I"))
+        self.ai_suggest_act.triggered.connect(self._ai_suggest_targets)
+        self.ai_optimize_act = QAction("Optimize observation order", self)
+        self.ai_optimize_act.triggered.connect(self._ai_optimize_plan)
+        self.ai_toggle_panel_act = QAction("Toggle AI panel", self)
+        self.ai_toggle_panel_act.triggered.connect(
+            lambda: self.ai_toggle_btn.setChecked(not self.ai_toggle_btn.isChecked())
+        )
 
         self.view_obs_preset_act = QAction("Observation Columns", self, checkable=True)
         self.view_obs_preset_act.triggered.connect(lambda: self._apply_column_preset("observation"))
@@ -3701,7 +3966,17 @@ class MainWindow(QMainWindow):
             self.view_obs_preset_act.setChecked(True)
 
         # Make shortcuts work even if the action isn't in a visible menu
-        for act in (self.load_act, self.load_plan_act, self.add_act, self.toggle_obs_act, self.exp_act, self.dark_act):
+        for act in (
+            self.load_act,
+            self.load_plan_act,
+            self.add_act,
+            self.toggle_obs_act,
+            self.exp_act,
+            self.dark_act,
+            self.ai_describe_act,
+            self.ai_suggest_act,
+            self.ai_optimize_act,
+        ):
             self.addAction(act)
 
         # ----- Menu bar -----
@@ -3726,6 +4001,13 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.view_obs_preset_act)
         view_menu.addAction(self.view_full_preset_act)
 
+        ai_menu = menubar.addMenu("&AI")
+        ai_menu.addAction(self.ai_describe_act)
+        ai_menu.addAction(self.ai_suggest_act)
+        ai_menu.addAction(self.ai_optimize_act)
+        ai_menu.addSeparator()
+        ai_menu.addAction(self.ai_toggle_panel_act)
+
         # Settings menu
         settings_menu = menubar.addMenu("&Settings")
         self.gen_settings_act = QAction("General Settings…", self)
@@ -3744,11 +4026,11 @@ class MainWindow(QMainWindow):
         """Load saved settings and apply both Table and General."""
         self._apply_table_settings()
         # Apply default sort column
-        val = self.settings.value("table/defaultSortColumn", 7)
+        val = self.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE)
         try:
             default_sort = int(val)
         except (TypeError, ValueError):
-            default_sort = 7
+            default_sort = TargetTableModel.COL_SCORE
         # Validate index
         ncols = self.table_model.columnCount()
         if 0 <= default_sort < ncols:
@@ -3756,15 +4038,15 @@ class MainWindow(QMainWindow):
         self._apply_general_settings()
 
     def _apply_table_settings(self):
-        """Apply table row height and first-column width."""
+        """Apply table row height and table column widths."""
         row_h = self.settings.value("table/rowHeight", 24, type=int)
         self.table_view.verticalHeader().setDefaultSectionSize(row_h)
         # Lock row height and apply to all existing rows
         for r in range(self.table_model.rowCount()):
             self.table_view.setRowHeight(r, row_h)
-        col_w = self.settings.value("table/firstColumnWidth", 100, type=int)
-        self.table_view.setColumnWidth(0, col_w)
-        # Lock the first column so Stretch mode doesn’t override it
+        first_col_w = self.settings.value("table/firstColumnWidth", 100, type=int)
+        self.table_view.setColumnWidth(0, first_col_w)
+        # Lock first column so Stretch mode doesn’t override it
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         # Font size
@@ -3851,6 +4133,14 @@ class MainWindow(QMainWindow):
         self._cutout_fov_arcmin = new_cutout_fov_arcmin
         self._cutout_size_px = new_cutout_size_px
         self._cutout_view_key = new_cutout_view_key
+        self.llm_config.url = (
+            self.settings.value("llm/serverUrl", LLMConfig.DEFAULT_URL, type=str)
+            or LLMConfig.DEFAULT_URL
+        ).strip().rstrip("/") or LLMConfig.DEFAULT_URL
+        self.llm_config.model = (
+            self.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str)
+            or LLMConfig.DEFAULT_MODEL
+        ).strip() or LLMConfig.DEFAULT_MODEL
 
         if hasattr(self, "min_moon_sep_spin"):
             self.min_moon_sep_spin.blockSignals(True)
@@ -3989,6 +4279,8 @@ class MainWindow(QMainWindow):
             self.sel_window_label.setText("-")
             self.sel_notes_label.setText("-")
             self.edit_object_btn.setEnabled(False)
+            if hasattr(self, "ai_describe_act"):
+                self.ai_describe_act.setEnabled(False)
             self._update_cutout_preview_for_target(None)
             self._update_night_details_constraints()
             self._update_status_bar()
@@ -4026,6 +4318,8 @@ class MainWindow(QMainWindow):
             self.sel_window_label.setText("-")
         self.sel_notes_label.setText(tgt.notes or "-")
         self.edit_object_btn.setEnabled(True)
+        if hasattr(self, "ai_describe_act"):
+            self.ai_describe_act.setEnabled(True)
         self._update_cutout_preview_for_target(tgt)
         self._update_night_details_constraints()
         self._update_status_bar()
@@ -4384,6 +4678,18 @@ class MainWindow(QMainWindow):
                 logger.debug("AstronomyWorker stopped")
             except Exception as exc:
                 logger.exception("Failed to stop AstronomyWorker: %s", exc)
+        llm_worker = getattr(self, "_llm_worker", None)
+        if llm_worker is not None:
+            try:
+                if llm_worker.isRunning():
+                    llm_worker.requestInterruption()
+                    llm_worker.quit()
+                    if not llm_worker.wait(1200):
+                        llm_worker.terminate()
+                        llm_worker.wait(400)
+            except Exception as exc:
+                logger.exception("Failed to stop LLMWorker: %s", exc)
+            self._llm_worker = None
         meta_worker = getattr(self, "_meta_worker", None)
         if meta_worker is not None:
             try:
@@ -4401,7 +4707,7 @@ class MainWindow(QMainWindow):
 
     def _apply_default_sort(self):
         """Apply default sort column from settings."""
-        default_sort = self.settings.value("table/defaultSortColumn", 7, type=int)
+        default_sort = self.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE, type=int)
         cols = self.table_model.columnCount()
         if 0 <= default_sort < cols:
             self.table_view.sortByColumn(default_sort, Qt.AscendingOrder)
@@ -6082,6 +6388,607 @@ class MainWindow(QMainWindow):
         if last_error is None:
             raise ValueError(f"Unable to resolve '{query}' using {source_label}.")
         raise ValueError(f"Unable to resolve '{query}' using {source_label}: {last_error}") from last_error
+
+    def _build_ai_panel(self) -> QWidget:
+        panel = QFrame(self)
+        panel.setObjectName("AIAssistantPanel")
+        panel.setMinimumHeight(170)
+        panel.setMaximumHeight(260)
+
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(6)
+
+        describe_btn = QPushButton("Describe Object")
+        describe_btn.clicked.connect(self._ai_describe_target)
+        btn_col.addWidget(describe_btn)
+
+        suggest_btn = QPushButton("Suggest Targets")
+        suggest_btn.clicked.connect(self._ai_suggest_targets)
+        btn_col.addWidget(suggest_btn)
+
+        optimize_btn = QPushButton("Optimize Order")
+        optimize_btn.clicked.connect(self._ai_optimize_plan)
+        btn_col.addWidget(optimize_btn)
+
+        btn_col.addStretch(1)
+        btn_widget = QWidget(panel)
+        btn_widget.setLayout(btn_col)
+        btn_widget.setFixedWidth(145)
+        layout.addWidget(btn_widget)
+
+        self.ai_output = QTextEdit(panel)
+        self.ai_output.setReadOnly(True)
+        self.ai_output.setPlaceholderText(
+            "AI responses will appear here.\n"
+            "Configure your local LLM in Settings -> General Settings."
+        )
+        layout.addWidget(self.ai_output, 1)
+
+        input_col = QVBoxLayout()
+        input_col.setSpacing(6)
+
+        self.ai_input = QLineEdit(panel)
+        self.ai_input.setPlaceholderText("Ask about tonight's observing plan...")
+        self.ai_input.returnPressed.connect(self._send_ai_query)
+        input_col.addWidget(self.ai_input)
+
+        send_btn = QPushButton("Send")
+        send_btn.clicked.connect(self._send_ai_query)
+        input_col.addWidget(send_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self._clear_ai_messages)
+        input_col.addWidget(clear_btn)
+
+        self.ai_status_label = QLabel("Ready", panel)
+        self.ai_status_label.setObjectName("SectionHint")
+        input_col.addWidget(self.ai_status_label)
+        input_col.addStretch(1)
+
+        input_widget = QWidget(panel)
+        input_widget.setLayout(input_col)
+        input_widget.setFixedWidth(210)
+        layout.addWidget(input_widget)
+
+        return panel
+
+    @Slot(bool)
+    def _toggle_ai_panel(self, checked: bool) -> None:
+        if hasattr(self, "ai_panel"):
+            self.ai_panel.setVisible(bool(checked))
+        if hasattr(self, "ai_toggle_btn"):
+            self.ai_toggle_btn.setText("Hide AI" if checked else "AI Assistant")
+
+    def _build_session_context(self, *, include_current_snapshot: bool = True) -> str:
+        parts: list[str] = []
+        date_str = self.date_edit.date().toString("yyyy-MM-dd")
+        parts.append(f"Observation date: {date_str}")
+        site = self.table_model.site
+        if site:
+            parts.append(
+                f"Site: {site.name} (lat {site.latitude:.3f}, lon {site.longitude:.3f}, "
+                f"elev {site.elevation:.0f} m, timezone {site.timezone_name})"
+            )
+        parts.append(f"Altitude limit: {self.limit_spin.value()} deg")
+        parts.append(f"Sun altitude threshold: {self._sun_alt_limit():.0f} deg")
+
+        payload = self.last_payload if isinstance(self.last_payload, dict) else None
+        tz_name = site.timezone_name if site else "UTC"
+        try:
+            tz = pytz.timezone(tz_name)
+        except Exception:
+            tz = pytz.UTC
+        now_local = None
+        if payload:
+            tz_name = str(payload.get("tz", tz_name or "UTC"))
+            try:
+                tz = pytz.timezone(tz_name)
+            except Exception:
+                tz = pytz.UTC
+            now_local = payload.get("now_local")
+
+            if isinstance(now_local, datetime):
+                try:
+                    now_local = now_local.astimezone(tz)
+                except Exception:
+                    pass
+
+            def _fmt_event(key: str) -> str:
+                raw = payload.get(key)
+                if raw is None:
+                    return "N/A"
+                try:
+                    dt = mdates.num2date(float(raw)).astimezone(tz)
+                    return dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    return "N/A"
+
+            if isinstance(now_local, datetime):
+                parts.append(f"Current local time: {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
+            parts.append(
+                "Events: "
+                f"sunset {_fmt_event('sunset')}, sunrise {_fmt_event('sunrise')}, "
+                f"dusk {_fmt_event('dusk')}, dawn {_fmt_event('dawn')}"
+            )
+            moon_phase = payload.get("moon_phase")
+            if moon_phase is not None:
+                try:
+                    parts.append(f"Moon phase: {float(moon_phase):.1f}%")
+                except Exception:
+                    pass
+
+        if not self.targets:
+            parts.append("Targets: none")
+            return "\n".join(parts)
+
+        rows: list[str] = []
+        max_items = 40
+        for idx, target in enumerate(self.targets):
+            if idx >= max_items:
+                rows.append(f"  - ... and {len(self.targets) - max_items} more")
+                break
+            details: list[str] = [f"priority {target.priority}"]
+            if target.observed:
+                details.append("observed yes")
+
+            metrics = self.target_metrics.get(target.name)
+            if metrics is not None:
+                details.extend(
+                    [
+                        f"score {metrics.score:.1f}",
+                        f"hours_above_limit {metrics.hours_above_limit:.2f} h",
+                        f"max_altitude {metrics.max_altitude_deg:.1f} deg",
+                        f"peak_moon_sep {metrics.peak_moon_sep_deg:.1f} deg",
+                    ]
+                )
+
+            window = self.target_windows.get(target.name)
+            if window is not None:
+                try:
+                    start_txt = window[0].astimezone(tz).strftime("%Y-%m-%d %H:%M")
+                    end_txt = window[1].astimezone(tz).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    start_txt = window[0].strftime("%Y-%m-%d %H:%M")
+                    end_txt = window[1].strftime("%Y-%m-%d %H:%M")
+                details.append(f"best_window_local {start_txt} -> {end_txt}")
+            else:
+                details.append("best_window_local none under current constraints")
+
+            if include_current_snapshot:
+                if idx < len(self.table_model.current_alts):
+                    alt_now = self.table_model.current_alts[idx]
+                    if math.isfinite(alt_now):
+                        details.append(f"current_alt_snapshot {alt_now:.1f} deg")
+                if idx < len(self.table_model.current_azs):
+                    az_now = self.table_model.current_azs[idx]
+                    if math.isfinite(az_now):
+                        details.append(f"current_az_snapshot {az_now:.1f} deg")
+                if idx < len(self.table_model.current_seps):
+                    moon_sep_now = self.table_model.current_seps[idx]
+                    if math.isfinite(moon_sep_now):
+                        details.append(f"current_moon_sep_snapshot {moon_sep_now:.1f} deg")
+
+            rows.append(
+                f"  - {target.name}: RA {target.ra:.3f} deg, Dec {target.dec:.3f} deg; "
+                + "; ".join(details)
+        )
+        parts.append("Current targets:\n" + "\n".join(rows))
+        return "\n".join(parts)
+
+    def _format_local_dt(self, value: datetime) -> str:
+        payload = self.last_payload if isinstance(self.last_payload, dict) else None
+        tz_name = str(payload.get("tz", "UTC")) if payload else "UTC"
+        try:
+            tz = pytz.timezone(tz_name)
+        except Exception:
+            tz = pytz.UTC
+        try:
+            return value.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return value.strftime("%Y-%m-%d %H:%M")
+
+    def _build_deterministic_observation_order(self) -> tuple[list[dict[str, object]], list[str]]:
+        payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
+        if not payload:
+            return [], ["Run a visibility calculation first so night windows are available."]
+
+        try:
+            tz = pytz.timezone(str(payload.get("tz", "UTC")))
+        except Exception:
+            tz = pytz.UTC
+
+        try:
+            times = [t.astimezone(tz) for t in mdates.num2date(payload["times"])]
+        except Exception:
+            return [], ["Visibility samples are unavailable in the current plot state."]
+
+        if not times:
+            return [], ["Visibility samples are unavailable in the current plot state."]
+
+        limit = float(self.limit_spin.value())
+        sun_alt_limit = self._sun_alt_limit()
+        sun_alt_series = np.array(payload.get("sun_alt", np.full(len(times), np.nan)), dtype=float)
+        obs_sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= sun_alt_limit)
+
+        considered_rows = set(range(len(self.targets)))
+        if self.table_model.row_enabled:
+            visible_rows = {idx for idx, enabled in enumerate(self.table_model.row_enabled) if enabled}
+            if visible_rows:
+                considered_rows = visible_rows
+
+        valid_items: list[dict[str, object]] = []
+        invalid_notes: list[str] = []
+
+        for idx, target in enumerate(self.targets):
+            if idx not in considered_rows:
+                continue
+
+            target_payload = payload.get(target.name)
+            if not isinstance(target_payload, dict):
+                invalid_notes.append(f"{target.name}: missing altitude series in current plot data.")
+                continue
+
+            alt = np.array(target_payload.get("altitude", []), dtype=float)
+            if alt.shape[0] != len(times):
+                invalid_notes.append(f"{target.name}: incomplete altitude series in current plot data.")
+                continue
+
+            valid_mask = np.isfinite(alt) & (alt >= limit) & obs_sun_mask
+            metrics = self.target_metrics.get(target.name)
+            if not valid_mask.any():
+                invalid_notes.append(f"{target.name}: no valid observing window under current constraints.")
+                continue
+
+            valid_indices = np.where(valid_mask)[0]
+            runs = np.split(valid_indices, np.where(np.diff(valid_indices) != 1)[0] + 1)
+            run_candidates: list[dict[str, object]] = []
+            for run in runs:
+                if len(run) == 0:
+                    continue
+                start_idx = int(run[0])
+                end_idx = min(int(run[-1]) + 1, len(times) - 1)
+                peak_idx = int(run[np.argmax(alt[run])])
+                start_dt = times[start_idx]
+                end_dt = times[end_idx]
+                duration_h = max(0.0, (end_dt - start_dt).total_seconds() / 3600.0)
+                still_rising = peak_idx >= int(run[-1])
+                run_candidates.append(
+                    {
+                        "window_start": start_dt,
+                        "window_end": end_dt,
+                        "peak_time": times[peak_idx],
+                        "window_hours": duration_h,
+                        "still_rising": still_rising,
+                    }
+                )
+
+            if not run_candidates:
+                invalid_notes.append(f"{target.name}: no valid observing window under current constraints.")
+                continue
+
+            selected_run = min(
+                run_candidates,
+                key=lambda item: (
+                    int(bool(item["still_rising"])),
+                    item["window_end"] if bool(item["still_rising"]) else item["window_start"],
+                    item["window_start"] if bool(item["still_rising"]) else item["peak_time"],
+                    item["window_hours"],
+                    item["peak_time"],
+                ),
+            )
+
+            valid_items.append(
+                {
+                    "row_index": idx,
+                    "name": target.name,
+                    "priority": int(target.priority),
+                    "score": float(metrics.score) if metrics else 0.0,
+                    "hours_above_limit": float(metrics.hours_above_limit) if metrics else 0.0,
+                    "max_altitude_deg": float(metrics.max_altitude_deg) if metrics else 0.0,
+                    "peak_moon_sep_deg": float(metrics.peak_moon_sep_deg) if metrics else 0.0,
+                    "window_start": selected_run["window_start"],
+                    "window_end": selected_run["window_end"],
+                    "peak_time": selected_run["peak_time"],
+                    "window_hours": selected_run["window_hours"],
+                    "still_rising": selected_run["still_rising"],
+                }
+            )
+
+        valid_items.sort(
+            key=lambda item: (
+                int(bool(item["still_rising"])),
+                item["window_end"] if bool(item["still_rising"]) else item["window_start"],
+                item["window_start"] if bool(item["still_rising"]) else item["peak_time"],
+                item["window_hours"],
+                item["peak_time"],
+                item["window_end"],
+                item["window_start"],
+                -int(item["priority"]),
+                -float(item["score"]),
+                str(item["name"]).lower(),
+            )
+        )
+        return valid_items, invalid_notes
+
+    def _render_deterministic_observation_order(self) -> str:
+        ordered, invalid_notes = self._build_deterministic_observation_order()
+        if not ordered and invalid_notes:
+            return "Cannot build a deterministic order.\n" + "\n".join(f"- {note}" for note in invalid_notes)
+        if not ordered:
+            return "Cannot build a deterministic order from the current plot state."
+
+        lines = [
+            "Deterministic order based on the current night windows.",
+            "",
+        ]
+
+        for idx, item in enumerate(ordered, start=1):
+            start_txt = self._format_local_dt(item["window_start"])
+            end_txt = self._format_local_dt(item["window_end"])
+            peak_txt = self._format_local_dt(item["peak_time"])
+            lines.append(f"{idx}. {item['name']}")
+            lines.append(f"   Window: {start_txt} -> {end_txt}")
+            lines.append(f"   Peak in valid window: {peak_txt}")
+            lines.append(
+                "   Metrics: "
+                f"score {float(item['score']):.1f}, "
+                f"hours above limit {float(item['hours_above_limit']):.2f} h, "
+                f"max alt {float(item['max_altitude_deg']):.1f} deg, "
+                f"peak moon sep {float(item['peak_moon_sep_deg']):.1f} deg"
+            )
+            lines.append("")
+
+        if invalid_notes:
+            lines.append("Excluded under current constraints:")
+            lines.extend(f"- {note}" for note in invalid_notes)
+
+        return "\n".join(lines).strip()
+
+    _SYSTEM_PROMPT = (
+        "You are an expert astronomy observation assistant. "
+        "Provide concise, practical, and accurate guidance for planning observations. "
+        "When suggesting objects, prefer common catalog names (Messier, NGC, IC, etc.). "
+        "Use the provided session context and prioritize objects practical for the current site and night."
+    )
+
+    @Slot()
+    def _send_ai_query(self) -> None:
+        text = self.ai_input.text().strip() if hasattr(self, "ai_input") else ""
+        if not text:
+            return
+        self.ai_input.clear()
+        context = self._build_session_context()
+        prompt = f"Current session context:\n{context}\n\nUser question: {text}"
+        self._dispatch_llm(prompt, tag="chat", label=f"You: {text}")
+
+    @Slot()
+    def _ai_describe_target(self) -> None:
+        target = self._selected_target_or_none()
+        if target is None:
+            QMessageBox.information(self, "No selection", "Select one target first.")
+            return
+        context = self._build_session_context()
+        prompt = (
+            f"Current session context:\n{context}\n\n"
+            f"Prepare an observing guide for '{target.name}' "
+            f"(RA {target.ra:.3f} deg, Dec {target.dec:.3f} deg). "
+            "Include object type, apparent brightness, practical observing tips, "
+            "suggested magnification range, useful filters, and one short scientific note."
+        )
+        self._dispatch_llm(prompt, tag="describe", label=f"Describe: {target.name}")
+
+    @Slot()
+    def _ai_suggest_targets(self) -> None:
+        context = self._build_session_context()
+        current_names = ", ".join(target.name for target in self.targets) if self.targets else "none"
+        prompt = (
+            f"Current session context:\n{context}\n\n"
+            f"Current target list: {current_names}\n"
+            "Suggest 5 to 8 additional objects suitable for tonight. "
+            "For each object provide: name, type, best observing window, and one-sentence reason."
+        )
+        self._dispatch_llm(prompt, tag="suggest", label="Suggest targets")
+
+    @Slot()
+    def _ai_optimize_plan(self) -> None:
+        if not self.targets:
+            QMessageBox.information(self, "No targets", "Load or add targets first.")
+            return
+        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
+            self.ai_toggle_btn.setChecked(True)
+        self._append_ai_message("Optimize observation order", is_user=True)
+        self._append_ai_message(self._render_deterministic_observation_order(), is_ai=True)
+        if hasattr(self, "ai_status_label"):
+            self.ai_status_label.setText("Ready")
+
+    def _dispatch_llm(self, prompt: str, tag: str, label: str) -> None:
+        worker = self._llm_worker
+        if worker is not None and worker.isRunning():
+            self._append_ai_message(
+                "The AI assistant is still processing the previous request.",
+                is_error=True,
+            )
+            return
+        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
+            self.ai_toggle_btn.setChecked(True)
+        self._append_ai_message(label, is_user=True)
+        self._start_ai_response_message()
+        if hasattr(self, "ai_status_label"):
+            self.ai_status_label.setText("Thinking...")
+        worker = LLMWorker(
+            config=self.llm_config,
+            prompt=prompt,
+            system_prompt=self._SYSTEM_PROMPT,
+            tag=tag,
+            parent=self,
+        )
+        worker.responseChunk.connect(self._on_ai_chunk)
+        worker.responseReady.connect(self._on_ai_response)
+        worker.errorOccurred.connect(self._on_ai_error)
+        worker.finished.connect(self._on_ai_worker_finished)
+        self._llm_worker = worker
+        worker.start()
+
+    @Slot(str, str)
+    def _on_ai_chunk(self, tag: str, text: str) -> None:
+        if not text:
+            return
+        if hasattr(self, "ai_status_label"):
+            self.ai_status_label.setText("Streaming...")
+        self._append_ai_stream_chunk(text)
+
+    @Slot(str, str)
+    def _on_ai_response(self, tag: str, text: str) -> None:
+        logger.info("LLM response received (tag=%s, length=%d)", tag, len(text))
+        self._finalize_ai_response(text)
+
+    @Slot(str)
+    def _on_ai_error(self, message: str) -> None:
+        logger.warning("LLM error: %s", message)
+        self._fail_ai_response(message)
+
+    @Slot()
+    def _on_ai_worker_finished(self) -> None:
+        if hasattr(self, "ai_status_label"):
+            self.ai_status_label.setText("Ready")
+        idx = self._ai_stream_message_index
+        if idx is not None and 0 <= idx < len(self._ai_messages):
+            if not self._ai_messages[idx].get("text", "").strip():
+                self._ai_messages.pop(idx)
+                self._render_ai_messages()
+        self._ai_stream_message_index = None
+        sender = self.sender()
+        if sender is self._llm_worker:
+            self._llm_worker = None
+
+    def _clear_ai_messages(self) -> None:
+        self._ai_messages.clear()
+        self._ai_stream_message_index = None
+        if hasattr(self, "ai_output"):
+            self.ai_output.clear()
+
+    @staticmethod
+    def _mix_qcolors(first: QColor, second: QColor, first_ratio: float) -> QColor:
+        ratio = max(0.0, min(1.0, float(first_ratio)))
+        other_ratio = 1.0 - ratio
+        return QColor(
+            int(round(first.red() * ratio + second.red() * other_ratio)),
+            int(round(first.green() * ratio + second.green() * other_ratio)),
+            int(round(first.blue() * ratio + second.blue() * other_ratio)),
+        )
+
+    @staticmethod
+    def _qcolor_css(color: QColor) -> str:
+        return color.name(QColor.HexRgb)
+
+    def _render_ai_messages(self) -> None:
+        if not hasattr(self, "ai_output"):
+            return
+        palette = self.ai_output.palette()
+        base = palette.color(QPalette.Base)
+        alt_base = palette.color(QPalette.AlternateBase)
+        text_color = palette.color(QPalette.Text)
+        highlight = palette.color(QPalette.Highlight)
+        accent_red = QColor("#dc2626")
+
+        user_border = self._mix_qcolors(highlight, base, 0.45)
+        ai_border = self._mix_qcolors(text_color, base, 0.14)
+        error_border = self._mix_qcolors(accent_red, base, 0.38)
+        muted_text = self._mix_qcolors(text_color, base, 0.42)
+
+        parts: list[str] = []
+        for message in self._ai_messages:
+            kind = message.get("kind", "ai")
+            raw_text = str(message.get("text", ""))
+            escaped = html_module.escape(raw_text).replace("\n", "<br>")
+            if kind == "user":
+                html = (
+                    '<div style="margin:6px 0;text-align:right">'
+                    '<span style="display:inline-block;max-width:95%;padding:6px 9px;'
+                    'background:transparent;'
+                    f'border:1px solid {self._qcolor_css(user_border)};'
+                    f'border-radius:10px;color:{self._qcolor_css(text_color)}">'
+                    f"<b>{escaped}</b></span></div>"
+                )
+            elif kind == "error":
+                html = (
+                    '<div style="margin:6px 0;text-align:left">'
+                    '<span style="display:inline-block;max-width:95%;padding:6px 9px;'
+                    'background:transparent;'
+                    f'border:1px solid {self._qcolor_css(error_border)};'
+                    f'border-radius:10px;color:{self._qcolor_css(text_color)}">'
+                    f"{escaped}</span></div>"
+                )
+            else:
+                body = escaped or (
+                    f'<span style="color:{self._qcolor_css(muted_text)}"><i>...</i></span>'
+                )
+                html = (
+                    '<div style="margin:6px 0;text-align:left">'
+                    '<span style="display:inline-block;max-width:95%;padding:6px 9px;'
+                    'background:transparent;'
+                    f'border:1px solid {self._qcolor_css(ai_border)};'
+                    f'border-radius:10px;color:{self._qcolor_css(text_color)}">'
+                    f"{body}</span></div>"
+                )
+            parts.append(html)
+        self.ai_output.setHtml("".join(parts))
+        scroll = self.ai_output.verticalScrollBar()
+        scroll.setValue(scroll.maximum())
+
+    def _start_ai_response_message(self) -> None:
+        self._ai_stream_message_index = self._append_ai_message("", is_ai=True)
+
+    def _append_ai_stream_chunk(self, text: str) -> None:
+        if not text:
+            return
+        idx = self._ai_stream_message_index
+        if idx is None or not (0 <= idx < len(self._ai_messages)):
+            idx = self._append_ai_message("", is_ai=True)
+            self._ai_stream_message_index = idx
+        self._ai_messages[idx]["text"] = self._ai_messages[idx].get("text", "") + text
+        self._render_ai_messages()
+
+    def _finalize_ai_response(self, text: str) -> None:
+        idx = self._ai_stream_message_index
+        if idx is not None and 0 <= idx < len(self._ai_messages):
+            self._ai_messages[idx]["kind"] = "ai"
+            self._ai_messages[idx]["text"] = text
+            self._render_ai_messages()
+        else:
+            self._append_ai_message(text, is_ai=True)
+        self._ai_stream_message_index = None
+
+    def _fail_ai_response(self, message: str) -> None:
+        idx = self._ai_stream_message_index
+        if idx is not None and 0 <= idx < len(self._ai_messages):
+            current_text = self._ai_messages[idx].get("text", "")
+            if current_text.strip():
+                self._append_ai_message(message, is_error=True)
+            else:
+                self._ai_messages[idx]["kind"] = "error"
+                self._ai_messages[idx]["text"] = message
+                self._render_ai_messages()
+        else:
+            self._append_ai_message(message, is_error=True)
+        self._ai_stream_message_index = None
+
+    def _append_ai_message(
+        self,
+        text: str,
+        *,
+        is_user: bool = False,
+        is_ai: bool = False,
+        is_error: bool = False,
+    ) -> int:
+        kind = "user" if is_user else "error" if is_error else "ai" if is_ai else "info"
+        self._ai_messages.append({"kind": kind, "text": str(text)})
+        self._render_ai_messages()
+        return len(self._ai_messages) - 1
 
     @Slot(int)
     def _change_date(self, offset_days: int):
