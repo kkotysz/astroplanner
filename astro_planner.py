@@ -57,13 +57,13 @@ from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, TypedDict, cast
 from time import perf_counter
 
 import numpy as np
 import pytz
-import ephem
-from astropy import units as u
+import ephem as _ephem
+from astropy import units as _astropy_units
 from astropy.coordinates import EarthLocation, SkyCoord, Angle
 from astropy.time import Time
 from astroplan import FixedTarget, Observer
@@ -72,10 +72,9 @@ from astroplan.observer import TargetAlwaysUpWarning
 
 from astroquery.simbad import Simbad
 try:
-    from astroquery.exceptions import NoResultsWarning
+    from astroquery.exceptions import NoResultsWarning as _AstroqueryNoResultsWarning
 except Exception:  # pragma: no cover - fallback only for older astroquery variants
-    class NoResultsWarning(Warning):
-        pass
+    _AstroqueryNoResultsWarning = Warning
 from pydantic import BaseModel, Field, ValidationError, ConfigDict
 from timezonefinder import TimezoneFinder
 import matplotlib.dates as mdates
@@ -108,6 +107,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 _TZ_FINDER = TimezoneFinder()
 _FINDER_PATCH_LOCK = threading.Lock()
+ephem: Any = _ephem
+u: Any = _astropy_units
+NoResultsWarning: type[Warning] = _AstroqueryNoResultsWarning
 
 TARGET_SEARCH_SOURCES: list[tuple[str, str]] = [
     ("simbad", "SIMBAD"),
@@ -158,6 +160,29 @@ class CalcRunStats:
     total_targets: int
 
 
+class ObservationOrderItem(TypedDict):
+    row_index: int
+    name: str
+    priority: int
+    score: float
+    hours_above_limit: float
+    max_altitude_deg: float
+    peak_moon_sep_deg: float
+    window_start: datetime
+    window_end: datetime
+    peak_time: datetime
+    window_hours: float
+    still_rising: bool
+
+
+class ObservationRun(TypedDict):
+    window_start: datetime
+    window_end: datetime
+    peak_time: datetime
+    window_hours: float
+    still_rising: bool
+
+
 def _decode_simbad_value(value: object) -> str:
     if isinstance(value, (bytes, bytearray)):
         return value.decode("utf-8", errors="ignore").strip()
@@ -168,9 +193,24 @@ def _safe_float(value: object) -> Optional[float]:
     if value is None or np.ma.is_masked(value):
         return None
     try:
-        return float(value)
+        return float(cast(Any, value))
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(value: object) -> Optional[int]:
+    if value is None or np.ma.is_masked(value):
+        return None
+    try:
+        return int(cast(Any, value))
+    except (TypeError, ValueError):
+        numeric = _safe_float(value)
+        if numeric is None:
+            return None
+        try:
+            return int(numeric)
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def _normalize_catalog_token(value: object) -> str:
@@ -232,11 +272,9 @@ def _extract_simbad_metadata(result, row_idx: int = 0) -> tuple[Optional[float],
             continue
         if np.ma.is_masked(raw):
             continue
-        try:
-            magnitude = float(raw)
+        magnitude = _safe_float(raw)
+        if magnitude is not None:
             break
-        except (TypeError, ValueError):
-            continue
 
     col = _simbad_column(result, "OTYPE")
     if col is not None:
@@ -333,6 +371,7 @@ def _plot_finder_image_compat(
     height_px: int,
 ) -> None:
     from astroquery.skyview import SkyView
+    skyview_any = cast(Any, SkyView)
 
     kwargs = {
         "survey": survey,
@@ -343,22 +382,22 @@ def _plot_finder_image_compat(
         "style_kwargs": {"cmap": "Greys", "origin": "lower"},
     }
     with _FINDER_PATCH_LOCK:
-        original_request = SkyView._request
-        original_url = str(getattr(SkyView, "URL", "") or "")
+        original_request = skyview_any._request
+        original_url = str(getattr(skyview_any, "URL", "") or "")
 
         if original_url.startswith("http://"):
             # Some networks reset plain HTTP to SkyView; HTTPS is much more stable.
-            SkyView.URL = "https://" + original_url[len("http://"):]
+            skyview_any.URL = "https://" + original_url[len("http://"):]
 
-        def _request_with_timeout(method, url, **inner_kwargs):
+        def _request_with_timeout(*args: Any, **inner_kwargs: Any):
             if inner_kwargs.get("timeout") in (None, 0):
                 inner_kwargs["timeout"] = FINDER_HTTP_TIMEOUT_S
-            return original_request(method, url, **inner_kwargs)
+            return original_request(*args, **inner_kwargs)
 
-        SkyView._request = _request_with_timeout
-        original = SkyView.get_images
+        skyview_any._request = _request_with_timeout
+        original = skyview_any.get_images
 
-        def _compat_get_images(*args, **inner_kwargs):
+        def _compat_get_images(*args: Any, **inner_kwargs: Any):
             inner_kwargs.pop("grid", None)
             if "show_progress" not in inner_kwargs:
                 inner_kwargs["show_progress"] = False
@@ -376,7 +415,7 @@ def _plot_finder_image_compat(
                 inner_kwargs["pixels"] = f"{max(64, int(width_px))},{max(64, int(height_px))}"
             return original(*args, **inner_kwargs)
 
-        SkyView.get_images = _compat_get_images
+        skyview_any.get_images = _compat_get_images
         try:
             try:
                 plot_finder_image(target, **kwargs)
@@ -395,10 +434,10 @@ def _plot_finder_image_compat(
                 except IndexError as inner_exc:
                     raise LookupError(f"SkyView returned no image for survey '{survey}'") from inner_exc
         finally:
-            SkyView.get_images = original
-            SkyView._request = original_request
+            skyview_any.get_images = original
+            skyview_any._request = original_request
             if original_url:
-                SkyView.URL = original_url
+                skyview_any.URL = original_url
 
 
 def _render_finder_chart_png_bytes(
@@ -430,7 +469,7 @@ def _render_finder_chart_png_bytes(
             # Fill the whole image area (no matplotlib frame margins),
             # so finder chart occupies the same visual size as Aladin cutout.
             fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
-            ax.set_position([0.0, 0.0, 1.0, 1.0])
+            ax.set_position((0.0, 0.0, 1.0, 1.0))
             ax.set_title("")
             ax.set_xlabel("")
             ax.set_ylabel("")
@@ -459,17 +498,15 @@ def _render_finder_chart_png_bytes(
 
 
 def _sanitize_cutout_fov_arcmin(value: object) -> int:
-    try:
-        ivalue = int(float(value))
-    except Exception:
+    ivalue = _safe_int(value)
+    if ivalue is None:
         ivalue = CUTOUT_DEFAULT_FOV_ARCMIN
     return max(CUTOUT_MIN_FOV_ARCMIN, min(CUTOUT_MAX_FOV_ARCMIN, ivalue))
 
 
 def _sanitize_cutout_size_px(value: object) -> int:
-    try:
-        ivalue = int(float(value))
-    except Exception:
+    ivalue = _safe_int(value)
+    if ivalue is None:
         ivalue = CUTOUT_DEFAULT_SIZE_PX
     return max(CUTOUT_MIN_SIZE_PX, min(CUTOUT_MAX_SIZE_PX, ivalue))
 
@@ -739,6 +776,7 @@ class TableSettingsDialog(QDialog):
         # Save default sort column
         s.setValue("table/defaultSortColumn", self.sort_combo.currentIndex())
         self.parent()._apply_table_settings()
+        self.parent()._apply_default_sort()
         super().accept()
 
 # --- General Settings Dialog ---
@@ -1362,11 +1400,39 @@ class Target(BaseModel):
 
     @classmethod
     def from_skycoord(cls, name: str, coord: SkyCoord) -> "Target":  # noqa: D401
-        return cls(name=name, ra=coord.ra.deg, dec=coord.dec.deg)    # type: ignore[arg-type]
+        coord_any = cast(Any, coord)
+        return _build_target(name=name, ra=float(coord_any.ra.deg), dec=float(coord_any.dec.deg))
 
     @property
     def skycoord(self) -> SkyCoord:  # noqa: D401
         return SkyCoord(ra=self.ra * u.deg, dec=self.dec * u.deg)
+
+
+def _build_target(
+    name: str,
+    ra: float,
+    dec: float,
+    *,
+    object_type: str = "",
+    magnitude: Optional[float] = None,
+    size_arcmin: Optional[float] = None,
+    priority: int = 3,
+    observed: bool = False,
+    notes: str = "",
+    plot_color: str = "",
+) -> Target:
+    return Target(
+        name=name,
+        ra=ra,
+        dec=dec,
+        object_type=object_type,
+        magnitude=magnitude,
+        size_arcmin=size_arcmin,
+        priority=priority,
+        observed=observed,
+        notes=notes,
+        plot_color=plot_color,
+    )
 
 
 class Site(BaseModel):
@@ -1444,6 +1510,8 @@ class AstronomyWorker(QThread):
             events = cached["events"]
         else:
             # compute astronomical dusk/dawn only if it occurs
+            dusk: Optional[Time] = None
+            dawn: Optional[Time] = None
             with warnings.catch_warnings():
                 warnings.filterwarnings('error', category=TargetAlwaysUpWarning)
                 try:
@@ -1462,7 +1530,7 @@ class AstronomyWorker(QThread):
             dawn_naut = observer.twilight_morning_nautical(midnight, which="next")
 
             events = {"times": jd}
-            if astro_ok:
+            if astro_ok and dusk is not None and dawn is not None:
                 events["dusk"] = dusk.plot_date
                 events["dawn"] = dawn.plot_date
             events.update({
@@ -2062,8 +2130,8 @@ class MainWindow(QMainWindow):
             ("today_btn", "today"),
             ("next_day_btn", "next"),
         ):
-            btn = getattr(self, attr, None)
-            if isinstance(btn, QToolButton):
+            btn = cast(Optional[QToolButton], getattr(self, attr, None))
+            if btn is not None:
                 btn.setIcon(self._build_date_nav_icon(kind))
 
     def _line_palette(self) -> list[str]:
@@ -2677,11 +2745,16 @@ class MainWindow(QMainWindow):
             if not name:
                 continue
             try:
+                latitude = _safe_float(item.get("latitude", 0.0))
+                longitude = _safe_float(item.get("longitude", 0.0))
+                elevation = _safe_float(item.get("elevation", 0.0))
+                if latitude is None or longitude is None or elevation is None:
+                    raise ValueError("Missing numeric coordinates")
                 loaded[name] = Site(
                     name=name,
-                    latitude=float(item.get("latitude", 0.0)),
-                    longitude=float(item.get("longitude", 0.0)),
-                    elevation=float(item.get("elevation", 0.0)),
+                    latitude=latitude,
+                    longitude=longitude,
+                    elevation=elevation,
                 )
             except Exception as exc:
                 logger.warning("Skipping invalid saved observatory %r: %s", name, exc)
@@ -2802,9 +2875,9 @@ class MainWindow(QMainWindow):
                 elev_payload = json.loads(resp.read().decode("utf-8"))
             elev_value = elev_payload.get("elevation")
             if isinstance(elev_value, list) and elev_value:
-                elevation = float(elev_value[0])
+                elevation = _safe_float(elev_value[0])
             elif elev_value is not None:
-                elevation = float(elev_value)
+                elevation = _safe_float(elev_value)
         except Exception:
             # Elevation is optional for this feature.
             elevation = None
@@ -2914,7 +2987,8 @@ class MainWindow(QMainWindow):
         self.clock_worker = None
         # Keep references to every ClockWorker we create so they can all be stopped
         self._clock_workers: list[ClockWorker] = []
-        self.last_payload = None
+        self.last_payload: Optional[dict[str, object]] = None
+        self.full_payload: Optional[dict[str, object]] = None
         # Prevent new workers once we start shutting down
         self._shutting_down = False
         self.setWindowTitle("Astronomical Observation Planner")
@@ -3014,7 +3088,7 @@ class MainWindow(QMainWindow):
 
         # Polar plot for alt-az projection
         self.polar_canvas = FigureCanvas(Figure(figsize=(4, 4)))
-        self.polar_ax = self.polar_canvas.figure.add_subplot(projection='polar')
+        self.polar_ax: Any = cast(Any, self.polar_canvas.figure.add_subplot(projection='polar'))
         self.polar_ax.set_theta_zero_location('N')
         self.polar_ax.set_theta_direction(-1)
         # Plot placeholders: targets, selected target, sun, moon
@@ -3831,7 +3905,7 @@ class MainWindow(QMainWindow):
         order_values = [0] * len(self.targets)
         ordered, _ = self._build_deterministic_observation_order()
         for rank, item in enumerate(ordered, start=1):
-            row_index = int(item.get("row_index", -1))
+            row_index = item["row_index"]
             if 0 <= row_index < len(order_values):
                 order_values[row_index] = rank
         self.table_model.order_values = order_values
@@ -3963,8 +4037,9 @@ class MainWindow(QMainWindow):
             self._update_cutout_preview_for_target(self._selected_target_or_none())
 
         # If a payload is already cached, refresh the polar plot right away
-        if getattr(self, "last_payload", None):
-            self._update_polar_positions(self.last_payload)
+        cached_payload = self.last_payload if isinstance(self.last_payload, dict) else None
+        if cached_payload is not None:
+            self._update_polar_positions(cached_payload)
         ds = s.value("general/defaultSite", type=str)
         if ds in self.observatories and self.obs_combo.currentText() != ds:
             self.obs_combo.setCurrentText(ds)
@@ -4097,8 +4172,9 @@ class MainWindow(QMainWindow):
         window = self.target_windows.get(tgt.name)
         if window:
             tz_name = "UTC"
-            if isinstance(getattr(self, "last_payload", None), dict):
-                tz_name = str(self.last_payload.get("tz", "UTC"))
+            cached_payload = self.last_payload if isinstance(self.last_payload, dict) else None
+            if cached_payload is not None:
+                tz_name = str(cached_payload.get("tz", "UTC"))
             try:
                 tz = pytz.timezone(tz_name)
             except Exception:
@@ -4491,6 +4567,27 @@ class MainWindow(QMainWindow):
         if 0 <= default_sort < cols:
             self.table_view.sortByColumn(default_sort, Qt.AscendingOrder)
 
+    def _reapply_active_sort(self, dynamic_only: bool = False) -> None:
+        if not hasattr(self, "table_view") or not self.table_view.isSortingEnabled():
+            return
+        header = self.table_view.horizontalHeader()
+        section = header.sortIndicatorSection()
+        if not (0 <= section < self.table_model.columnCount()):
+            return
+        if dynamic_only:
+            dynamic_columns = {
+                TargetTableModel.COL_ORDER,
+                TargetTableModel.COL_HA,
+                TargetTableModel.COL_ALT,
+                TargetTableModel.COL_AZ,
+                TargetTableModel.COL_MOON_SEP,
+                TargetTableModel.COL_SCORE,
+                TargetTableModel.COL_HOURS,
+            }
+            if section not in dynamic_columns:
+                return
+        self.table_view.sortByColumn(section, header.sortIndicatorOrder())
+
     @Slot()
     def _load_plan(self):
         """Load a saved plan (JSON targets)."""
@@ -4547,7 +4644,7 @@ class MainWindow(QMainWindow):
                     size_arcmin = row.get("size_arcmin") or None
                     observed_raw = str(row.get("observed", "")).strip().lower()
                     loaded_targets.append(
-                        Target(
+                        _build_target(
                             name=row["name"],
                             ra=parse_ra_to_deg(row["ra"]),
                             dec=parse_dec_to_deg(row["dec"]),
@@ -4819,7 +4916,9 @@ class MainWindow(QMainWindow):
                 end_idx = min(int(best_run[-1]) + 1, len(times) - 1)
                 self.target_windows[tgt.name] = (times[start_idx], times[end_idx])
 
-            moon_sep_now = float(tgt.skycoord.separation(moon_coord).deg)
+            moon_sep_now = _safe_float(np.real(tgt.skycoord.separation(moon_coord).deg))
+            if moon_sep_now is None:
+                moon_sep_now = float("nan")
             passes_filters = self._passes_active_filters(tgt, metrics.score, moon_sep_now)
             row_enabled.append(passes_filters)
             if not passes_filters:
@@ -4875,6 +4974,7 @@ class MainWindow(QMainWindow):
         self.table_model.hours_above_limit = hour_vals
         self.table_model.row_enabled = row_enabled
         self._recompute_recommended_order_cache()
+        self._reapply_active_sort(dynamic_only=True)
         self._apply_table_row_visibility()
         self._emit_table_data_changed()
 
@@ -4920,7 +5020,7 @@ class MainWindow(QMainWindow):
             center_dt = mdates.num2date(data["midnight"]).astimezone(tz)
             start_dt = center_dt - timedelta(hours=12)
             end_dt = center_dt + timedelta(hours=12)
-        self.ax_alt.set_xlim(start_dt, end_dt)
+        self.ax_alt.set_xlim(float(mdates.date2num(start_dt)), float(mdates.date2num(end_dt)))
         xmin, xmax = self.ax_alt.get_xlim()
 
         # Segments to shade, only if both endpoints exist and start < end, and within window
@@ -5078,6 +5178,7 @@ class MainWindow(QMainWindow):
         self.table_model.current_azs = data["azs"]
         self.table_model.current_seps = data["seps"]
         self.table_model.row_enabled = self._recompute_row_enabled_from_current()
+        self._reapply_active_sort(dynamic_only=True)
         self._apply_table_row_visibility()
         self._emit_table_data_changed()
         self._update_status_bar()
@@ -5150,8 +5251,13 @@ class MainWindow(QMainWindow):
                 self.selected_trace_line = None
                 self.polar_canvas.draw_idle()
                 return
-            alt_arr = np.array(self.full_payload[name]["altitude"])
-            az_arr  = np.array(self.full_payload[name]["azimuth"])
+            target_payload = self.full_payload.get(name)
+            if not isinstance(target_payload, dict):
+                self.selected_trace_line = None
+                self.polar_canvas.draw_idle()
+                return
+            alt_arr = np.array(target_payload["altitude"])
+            az_arr  = np.array(target_payload["azimuth"])
             # Only points above horizon
             mask = alt_arr > 0
             vis_idx = np.where(mask)[0]
@@ -5398,8 +5504,9 @@ class MainWindow(QMainWindow):
         self.plot_canvas.figure.savefig(out_path / "plan_plot.png", dpi=150)
         # CSV summary and ICS window schedule
         tz_name = "UTC"
-        if isinstance(getattr(self, "last_payload", None), dict):
-            tz_name = str(self.last_payload.get("tz", "UTC"))
+        cached_payload = self.last_payload if isinstance(self.last_payload, dict) else None
+        if cached_payload is not None:
+            tz_name = str(cached_payload.get("tz", "UTC"))
         elif self.table_model.site:
             tz_name = self.table_model.site.timezone_name
 
@@ -5595,7 +5702,7 @@ class MainWindow(QMainWindow):
             ra_deg, dec_deg = parse_ra_dec_query(query)
         except Exception:
             return None
-        return Target(name=query, ra=ra_deg, dec=dec_deg)
+        return _build_target(name=query, ra=ra_deg, dec=dec_deg)
 
     def _resolve_target_simbad(self, query: str) -> Target:
         try:
@@ -5625,7 +5732,7 @@ class MainWindow(QMainWindow):
                 magnitude, object_type = _extract_simbad_metadata(result)
                 self._simbad_meta_cache[query.strip().lower()] = (magnitude, object_type)
                 self._simbad_meta_cache[name_res.strip().lower()] = (magnitude, object_type)
-                return Target(
+                return _build_target(
                     name=name_res,
                     ra=ra_deg,
                     dec=dec_deg,
@@ -5665,7 +5772,7 @@ class MainWindow(QMainWindow):
             designation_col = _simbad_column(results, "designation")
             designation = _decode_simbad_value(_simbad_cell(results, designation_col, row_idx)) if designation_col else ""
             name = designation or (f"Gaia DR3 {source_id}".strip() if source_id else query)
-            return Target(
+            return _build_target(
                 name=name,
                 ra=float(ra_deg),
                 dec=float(dec_deg),
@@ -5744,13 +5851,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             raise RuntimeError(f"Gaia DR3 cone search failed for '{query}': {exc}") from exc
 
-        if not _simbad_has_row(results):
+        if results is None or not _simbad_has_row(results):
             raise ValueError(f"No Gaia DR3 source found near '{query}'.")
 
         row_idx = 0
         ra_col = _simbad_column(results, "ra")
         dec_col = _simbad_column(results, "dec")
-        if ra_col and dec_col and len(results) > 1:
+        if ra_col and dec_col and results is not None and len(results) > 1:
             try:
                 ra_vals = np.asarray(results[ra_col], dtype=float)
                 dec_vals = np.asarray(results[dec_col], dtype=float)
@@ -5823,7 +5930,7 @@ class MainWindow(QMainWindow):
         magnitude = _safe_float(row.get("AlertMag"))
         object_type = row.get("Class", "").strip() or "Gaia Alert"
         name = row.get("Name", "").strip() or query
-        return Target(
+        return _build_target(
             name=name,
             ra=float(ra_deg),
             dec=float(dec_deg),
@@ -6076,7 +6183,7 @@ class MainWindow(QMainWindow):
         prefix = str(_get_reply("name_prefix", "prefix") or "").strip().upper()
         if prefix and not name.lower().startswith(prefix.lower()):
             name = f"{prefix}{name}"
-        return Target(
+        return _build_target(
             name=name,
             ra=float(ra_deg),
             dec=float(dec_deg),
@@ -6120,7 +6227,7 @@ class MainWindow(QMainWindow):
         if not object_type:
             object_type = "NED object"
 
-        return Target(
+        return _build_target(
             name=name or query,
             ra=float(ra_deg),
             dec=float(dec_deg),
@@ -6173,7 +6280,7 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Unable to resolve '{query}' using {source_label}.")
         raise ValueError(f"Unable to resolve '{query}' using {source_label}: {last_error}") from last_error
 
-    def _build_deterministic_observation_order(self) -> tuple[list[dict[str, object]], list[str]]:
+    def _build_deterministic_observation_order(self) -> tuple[list[ObservationOrderItem], list[str]]:
         payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
         if not payload:
             return [], ["Run a visibility calculation first so night windows are available."]
@@ -6202,7 +6309,7 @@ class MainWindow(QMainWindow):
             if visible_rows:
                 considered_rows = visible_rows
 
-        valid_items: list[dict[str, object]] = []
+        valid_items: list[ObservationOrderItem] = []
         invalid_notes: list[str] = []
 
         for idx, target in enumerate(self.targets):
@@ -6227,7 +6334,7 @@ class MainWindow(QMainWindow):
 
             valid_indices = np.where(valid_mask)[0]
             runs = np.split(valid_indices, np.where(np.diff(valid_indices) != 1)[0] + 1)
-            run_candidates: list[dict[str, object]] = []
+            run_candidates: list[ObservationRun] = []
             for run in runs:
                 if len(run) == 0:
                     continue
@@ -6252,7 +6359,7 @@ class MainWindow(QMainWindow):
                 invalid_notes.append(f"{target.name}: no valid observing window under current constraints.")
                 continue
 
-            selected_run = min(
+            selected_run: ObservationRun = min(
                 run_candidates,
                 key=lambda item: (
                     int(bool(item["still_rising"])),
@@ -6263,22 +6370,21 @@ class MainWindow(QMainWindow):
                 ),
             )
 
-            valid_items.append(
-                {
-                    "row_index": idx,
-                    "name": target.name,
-                    "priority": int(target.priority),
-                    "score": float(metrics.score) if metrics else 0.0,
-                    "hours_above_limit": float(metrics.hours_above_limit) if metrics else 0.0,
-                    "max_altitude_deg": float(metrics.max_altitude_deg) if metrics else 0.0,
-                    "peak_moon_sep_deg": float(metrics.peak_moon_sep_deg) if metrics else 0.0,
-                    "window_start": selected_run["window_start"],
-                    "window_end": selected_run["window_end"],
-                    "peak_time": selected_run["peak_time"],
-                    "window_hours": selected_run["window_hours"],
-                    "still_rising": selected_run["still_rising"],
-                }
-            )
+            order_item: ObservationOrderItem = {
+                "row_index": idx,
+                "name": target.name,
+                "priority": int(target.priority),
+                "score": float(metrics.score) if metrics else 0.0,
+                "hours_above_limit": float(metrics.hours_above_limit) if metrics else 0.0,
+                "max_altitude_deg": float(metrics.max_altitude_deg) if metrics else 0.0,
+                "peak_moon_sep_deg": float(metrics.peak_moon_sep_deg) if metrics else 0.0,
+                "window_start": selected_run["window_start"],
+                "window_end": selected_run["window_end"],
+                "peak_time": selected_run["peak_time"],
+                "window_hours": selected_run["window_hours"],
+                "still_rising": selected_run["still_rising"],
+            }
+            valid_items.append(order_item)
 
         valid_items.sort(
             key=lambda item: (
