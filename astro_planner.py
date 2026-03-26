@@ -662,12 +662,12 @@ class TableSettingsDialog(QDialog):
         init_h = parent.settings.value("table/rowHeight", 24, type=int) if parent and hasattr(parent, "settings") else 24
         self.row_height_spin.setValue(init_h)
         layout.addRow("Row height:", self.row_height_spin)
-        # First-column width
+        # Name-column width
         self.first_col_width_spin = QSpinBox(self)
         self.first_col_width_spin.setRange(50, 500)
         init_w = parent.settings.value("table/firstColumnWidth", 100, type=int) if parent and hasattr(parent, "settings") else 100
         self.first_col_width_spin.setValue(init_w)
-        layout.addRow("First-column width:", self.first_col_width_spin)
+        layout.addRow("Name column width:", self.first_col_width_spin)
 
         # Font size
         self.font_spin = QSpinBox(self)
@@ -691,7 +691,11 @@ class TableSettingsDialog(QDialog):
         # Populate with column headers
         headers = parent.table_model.headers if parent and hasattr(parent, "table_model") else []
         self.sort_combo.addItems(headers)
-        init_sort = parent.settings.value("table/defaultSortColumn", 7, type=int) if parent and hasattr(parent, "settings") else 7
+        init_sort = (
+            parent.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE, type=int)
+            if parent and hasattr(parent, "settings")
+            else TargetTableModel.COL_SCORE
+        )
         # Clamp to valid range
         if 0 <= init_sort < len(headers):
             self.sort_combo.setCurrentIndex(init_sort)
@@ -1765,19 +1769,21 @@ class LLMWorker(QThread):
 # --- Qt Table Model for the targets list ----------
 # --------------------------------------------------
 class TargetTableModel(QAbstractTableModel):
-    COL_NAME = 0
-    COL_RA = 1
-    COL_HA = 2
-    COL_DEC = 3
-    COL_ALT = 4
-    COL_AZ = 5
-    COL_MOON_SEP = 6
-    COL_SCORE = 7
-    COL_HOURS = 8
-    COL_PRIORITY = 9
-    COL_OBSERVED = 10
-    COL_ACTIONS = 11
+    COL_ORDER = 0
+    COL_NAME = 1
+    COL_RA = 2
+    COL_HA = 3
+    COL_DEC = 4
+    COL_ALT = 5
+    COL_AZ = 6
+    COL_MOON_SEP = 7
+    COL_SCORE = 8
+    COL_HOURS = 9
+    COL_PRIORITY = 10
+    COL_OBSERVED = 11
+    COL_ACTIONS = 12
     headers = [
+        "Order",
         "Name",
         "RA (°)",
         "HA (h)",
@@ -1799,6 +1805,7 @@ class TargetTableModel(QAbstractTableModel):
         self.site = site
         self.limit: float | None = None
         # Cached current values for table display
+        self.order_values: list[int] = []
         self.current_alts: list[float] = []
         self.current_azs: list[float] = []
         self.current_seps: list[float] = []
@@ -1809,6 +1816,8 @@ class TargetTableModel(QAbstractTableModel):
 
     def _ensure_cache_lengths(self) -> None:
         n = len(self._targets)
+        if len(self.order_values) < n:
+            self.order_values.extend([0] * (n - len(self.order_values)))
         if len(self.current_alts) < n:
             self.current_alts.extend([float("nan")] * (n - len(self.current_alts)))
         if len(self.current_azs) < n:
@@ -1825,6 +1834,7 @@ class TargetTableModel(QAbstractTableModel):
     def reset_targets(self, targets: list[Target]) -> None:
         self.beginResetModel()
         self._targets[:] = targets
+        self.order_values = []
         self.current_alts = []
         self.current_azs = []
         self.current_seps = []
@@ -1837,6 +1847,7 @@ class TargetTableModel(QAbstractTableModel):
         row = len(self._targets)
         self.beginInsertRows(QModelIndex(), row, row)
         self._targets.append(target)
+        self.order_values.append(0)
         self.endInsertRows()
 
     def remove_rows(self, rows: list[int]) -> list[Target]:
@@ -1846,6 +1857,8 @@ class TargetTableModel(QAbstractTableModel):
                 continue
             self.beginRemoveRows(QModelIndex(), row, row)
             removed.append(self._targets.pop(row))
+            if row < len(self.order_values):
+                self.order_values.pop(row)
             if row < len(self.current_alts):
                 self.current_alts.pop(row)
             if row < len(self.current_azs):
@@ -1954,6 +1967,12 @@ class TargetTableModel(QAbstractTableModel):
                 extras.append(f"Notes: {tgt.notes}")
             return "\n".join([tgt.name, *extras])
 
+        if role == Qt.ToolTipRole and col == self.COL_ORDER:
+            order_value = self.order_values[row] if row < len(self.order_values) else 0
+            if order_value > 0:
+                return f"Recommended observing order: {order_value}"
+            return "No deterministic observing order is available for this row yet."
+
         # Tooltip for altitude status in altitude column
         if role == Qt.ToolTipRole and col == self.COL_ALT and self.site:
             alt = self.current_alts[row] if row < len(self.current_alts) else None
@@ -1968,6 +1987,9 @@ class TargetTableModel(QAbstractTableModel):
 
         if role not in (Qt.DisplayRole, Qt.EditRole):
             return None
+        if col == self.COL_ORDER:
+            order_value = self.order_values[row] if row < len(self.order_values) else 0
+            return str(order_value) if order_value > 0 else ""
         if col == self.COL_NAME:
             return tgt.name
         if col == self.COL_RA:
@@ -2011,6 +2033,7 @@ class TargetTableModel(QAbstractTableModel):
         for idx, tgt in enumerate(self._targets):
             rows.append({
                 "target": tgt,
+                "order": self.order_values[idx] if idx < len(self.order_values) else 0,
                 "alt": self.current_alts[idx] if idx < len(self.current_alts) else float("-inf"),
                 "az": self.current_azs[idx] if idx < len(self.current_azs) else float("-inf"),
                 "sep": self.current_seps[idx] if idx < len(self.current_seps) else float("-inf"),
@@ -2019,7 +2042,12 @@ class TargetTableModel(QAbstractTableModel):
                 "enabled": self.row_enabled[idx] if idx < len(self.row_enabled) else True,
             })
 
-        if column == self.COL_NAME:
+        if column == self.COL_ORDER:
+            rows.sort(
+                key=lambda r: (r["order"] <= 0, int(r["order"]) if r["order"] > 0 else 10**9),
+                reverse=reverse,
+            )
+        elif column == self.COL_NAME:
             rows.sort(key=lambda r: r["target"].name.lower(), reverse=reverse)
         elif column == self.COL_RA:
             rows.sort(key=lambda r: r["target"].ra, reverse=reverse)
@@ -2050,6 +2078,7 @@ class TargetTableModel(QAbstractTableModel):
 
         if rows:
             self._targets[:] = [row["target"] for row in rows]
+            self.order_values = [int(row["order"]) for row in rows]
             self.current_alts = [float(row["alt"]) for row in rows]
             self.current_azs = [float(row["az"]) for row in rows]
             self.current_seps = [float(row["sep"]) for row in rows]
@@ -2057,6 +2086,7 @@ class TargetTableModel(QAbstractTableModel):
             self.hours_above_limit = [float(row["hours"]) for row in rows]
             self.row_enabled = [bool(row["enabled"]) for row in rows]
         elif n == 0:
+            self.order_values = []
             self.current_alts = []
             self.current_azs = []
             self.current_seps = []
@@ -2103,6 +2133,7 @@ class TargetTableModel(QAbstractTableModel):
         for r in rows:
             bundles.append((
                 self._targets[r],
+                self.order_values[r] if r < len(self.order_values) else 0,
                 self.current_alts[r] if r < len(self.current_alts) else float("nan"),
                 self.current_azs[r] if r < len(self.current_azs) else float("nan"),
                 self.current_seps[r] if r < len(self.current_seps) else float("nan"),
@@ -2113,6 +2144,8 @@ class TargetTableModel(QAbstractTableModel):
 
         for r in reversed(rows):
             self._targets.pop(r)
+            if r < len(self.order_values):
+                self.order_values.pop(r)
             if r < len(self.current_alts):
                 self.current_alts.pop(r)
             if r < len(self.current_azs):
@@ -2128,8 +2161,9 @@ class TargetTableModel(QAbstractTableModel):
 
         for offset, bundle in enumerate(bundles):
             pos = insert_row + offset
-            tgt, alt, az, sep, score, hours, enabled = bundle
+            tgt, order_value, alt, az, sep, score, hours, enabled = bundle
             self._targets.insert(pos, tgt)
+            self.order_values.insert(pos, int(order_value))
             self.current_alts.insert(pos, alt)
             self.current_azs.insert(pos, az)
             self.current_seps.insert(pos, sep)
@@ -3119,6 +3153,7 @@ class MainWindow(QMainWindow):
 
         # Persistent user settings
         self.settings = QSettings("YourCompany", "AstroPlanner")
+        self._migrate_table_settings_schema()
         self._dark_enabled = self.settings.value("general/darkMode", False, type=bool)
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
         self._ui_font_size = max(9, min(16, self.settings.value("general/uiFontSize", 11, type=int)))
@@ -3944,8 +3979,6 @@ class MainWindow(QMainWindow):
         self.ai_describe_act.triggered.connect(self._ai_describe_target)
         self.ai_suggest_act = QAction("Suggest targets for tonight", self, shortcut=QKeySequence("Ctrl+Shift+I"))
         self.ai_suggest_act.triggered.connect(self._ai_suggest_targets)
-        self.ai_optimize_act = QAction("Optimize observation order", self)
-        self.ai_optimize_act.triggered.connect(self._ai_optimize_plan)
         self.ai_toggle_panel_act = QAction("Toggle AI panel", self)
         self.ai_toggle_panel_act.triggered.connect(
             lambda: self.ai_toggle_btn.setChecked(not self.ai_toggle_btn.isChecked())
@@ -3975,7 +4008,6 @@ class MainWindow(QMainWindow):
             self.dark_act,
             self.ai_describe_act,
             self.ai_suggest_act,
-            self.ai_optimize_act,
         ):
             self.addAction(act)
 
@@ -4004,7 +4036,6 @@ class MainWindow(QMainWindow):
         ai_menu = menubar.addMenu("&AI")
         ai_menu.addAction(self.ai_describe_act)
         ai_menu.addAction(self.ai_suggest_act)
-        ai_menu.addAction(self.ai_optimize_act)
         ai_menu.addSeparator()
         ai_menu.addAction(self.ai_toggle_panel_act)
 
@@ -4037,6 +4068,40 @@ class MainWindow(QMainWindow):
             self.table_view.sortByColumn(default_sort, Qt.AscendingOrder)
         self._apply_general_settings()
 
+    def _migrate_table_settings_schema(self) -> None:
+        version = self.settings.value("table/columnSchemaVersion", 0, type=int)
+        if version >= 2:
+            return
+
+        old_column_count = 12
+        for idx in range(old_column_count - 1, -1, -1):
+            old_key = f"table/col{idx}"
+            if not self.settings.contains(old_key):
+                continue
+            self.settings.setValue(f"table/col{idx + 1}", self.settings.value(old_key, type=bool))
+        self.settings.setValue("table/col0", True)
+
+        if self.settings.contains("table/defaultSortColumn"):
+            try:
+                old_sort = int(self.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE))
+            except (TypeError, ValueError):
+                old_sort = TargetTableModel.COL_SCORE
+            self.settings.setValue(
+                "table/defaultSortColumn",
+                min(old_sort + 1, TargetTableModel.COL_ACTIONS),
+            )
+
+        self.settings.setValue("table/columnSchemaVersion", 2)
+
+    def _recompute_recommended_order_cache(self) -> None:
+        order_values = [0] * len(self.targets)
+        ordered, _ = self._build_deterministic_observation_order()
+        for rank, item in enumerate(ordered, start=1):
+            row_index = int(item.get("row_index", -1))
+            if 0 <= row_index < len(order_values):
+                order_values[row_index] = rank
+        self.table_model.order_values = order_values
+
     def _apply_table_settings(self):
         """Apply table row height and table column widths."""
         row_h = self.settings.value("table/rowHeight", 24, type=int)
@@ -4044,11 +4109,13 @@ class MainWindow(QMainWindow):
         # Lock row height and apply to all existing rows
         for r in range(self.table_model.rowCount()):
             self.table_view.setRowHeight(r, row_h)
-        first_col_w = self.settings.value("table/firstColumnWidth", 100, type=int)
-        self.table_view.setColumnWidth(0, first_col_w)
-        # Lock first column so Stretch mode doesn’t override it
+        name_col_w = self.settings.value("table/firstColumnWidth", 100, type=int)
+        self.table_view.setColumnWidth(TargetTableModel.COL_ORDER, 56)
+        self.table_view.setColumnWidth(TargetTableModel.COL_NAME, name_col_w)
+        # Lock Order and Name columns so Stretch mode doesn’t override them
         header = self.table_view.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(TargetTableModel.COL_ORDER, QHeaderView.Fixed)
+        header.setSectionResizeMode(TargetTableModel.COL_NAME, QHeaderView.Fixed)
         # Font size
         fs = self.settings.value("table/fontSize", 11, type=int)
         fnt = self.table_view.font()
@@ -4071,6 +4138,7 @@ class MainWindow(QMainWindow):
         if preset not in {"observation", "full"}:
             preset = "observation"
         obs_visible = {
+            TargetTableModel.COL_ORDER,
             TargetTableModel.COL_NAME,
             TargetTableModel.COL_ALT,
             TargetTableModel.COL_AZ,
@@ -4502,6 +4570,7 @@ class MainWindow(QMainWindow):
             if old_name != tgt.name:
                 self.table_model.color_map.pop(old_name, None)
             self._refresh_target_color_map()
+            self._recompute_recommended_order_cache()
 
             self._emit_table_data_changed()
             self._update_selected_details()
@@ -4813,6 +4882,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Resolve error", str(exc))
             return
         self.table_model.append_target(target)
+        self._recompute_recommended_order_cache()
         # Reapply settings & default sort after layout change
         self._apply_table_settings()
         self._apply_default_sort()
@@ -4872,6 +4942,7 @@ class MainWindow(QMainWindow):
         self.target_metrics.pop(removed_name, None)
         self.target_windows.pop(removed_name, None)
         self.table_model.remove_rows([row])
+        self._recompute_recommended_order_cache()
         # Reapply settings & default sort after layout change
         self._apply_table_settings()
         self._apply_default_sort()
@@ -4890,6 +4961,7 @@ class MainWindow(QMainWindow):
         for tgt in removed:
             self.target_metrics.pop(tgt.name, None)
             self.target_windows.pop(tgt.name, None)
+        self._recompute_recommended_order_cache()
         self._apply_table_settings()
         self._apply_default_sort()
         self._update_selected_details()
@@ -4943,6 +5015,7 @@ class MainWindow(QMainWindow):
             self.table_view.setRowHidden(row, False)
 
     def _clear_table_dynamic_cache(self):
+        self.table_model.order_values = []
         self.table_model.current_alts = []
         self.table_model.current_azs = []
         self.table_model.current_seps = []
@@ -5091,6 +5164,7 @@ class MainWindow(QMainWindow):
         self.table_model.scores = score_vals
         self.table_model.hours_above_limit = hour_vals
         self.table_model.row_enabled = row_enabled
+        self._recompute_recommended_order_cache()
         self._apply_table_row_visibility()
         self._emit_table_data_changed()
 
@@ -6410,10 +6484,6 @@ class MainWindow(QMainWindow):
         suggest_btn.clicked.connect(self._ai_suggest_targets)
         btn_col.addWidget(suggest_btn)
 
-        optimize_btn = QPushButton("Optimize Order")
-        optimize_btn.clicked.connect(self._ai_optimize_plan)
-        btn_col.addWidget(optimize_btn)
-
         btn_col.addStretch(1)
         btn_widget = QWidget(panel)
         btn_widget.setLayout(btn_col)
@@ -6575,21 +6645,9 @@ class MainWindow(QMainWindow):
             rows.append(
                 f"  - {target.name}: RA {target.ra:.3f} deg, Dec {target.dec:.3f} deg; "
                 + "; ".join(details)
-        )
+            )
         parts.append("Current targets:\n" + "\n".join(rows))
         return "\n".join(parts)
-
-    def _format_local_dt(self, value: datetime) -> str:
-        payload = self.last_payload if isinstance(self.last_payload, dict) else None
-        tz_name = str(payload.get("tz", "UTC")) if payload else "UTC"
-        try:
-            tz = pytz.timezone(tz_name)
-        except Exception:
-            tz = pytz.UTC
-        try:
-            return value.astimezone(tz).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return value.strftime("%Y-%m-%d %H:%M")
 
     def _build_deterministic_observation_order(self) -> tuple[list[dict[str, object]], list[str]]:
         payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
@@ -6714,40 +6772,6 @@ class MainWindow(QMainWindow):
         )
         return valid_items, invalid_notes
 
-    def _render_deterministic_observation_order(self) -> str:
-        ordered, invalid_notes = self._build_deterministic_observation_order()
-        if not ordered and invalid_notes:
-            return "Cannot build a deterministic order.\n" + "\n".join(f"- {note}" for note in invalid_notes)
-        if not ordered:
-            return "Cannot build a deterministic order from the current plot state."
-
-        lines = [
-            "Deterministic order based on the current night windows.",
-            "",
-        ]
-
-        for idx, item in enumerate(ordered, start=1):
-            start_txt = self._format_local_dt(item["window_start"])
-            end_txt = self._format_local_dt(item["window_end"])
-            peak_txt = self._format_local_dt(item["peak_time"])
-            lines.append(f"{idx}. {item['name']}")
-            lines.append(f"   Window: {start_txt} -> {end_txt}")
-            lines.append(f"   Peak in valid window: {peak_txt}")
-            lines.append(
-                "   Metrics: "
-                f"score {float(item['score']):.1f}, "
-                f"hours above limit {float(item['hours_above_limit']):.2f} h, "
-                f"max alt {float(item['max_altitude_deg']):.1f} deg, "
-                f"peak moon sep {float(item['peak_moon_sep_deg']):.1f} deg"
-            )
-            lines.append("")
-
-        if invalid_notes:
-            lines.append("Excluded under current constraints:")
-            lines.extend(f"- {note}" for note in invalid_notes)
-
-        return "\n".join(lines).strip()
-
     _SYSTEM_PROMPT = (
         "You are an expert astronomy observation assistant. "
         "Provide concise, practical, and accurate guidance for planning observations. "
@@ -6792,18 +6816,6 @@ class MainWindow(QMainWindow):
             "For each object provide: name, type, best observing window, and one-sentence reason."
         )
         self._dispatch_llm(prompt, tag="suggest", label="Suggest targets")
-
-    @Slot()
-    def _ai_optimize_plan(self) -> None:
-        if not self.targets:
-            QMessageBox.information(self, "No targets", "Load or add targets first.")
-            return
-        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
-            self.ai_toggle_btn.setChecked(True)
-        self._append_ai_message("Optimize observation order", is_user=True)
-        self._append_ai_message(self._render_deterministic_observation_order(), is_ai=True)
-        if hasattr(self, "ai_status_label"):
-            self.ai_status_label.setText("Ready")
 
     def _dispatch_llm(self, prompt: str, tag: str, label: str) -> None:
         worker = self._llm_worker
