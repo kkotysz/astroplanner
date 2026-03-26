@@ -531,6 +531,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QSpinBox,
+    QSlider,
     QStyle,
     QSizePolicy,
     QTableView,
@@ -2237,6 +2238,7 @@ class MainWindow(QMainWindow):
             )
         )
         self._refresh_date_nav_icons()
+        self._refresh_plot_mode_switch()
         self._update_night_details_constraints()
         # Apply icon size globally
         self.setIconSize(QSize(20, 20))
@@ -2312,6 +2314,71 @@ class MainWindow(QMainWindow):
         if not use_palette:
             return "#4da3ff"
         return str(use_palette[index % len(use_palette)])
+
+    def _airmass_from_altitude(self, altitude_deg: object) -> np.ndarray:
+        altitude = np.asarray(altitude_deg, dtype=float)
+        airmass = np.full_like(altitude, np.nan, dtype=float)
+        valid = np.isfinite(altitude) & (altitude > 0.0)
+        if np.any(valid):
+            alt_valid = altitude[valid]
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                denom = np.sin(np.radians(alt_valid)) + 0.50572 * np.power(alt_valid + 6.07995, -1.6364)
+                airmass[valid] = 1.0 / denom
+        return airmass
+
+    def _plot_y_values(self, altitude_deg: object) -> np.ndarray:
+        altitude = np.asarray(altitude_deg, dtype=float)
+        if not self._plot_airmass:
+            return altitude
+        return self._airmass_from_altitude(altitude)
+
+    def _plot_limit_value(self) -> float:
+        limit_alt = float(self.limit_spin.value())
+        if not self._plot_airmass:
+            return limit_alt
+        limit_airmass = self._airmass_from_altitude(np.array([limit_alt], dtype=float))
+        value = _safe_float(limit_airmass[0])
+        return value if value is not None else 1.0
+
+    def _configure_main_plot_y_axis(self) -> None:
+        if not self._plot_airmass:
+            self.ax_alt.set_ylabel("Altitude (°)")
+            self.ax_alt.set_ylim(0, 90)
+            self.ax_alt.set_yticks([0, 15, 30, 45, 60, 75, 90])
+            return
+
+        limit_airmass = self._plot_limit_value()
+        max_airmass = max(3.0, min(8.0, float(math.ceil(limit_airmass + 1.0))))
+        ticks = [1.0, 1.1, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0]
+        visible_ticks = [tick for tick in ticks if tick <= max_airmass]
+        if not visible_ticks or visible_ticks[0] != 1.0:
+            visible_ticks.insert(0, 1.0)
+        self.ax_alt.set_ylabel("Airmass")
+        self.ax_alt.set_ylim(max_airmass, 1.0)
+        self.ax_alt.set_yticks(visible_ticks)
+        self.ax_alt.set_yticklabels([f"{tick:.1f}" for tick in visible_ticks])
+
+    def _refresh_plot_mode_switch(self) -> None:
+        if not hasattr(self, "plot_mode_alt_label") or not hasattr(self, "plot_mode_airmass_label"):
+            return
+        base = self.palette().color(QPalette.ColorRole.WindowText)
+        active_color = f"rgba({base.red()}, {base.green()}, {base.blue()}, 255)"
+        inactive_color = f"rgba({base.red()}, {base.green()}, {base.blue()}, 150)"
+        self.plot_mode_alt_label.setStyleSheet(
+            f"font-weight: {'700' if not self._plot_airmass else '500'}; color: {active_color if not self._plot_airmass else inactive_color};"
+        )
+        self.plot_mode_airmass_label.setStyleSheet(
+            f"font-weight: {'700' if self._plot_airmass else '500'}; color: {active_color if self._plot_airmass else inactive_color};"
+        )
+
+    def _reset_plot_navigation_home(self) -> None:
+        if not hasattr(self, "plot_toolbar"):
+            return
+        try:
+            self.plot_toolbar.update()
+            self.plot_toolbar.push_current()
+        except Exception:
+            pass
 
     def _refresh_target_color_map(self, palette: Optional[list[str]] = None):
         use_palette = palette if palette is not None else self._line_palette()
@@ -3177,6 +3244,7 @@ class MainWindow(QMainWindow):
         self._last_calc_stats = CalcRunStats(duration_s=0.0, visible_targets=0, total_targets=0)
         self._clock_polar_tick = 0
         self.color_blind_mode = self.settings.value("general/colorBlindMode", False, type=bool)
+        self._plot_airmass = self.settings.value("general/plotAirmass", False, type=bool)
         self._cutout_view_key = _normalize_cutout_view_key(
             self.settings.value("general/cutoutView", CUTOUT_DEFAULT_VIEW_KEY, type=str)
         )
@@ -3393,9 +3461,57 @@ class MainWindow(QMainWindow):
         self.plot_toolbar = NavigationToolbar(self.plot_canvas, self)
         # Minimize toolbar padding and height
         self.plot_toolbar.setIconSize(QSize(16, 16))
-        self.plot_toolbar.setMaximumHeight(self.plot_toolbar.sizeHint().height())
         self.plot_toolbar.layout().setContentsMargins(0, 0, 0, 0)
         self.plot_toolbar.layout().setSpacing(0)
+        self.plot_mode_widget = QWidget(self.plot_toolbar)
+        self.plot_mode_widget.setObjectName("PlotModeWidget")
+        plot_mode_layout = QHBoxLayout(self.plot_mode_widget)
+        plot_mode_layout.setContentsMargins(4, 0, 4, 0)
+        plot_mode_layout.setSpacing(6)
+        self.plot_mode_alt_label = QLabel("Altitude", self.plot_mode_widget)
+        self.plot_mode_airmass_label = QLabel("Airmass", self.plot_mode_widget)
+        self.airmass_toggle_btn = QSlider(Qt.Orientation.Horizontal, self.plot_mode_widget)
+        self.airmass_toggle_btn.setObjectName("PlotModeSwitch")
+        self.airmass_toggle_btn.setToolTip("Switch the main plot Y-axis between altitude and airmass")
+        self.airmass_toggle_btn.setRange(0, 1)
+        self.airmass_toggle_btn.setSingleStep(1)
+        self.airmass_toggle_btn.setPageStep(1)
+        self.airmass_toggle_btn.setFixedWidth(34)
+        self.airmass_toggle_btn.setFixedHeight(18)
+        self.airmass_toggle_btn.setValue(1 if self._plot_airmass else 0)
+        self.airmass_toggle_btn.valueChanged.connect(self._on_plot_mode_switch_changed)
+        self.airmass_toggle_btn.setStyleSheet(
+            """
+            QSlider::groove:horizontal {
+                height: 18px;
+                border-radius: 9px;
+                background: rgba(120, 120, 120, 0.30);
+                border: 1px solid rgba(120, 120, 120, 0.55);
+            }
+            QSlider::sub-page:horizontal {
+                background: rgba(67, 145, 214, 0.48);
+                border-radius: 9px;
+            }
+            QSlider::add-page:horizontal {
+                background: transparent;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal {
+                width: 14px;
+                margin: 1px;
+                border-radius: 7px;
+                background: rgb(244, 247, 250);
+                border: 1px solid rgba(30, 41, 59, 0.22);
+            }
+            """
+        )
+        plot_mode_layout.addWidget(self.plot_mode_alt_label)
+        plot_mode_layout.addWidget(self.airmass_toggle_btn)
+        plot_mode_layout.addWidget(self.plot_mode_airmass_label)
+        self._refresh_plot_mode_switch()
+        self.plot_toolbar.addSeparator()
+        self.plot_toolbar.addWidget(self.plot_mode_widget)
+        self.plot_toolbar.setMaximumHeight(self.plot_toolbar.sizeHint().height())
 
         # top controls
         # Date selector with previous/next day buttons
@@ -5124,8 +5240,9 @@ class MainWindow(QMainWindow):
             # straight connector lines through non-visible intervals.
             alt_vis = np.array(alt, copy=True)
             alt_vis[~vis_mask] = np.nan
+            plot_alt_vis = self._plot_y_values(alt_vis)
             base_line, = self.ax_alt.plot(
-                times_nums, alt_vis,
+                times_nums, plot_alt_vis,
                 color=color, linewidth=1.4,
                 linestyle="--", alpha=0.3, zorder=1
             )
@@ -5135,8 +5252,9 @@ class MainWindow(QMainWindow):
             if high_mask.any():
                 alt_high = np.array(alt, copy=True)
                 alt_high[~high_mask] = np.nan
+                plot_alt_high = self._plot_y_values(alt_high)
                 solid_line, = self.ax_alt.plot(
-                    times_nums, alt_high,
+                    times_nums, plot_alt_high,
                     color=color, linewidth=1.4,
                     linestyle="-", alpha=1.0, zorder=2
                 )
@@ -5243,7 +5361,16 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------------------
         # Red limiting‑altitude line
         # ------------------------------------------------------------------
-        self.ax_alt.axhline(self.limit_spin.value(), color="red", linestyle="-", linewidth=0.5, alpha=0.4, label="Limit Altitude")
+        limit_line_value = self._plot_limit_value()
+        limit_line_label = "Limit Airmass" if self._plot_airmass else "Limit Altitude"
+        self.ax_alt.axhline(
+            limit_line_value,
+            color="red",
+            linestyle="-",
+            linewidth=0.5,
+            alpha=0.4,
+            label=limit_line_label,
+        )
 
         # Reset line references
         self.sun_line = None
@@ -5251,8 +5378,9 @@ class MainWindow(QMainWindow):
 
         # Sun altitude curve (always plot, visibility controlled)
         if "sun_alt" in data:
+            sun_plot_values = self._plot_y_values(data["sun_alt"])
             self.sun_line, = self.ax_alt.plot(
-                times, data["sun_alt"],
+                times, sun_plot_values,
                 color="orange", linewidth=1.2, linestyle='-',
                 alpha=0.8, label="Sun"
             )
@@ -5260,8 +5388,9 @@ class MainWindow(QMainWindow):
 
         # Moon altitude curve (always plot, visibility controlled)
         if "moon_alt" in data:
+            moon_plot_values = self._plot_y_values(data["moon_alt"])
             self.moon_line, = self.ax_alt.plot(
-                times, data["moon_alt"],
+                times, moon_plot_values,
                 color="silver", linewidth=1.2, linestyle='-',
                 alpha=0.8, label="Moon"
             )
@@ -5291,10 +5420,9 @@ class MainWindow(QMainWindow):
         self.moonphase_bar.setValue(phase_value)
         self.moonphase_bar.setFormat(f"{phase_value}%")
 
-        self.ax_alt.set_ylabel("Altitude (°)")
+        self._configure_main_plot_y_axis()
         self.ax_alt.set_xlabel("Time (local)")
         # self.ax_alt.legend(loc="upper right")
-        self.ax_alt.set_ylim(0, 90)
         # Hour labels in the observer's local timezone
         self.ax_alt.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=tz))
         # Display selected observation date
@@ -5336,6 +5464,7 @@ class MainWindow(QMainWindow):
             self._calc_started_at = 0.0
         self._update_selected_details()
         self._update_status_bar()
+        self._reset_plot_navigation_home()
         self.plot_canvas.draw_idle()
         self._update_polar_positions(data)
 
@@ -5347,6 +5476,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'moon_line') and self.moon_line:
             self.moon_line.set_visible(self.moon_check.isChecked())
         self.plot_canvas.draw_idle()
+
+    @Slot(int)
+    def _on_plot_mode_switch_changed(self, value: int):
+        checked = bool(value)
+        if self._plot_airmass == checked:
+            self._refresh_plot_mode_switch()
+            return
+        self._plot_airmass = checked
+        self._refresh_plot_mode_switch()
+        self.settings.setValue("general/plotAirmass", self._plot_airmass)
+        if isinstance(self.last_payload, dict):
+            self._update_plot(self.last_payload)
 
 
     @Slot()
