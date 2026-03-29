@@ -53,7 +53,7 @@ import os
 import sys
 import threading
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -118,6 +118,10 @@ TARGET_SEARCH_SOURCES: list[tuple[str, str]] = [
     ("ned", "NED"),
     ("lsst", "LSST"),
 ]
+TARGET_SOURCE_LABELS: dict[str, str] = {key: label for key, label in TARGET_SEARCH_SOURCES}
+TARGET_SOURCE_LABELS["bhtom"] = "BHTOM"
+TARGET_SOURCE_LABELS["coordinates"] = "Manual coordinates"
+TARGET_SOURCE_LABELS["manual"] = "Manual target"
 
 TNS_ENDPOINT_CHOICES: list[tuple[str, str]] = [
     ("production", "Production (www.wis-tns.org)"),
@@ -150,6 +154,12 @@ CUTOUT_CACHE_MAX = 24
 FINDER_HTTP_TIMEOUT_S = 5.0
 FINDER_WORKER_TIMEOUT_MS = 10000
 FINDER_RETRY_COOLDOWN_S = 45.0
+BHTOM_API_BASE_URL = "https://bh-tom2.astrouw.edu.pl"
+BHTOM_TARGET_LIST_PATH = "/targets/getTargetList/"
+BHTOM_MAX_SUGGESTION_PAGES = 5
+BHTOM_PAGE_SIZE = 200
+BHTOM_SUGGESTION_MIN_IMPORTANCE = 2.0
+BHTOM_SUGGESTION_CACHE_TTL_S = 60 * 60
 
 
 @dataclass(frozen=True)
@@ -174,10 +184,45 @@ def _safe_float(value: object) -> Optional[float]:
         return None
 
 
+def _safe_int(value: object) -> Optional[int]:
+    if value is None or np.ma.is_masked(value):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+
 def _normalize_catalog_token(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip().lower()
+
+
+def _target_source_label(source_key: object) -> str:
+    key = _normalize_catalog_token(source_key)
+    if not key:
+        return "Saved target"
+    return TARGET_SOURCE_LABELS.get(key, str(source_key).strip() or "Saved target")
+
+
+def _target_magnitude_label(target: "Target") -> str:
+    return "Last Mag" if _normalize_catalog_token(target.source_catalog) == "bhtom" else "Mag"
+
+
+def _object_type_is_unknown(value: object) -> bool:
+    token = _normalize_catalog_token(value)
+    return token in {"", "-", "unknown", "unk", "n/a", "na", "none"}
+
+
+def _normalize_catalog_display_name(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return " ".join(text.split())
 
 
 def _simbad_column(result, *candidates: str) -> Optional[str]:
@@ -248,6 +293,78 @@ def _extract_simbad_metadata(result, row_idx: int = 0) -> tuple[Optional[float],
     return magnitude, object_type
 
 
+def _extract_simbad_photometry(result, row_idx: int = 0) -> dict[str, float]:
+    photometry: dict[str, float] = {}
+    if not _simbad_has_row(result, row_idx):
+        return photometry
+
+    for label, candidates in (
+        ("B", ("B", "FLUX_B")),
+        ("V", ("V", "FLUX_V")),
+        ("R", ("R", "FLUX_R")),
+    ):
+        col = _simbad_column(result, *candidates)
+        if col is None:
+            continue
+        raw = _simbad_cell(result, col, row_idx)
+        if raw is None or np.ma.is_masked(raw):
+            continue
+        try:
+            photometry[label] = float(raw)
+        except (TypeError, ValueError):
+            continue
+
+    return photometry
+
+
+def _extract_simbad_compact_measurements(result, row_idx: int = 0) -> dict[str, object]:
+    details: dict[str, object] = {
+        "photometry": _extract_simbad_photometry(result, row_idx=row_idx),
+    }
+    if not _simbad_has_row(result, row_idx):
+        return details
+
+    text_columns = {
+        "sp_type": ("sp_type", "messpt.sptype"),
+        "distance_unit": ("mesdistance.unit",),
+    }
+    float_columns = {
+        "parallax_mas": ("plx_value", "mesplx.plx"),
+        "parallax_err_mas": ("plx_err",),
+        "distance_value": ("mesdistance.dist",),
+        "distance_plus_err": ("mesdistance.plus_err",),
+        "distance_minus_err": ("mesdistance.minus_err",),
+        "teff_k": ("mesfe_h.teff",),
+        "fe_h": ("mesfe_h.fe_h",),
+        "size_major_arcmin": ("galdim_majaxis", "mesdiameter.diameter"),
+        "size_minor_arcmin": ("galdim_minaxis",),
+        "radial_velocity_kms": ("rvz_radvel", "mesvelocities.velvalue"),
+        "radial_velocity_err_kms": ("rvz_err", "mesvelocities.meanerror"),
+        "redshift": ("rvz_redshift",),
+    }
+
+    for key, candidates in text_columns.items():
+        col = _simbad_column(result, *candidates)
+        if col is None:
+            continue
+        raw = _simbad_cell(result, col, row_idx)
+        if raw is None or np.ma.is_masked(raw):
+            continue
+        text = _decode_simbad_value(raw)
+        if text:
+            details[key] = text
+
+    for key, candidates in float_columns.items():
+        col = _simbad_column(result, *candidates)
+        if col is None:
+            continue
+        value = _safe_float(_simbad_cell(result, col, row_idx))
+        if value is not None and math.isfinite(value):
+            details[key] = float(value)
+
+    return details
+
+
 def _extract_simbad_name(result, fallback: str, row_idx: int = 0) -> str:
     if not _simbad_has_row(result, row_idx):
         return fallback
@@ -259,6 +376,64 @@ def _extract_simbad_name(result, fallback: str, row_idx: int = 0) -> str:
         return fallback
     value = _decode_simbad_value(raw)
     return value or fallback
+
+
+def _simbad_row_coord(result, row_idx: int = 0) -> Optional[SkyCoord]:
+    if not _simbad_has_row(result, row_idx):
+        return None
+
+    ra_deg_col = _simbad_column(result, "RA_d", "RA(deg)")
+    dec_deg_col = _simbad_column(result, "DEC_d", "DEC(deg)")
+    if ra_deg_col is not None and dec_deg_col is not None:
+        ra_deg = _safe_float(_simbad_cell(result, ra_deg_col, row_idx))
+        dec_deg = _safe_float(_simbad_cell(result, dec_deg_col, row_idx))
+        if ra_deg is not None and dec_deg is not None:
+            return SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
+
+    ra_col = _simbad_column(result, "RA", "ra")
+    dec_col = _simbad_column(result, "DEC", "dec")
+    if ra_col is None or dec_col is None:
+        return None
+    ra_raw = _simbad_cell(result, ra_col, row_idx)
+    dec_raw = _simbad_cell(result, dec_col, row_idx)
+    if ra_raw is None or dec_raw is None or np.ma.is_masked(ra_raw) or np.ma.is_masked(dec_raw):
+        return None
+    ra_deg = _safe_float(ra_raw)
+    dec_deg = _safe_float(dec_raw)
+    if ra_deg is not None and dec_deg is not None:
+        return SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
+    ra_txt = _decode_simbad_value(ra_raw)
+    dec_txt = _decode_simbad_value(dec_raw)
+    if not ra_txt or not dec_txt:
+        return None
+    try:
+        return SkyCoord(ra_txt, dec_txt, unit=(u.hourangle, u.deg), frame="icrs")
+    except Exception:
+        return None
+
+
+def _simbad_best_row_index(result, reference_coord: Optional[SkyCoord] = None) -> int:
+    if reference_coord is None or not _simbad_has_row(result):
+        return 0
+    try:
+        total_rows = len(result)
+    except Exception:
+        return 0
+
+    best_idx = 0
+    best_sep = float("inf")
+    for row_idx in range(total_rows):
+        row_coord = _simbad_row_coord(result, row_idx=row_idx)
+        if row_coord is None:
+            continue
+        try:
+            sep_arcsec = float(row_coord.separation(reference_coord).arcsec)
+        except Exception:
+            continue
+        if sep_arcsec < best_sep:
+            best_sep = sep_arcsec
+            best_idx = row_idx
+    return best_idx
 
 
 def _build_tns_marker(bot_id: int | str, bot_name: str) -> str:
@@ -478,7 +653,9 @@ def _sanitize_cutout_size_px(value: object) -> int:
 from PySide6.QtCore import (
     QAbstractTableModel,
     QDate,
+    QEvent,
     QModelIndex,
+    QSignalBlocker,
     Qt,
     QThread,
     QMutex, QWaitCondition,
@@ -500,6 +677,8 @@ from PySide6.QtGui import (
     QDoubleValidator,
     QFont,
     QFontDatabase,
+    QFontMetrics,
+    QDesktopServices,
     QIcon,
     QImage,
     QKeySequence,
@@ -515,6 +694,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QDoubleSpinBox,
     QFrame,
     QFormLayout,
     QHeaderView,
@@ -750,21 +930,39 @@ class GeneralSettingsDialog(QDialog):
         super().__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("General Settings")
-        layout = QFormLayout(self)
+        root_layout = QVBoxLayout(self)
+        tabs = QTabWidget(self)
+        tabs.setDocumentMode(True)
+        root_layout.addWidget(tabs)
+
+        def _make_tab(title: str) -> QFormLayout:
+            page = QWidget(self)
+            form = QFormLayout(page)
+            form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+            form.setContentsMargins(12, 12, 12, 12)
+            form.setSpacing(10)
+            tabs.addTab(page, title)
+            return form
+
+        general_layout = _make_tab("General")
+        cutout_layout = _make_tab("Cutout")
+        ai_layout = _make_tab("AI")
+        integrations_layout = _make_tab("Integrations")
+        plot_layout = _make_tab("Plot")
 
         # Default Observatory
         self.site_combo = QComboBox(self)
         self.site_combo.addItems(parent.observatories.keys()) # type: ignore[attr-defined]
         init_site = parent.settings.value("general/defaultSite", parent.obs_combo.currentText(), type=str) if parent and hasattr(parent, "settings") else "Custom"
         self.site_combo.setCurrentText(init_site)
-        layout.addRow("Default Observatory:", self.site_combo)
+        general_layout.addRow("Default Observatory:", self.site_combo)
 
         # Visibility samples
         self.ts_spin = QSpinBox(self)
         self.ts_spin.setRange(50, 1000)
         init_ts = parent.settings.value("general/timeSamples", 240, type=int) if parent and hasattr(parent, "settings") else 240
         self.ts_spin.setValue(init_ts)
-        layout.addRow("Visibility samples:", self.ts_spin)
+        general_layout.addRow("Visibility samples:", self.ts_spin)
 
         # Global UI font size
         self.ui_font_spin = QSpinBox(self)
@@ -772,7 +970,7 @@ class GeneralSettingsDialog(QDialog):
         self.ui_font_spin.setSuffix(" pt")
         init_ui_font = parent.settings.value("general/uiFontSize", 11, type=int) if parent and hasattr(parent, "settings") else 11
         self.ui_font_spin.setValue(max(9, min(16, int(init_ui_font))))
-        layout.addRow("UI font size:", self.ui_font_spin)
+        general_layout.addRow("UI font size:", self.ui_font_spin)
 
         # UI theme
         self.theme_combo = QComboBox(self)
@@ -786,7 +984,7 @@ class GeneralSettingsDialog(QDialog):
         theme_idx = self.theme_combo.findData(init_theme)
         if theme_idx >= 0:
             self.theme_combo.setCurrentIndex(theme_idx)
-        layout.addRow("Color theme:", self.theme_combo)
+        general_layout.addRow("Color theme:", self.theme_combo)
 
         # Cutout defaults
         self.cutout_view_combo = QComboBox(self)
@@ -836,11 +1034,11 @@ class GeneralSettingsDialog(QDialog):
 
         cutout_hdr = QLabel("Cutout defaults")
         cutout_hdr.setObjectName("SectionHint")
-        layout.addRow(cutout_hdr)
-        layout.addRow("Cutout view:", self.cutout_view_combo)
-        layout.addRow("Cutout survey:", self.cutout_survey_combo)
-        layout.addRow("Cutout FOV:", self.cutout_fov_spin)
-        layout.addRow("Cutout size:", self.cutout_size_spin)
+        cutout_layout.addRow(cutout_hdr)
+        cutout_layout.addRow("Cutout view:", self.cutout_view_combo)
+        cutout_layout.addRow("Cutout survey:", self.cutout_survey_combo)
+        cutout_layout.addRow("Cutout FOV:", self.cutout_fov_spin)
+        cutout_layout.addRow("Cutout size:", self.cutout_size_spin)
 
         # Local LLM defaults
         self.llm_url_edit = QLineEdit(self)
@@ -860,9 +1058,24 @@ class GeneralSettingsDialog(QDialog):
 
         llm_hdr = QLabel("Local AI assistant (optional)")
         llm_hdr.setObjectName("SectionHint")
-        layout.addRow(llm_hdr)
-        layout.addRow("LLM server URL:", self.llm_url_edit)
-        layout.addRow("LLM model:", self.llm_model_edit)
+        ai_layout.addRow(llm_hdr)
+        ai_layout.addRow("LLM server URL:", self.llm_url_edit)
+        ai_layout.addRow("LLM model:", self.llm_model_edit)
+
+        # BHTOM credentials (optional, used for Suggest Targets)
+        self.bhtom_api_edit = QLineEdit(self)
+        self.bhtom_api_edit.setEchoMode(QLineEdit.Password)
+        self.bhtom_api_edit.setPlaceholderText("API token for BHTOM target suggestions")
+        self.bhtom_api_edit.setText(
+            parent.settings.value("general/bhtomApiToken", "", type=str)
+            if parent and hasattr(parent, "settings")
+            else ""
+        )
+
+        bhtom_hdr = QLabel("BHTOM suggestions (optional)")
+        bhtom_hdr.setObjectName("SectionHint")
+        integrations_layout.addRow(bhtom_hdr)
+        integrations_layout.addRow("BHTOM API token:", self.bhtom_api_edit)
 
         # TNS credentials (optional, used for TNS resolver)
         self.tns_api_edit = QLineEdit(self)
@@ -891,12 +1104,12 @@ class GeneralSettingsDialog(QDialog):
 
         tns_hdr = QLabel("TNS credentials (optional)")
         tns_hdr.setObjectName("SectionHint")
-        layout.addRow(tns_hdr)
-        layout.addRow("TNS API key:", self.tns_api_edit)
-        layout.addRow("TNS Bot ID:", self.tns_bot_id_edit)
-        layout.addRow("TNS Bot name:", self.tns_bot_name_edit)
-        layout.addRow("TNS endpoint:", self.tns_endpoint_combo)
-        layout.addRow("", self.tns_test_btn)
+        integrations_layout.addRow(tns_hdr)
+        integrations_layout.addRow("TNS API key:", self.tns_api_edit)
+        integrations_layout.addRow("TNS Bot ID:", self.tns_bot_id_edit)
+        integrations_layout.addRow("TNS Bot name:", self.tns_bot_name_edit)
+        integrations_layout.addRow("TNS endpoint:", self.tns_endpoint_combo)
+        integrations_layout.addRow("", self.tns_test_btn)
 
         # Polar-plot path options
         self.sun_path_chk  = QCheckBox("Plot Sun path",  self)
@@ -909,17 +1122,18 @@ class GeneralSettingsDialog(QDialog):
         self.obj_path_chk.setChecked(parent.settings.value("general/showObjPath",  True, type=bool)) if parent and hasattr(parent, "settings") else True
         self.color_blind_chk.setChecked(parent.settings.value("general/colorBlindMode", False, type=bool)) if parent and hasattr(parent, "settings") else False
 
-        layout.addRow(self.sun_path_chk)
-        layout.addRow(self.moon_path_chk)
-        layout.addRow(self.obj_path_chk)
-        layout.addRow(self.color_blind_chk)
+        plot_layout.addRow(self.sun_path_chk)
+        plot_layout.addRow(self.moon_path_chk)
+        plot_layout.addRow(self.obj_path_chk)
+        plot_layout.addRow(self.color_blind_chk)
 
         # OK / Cancel
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-        self.setMinimumWidth(max(420, self.sizeHint().width()))
+        root_layout.addWidget(btns)
+        self.setMinimumSize(560, 460)
+        self.resize(640, 520)
 
     def accept(self):
         s = self.parent().settings
@@ -939,6 +1153,7 @@ class GeneralSettingsDialog(QDialog):
         llm_model = self.llm_model_edit.text().strip() or LLMConfig.DEFAULT_MODEL
         s.setValue("llm/serverUrl", llm_url)
         s.setValue("llm/model", llm_model)
+        s.setValue("general/bhtomApiToken", self.bhtom_api_edit.text().strip())
         s.setValue("general/tnsApiKey", self.tns_api_edit.text().strip())
         s.setValue("general/tnsBotId", self.tns_bot_id_edit.text().strip())
         s.setValue("general/tnsBotName", self.tns_bot_name_edit.text().strip())
@@ -1380,6 +1595,8 @@ class Target(BaseModel):
     name: str = Field(..., description="Display name")
     ra: float = Field(..., description="Right Ascension in degrees")
     dec: float = Field(..., description="Declination in degrees")
+    source_catalog: str = Field("", description="Resolver/backend used to create this target")
+    source_object_id: str = Field("", description="Identifier returned by the source catalog")
     object_type: str = Field("", description="Target type label")
     magnitude: Optional[float] = Field(None, description="Apparent magnitude")
     size_arcmin: Optional[float] = Field(None, description="Apparent size in arcminutes")
@@ -1424,6 +1641,746 @@ class SessionSettings(BaseModel):
     # <‑‑ make Pydantic happy with Qt types
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+
+def _targets_match(left: Target, right: Target, max_sep_deg: float = 0.05) -> bool:
+    left_source = _normalize_catalog_token(left.source_object_id)
+    right_source = _normalize_catalog_token(right.source_object_id)
+    if left_source and right_source and left_source == right_source:
+        return True
+    if _normalize_catalog_token(left.name) == _normalize_catalog_token(right.name):
+        return True
+    try:
+        return float(left.skycoord.separation(right.skycoord).deg) < max_sep_deg
+    except Exception:
+        return False
+
+
+class SuggestionTableModel(QAbstractTableModel):
+    COL_NAME = 0
+    COL_TYPE = 1
+    COL_MAG = 2
+    COL_PRIORITY = 3
+    COL_IMPORTANCE = 4
+    COL_SCORE = 5
+    COL_AIRMASS = 6
+    COL_HOURS = 7
+    COL_WINDOW = 8
+    COL_MOON_SEP = 9
+    COL_ACTION = 10
+
+    headers = [
+        "Name",
+        "Type",
+        "Last Mag",
+        "Pri",
+        "Importance",
+        "Score",
+        "Min Airmass",
+        "Over Lim (h)",
+        "Best Window",
+        "Moon Sep",
+        "Add",
+    ]
+
+    def __init__(
+        self,
+        suggestions: list[dict[str, object]],
+        moon_sep_threshold: float,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._all_rows = suggestions
+        self._visible_rows: list[dict[str, object]] = []
+        self._min_importance = BHTOM_SUGGESTION_MIN_IMPORTANCE
+        self._min_score = 0.0
+        self._min_hours = 0.0
+        self._min_moon_sep = 0.0
+        self._max_airmass = 99.0
+        self._max_magnitude = 99.0
+        self._moon_sep_threshold = float(moon_sep_threshold)
+        self._sort_column = self.COL_IMPORTANCE
+        self._sort_order = Qt.DescendingOrder
+        self._hover_row: Optional[int] = None
+        self._hover_name_row: Optional[int] = None
+        self._hover_action_row: Optional[int] = None
+        self._rebuild_rows()
+
+    @staticmethod
+    def _target(item: dict[str, object]) -> Target:
+        target = item["target"]
+        assert isinstance(target, Target)
+        return target
+
+    @staticmethod
+    def _metrics(item: dict[str, object]) -> TargetNightMetrics:
+        metrics = item["metrics"]
+        assert isinstance(metrics, TargetNightMetrics)
+        return metrics
+
+    @staticmethod
+    def _window_start(item: dict[str, object]) -> datetime:
+        value = item["window_start"]
+        assert isinstance(value, datetime)
+        return value
+
+    @staticmethod
+    def _window_end(item: dict[str, object]) -> datetime:
+        value = item["window_end"]
+        assert isinstance(value, datetime)
+        return value
+
+    @staticmethod
+    def _optional_float_key(value: object, descending: bool) -> tuple[int, float]:
+        number = _safe_float(value)
+        if number is None or not math.isfinite(number):
+            return (1, 0.0)
+        return (0, -float(number) if descending else float(number))
+
+    @staticmethod
+    def _numeric_key(value: object, descending: bool) -> float:
+        number = _safe_float(value)
+        if number is None or not math.isfinite(number):
+            number = 0.0
+        return -float(number) if descending else float(number)
+
+    def _passes_filters(self, item: dict[str, object]) -> bool:
+        target = self._target(item)
+        metrics = self._metrics(item)
+        importance = float(item.get("importance", 0.0) or 0.0)
+        if importance < self._min_importance:
+            return False
+        if metrics.score < self._min_score:
+            return False
+        if metrics.hours_above_limit < self._min_hours:
+            return False
+        min_window_moon_sep = _safe_float(item.get("min_window_moon_sep"))
+        if self._min_moon_sep > 0.0:
+            if min_window_moon_sep is None or not math.isfinite(min_window_moon_sep) or min_window_moon_sep < self._min_moon_sep:
+                return False
+        best_airmass = _safe_float(item.get("best_airmass"))
+        if self._max_airmass < 99.0:
+            if best_airmass is None or not math.isfinite(best_airmass) or best_airmass > self._max_airmass:
+                return False
+        if self._max_magnitude < 99.0:
+            if target.magnitude is None or target.magnitude > self._max_magnitude:
+                return False
+        return True
+
+    def _sort_rows(self, rows: list[dict[str, object]]) -> None:
+        descending = self._sort_order == Qt.DescendingOrder
+        col = self._sort_column
+        if col == self.COL_NAME:
+            rows.sort(key=lambda item: self._target(item).name.lower(), reverse=descending)
+        elif col == self.COL_TYPE:
+            rows.sort(key=lambda item: (self._target(item).object_type or "").lower(), reverse=descending)
+        elif col == self.COL_MAG:
+            rows.sort(key=lambda item: self._optional_float_key(self._target(item).magnitude, descending))
+        elif col == self.COL_PRIORITY:
+            rows.sort(key=lambda item: self._numeric_key(self._target(item).priority, descending))
+        elif col == self.COL_IMPORTANCE:
+            rows.sort(key=lambda item: self._numeric_key(item.get("importance"), descending))
+        elif col == self.COL_SCORE:
+            rows.sort(key=lambda item: self._numeric_key(self._metrics(item).score, descending))
+        elif col == self.COL_AIRMASS:
+            rows.sort(key=lambda item: self._optional_float_key(item.get("best_airmass"), descending))
+        elif col == self.COL_HOURS:
+            rows.sort(key=lambda item: self._numeric_key(self._metrics(item).hours_above_limit, descending))
+        elif col == self.COL_WINDOW:
+            rows.sort(
+                key=lambda item: self._window_start(item).timestamp() * (-1.0 if descending else 1.0)
+            )
+        elif col == self.COL_MOON_SEP:
+            rows.sort(key=lambda item: self._optional_float_key(item.get("min_window_moon_sep"), descending))
+        elif col == self.COL_ACTION:
+            rows.sort(
+                key=lambda item: (
+                    bool(item.get("added_to_plan")),
+                    self._target(item).name.lower(),
+                )
+            )
+            if descending:
+                rows.reverse()
+        else:
+            rows.sort(
+                key=lambda item: (
+                    -float(item.get("importance", 0.0) or 0.0),
+                    -float(self._metrics(item).score),
+                    self._target(item).name.lower(),
+                )
+            )
+
+    def _rebuild_rows(self) -> None:
+        self.beginResetModel()
+        filtered = [item for item in self._all_rows if self._passes_filters(item)]
+        self._sort_rows(filtered)
+        self._visible_rows = filtered
+        self._hover_row = None
+        self._hover_name_row = None
+        self._hover_action_row = None
+        self.endResetModel()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        return len(self._visible_rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
+        return len(self.headers)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):  # noqa: N802
+        if not index.isValid() or not (0 <= index.row() < len(self._visible_rows)):
+            return None
+
+        item = self._visible_rows[index.row()]
+        target = self._target(item)
+        metrics = self._metrics(item)
+        row = index.row()
+        col = index.column()
+
+        if role == Qt.TextAlignmentRole:
+            if col in {self.COL_NAME, self.COL_TYPE, self.COL_WINDOW}:
+                return Qt.AlignLeft | Qt.AlignVCenter
+            return Qt.AlignCenter | Qt.AlignVCenter
+
+        if role == Qt.FontRole and col in {self.COL_NAME, self.COL_ACTION}:
+            font = QFont()
+            font.setBold(True)
+            if col == self.COL_NAME and row == self._hover_name_row:
+                font.setUnderline(True)
+            return font
+
+        if role == Qt.ToolTipRole:
+            if col == self.COL_NAME:
+                return f"Open in BHTOM: {target.name}"
+            if col == self.COL_WINDOW:
+                return (
+                    f"{self._window_start(item).strftime('%Y-%m-%d %H:%M')} -> "
+                    f"{self._window_end(item).strftime('%Y-%m-%d %H:%M')}"
+                )
+            if col == self.COL_MOON_SEP and item.get("moon_sep_warning"):
+                min_sep = _safe_float(item.get("min_window_moon_sep"))
+                if min_sep is not None:
+                    return (
+                        f"Moon separation drops to {min_sep:.1f} deg in the best window "
+                        f"(threshold {self._moon_sep_threshold:.0f} deg)."
+                    )
+            if col == self.COL_ACTION and item.get("added_to_plan"):
+                return "This target has already been added to the current plan."
+
+        if role == Qt.BackgroundRole:
+            if row == self._hover_row:
+                return QBrush(QColor("#ff3d78"))
+            if col == self.COL_MOON_SEP and item.get("moon_sep_warning"):
+                return QBrush(QColor("#fff1a8"))
+            if col == self.COL_ACTION:
+                if item.get("added_to_plan"):
+                    return QBrush(QColor("#e6f4ea"))
+                if row == self._hover_action_row:
+                    return QBrush(QColor("#d8e2ef"))
+                return QBrush(QColor("#c7d1dc"))
+
+        if role == Qt.ForegroundRole:
+            if row == self._hover_row:
+                return QBrush(QColor("#ffcb3a"))
+            if col == self.COL_MOON_SEP and item.get("moon_sep_warning"):
+                return QBrush(QColor("#3f3200"))
+            if col == self.COL_ACTION:
+                if item.get("added_to_plan"):
+                    return QBrush(QColor("#4f6f52"))
+                if row == self._hover_action_row:
+                    return QBrush(QColor("#17212b"))
+                return QBrush(QColor("#243241"))
+
+        if role not in (Qt.DisplayRole, Qt.EditRole):
+            return None
+
+        if col == self.COL_NAME:
+            return target.name
+        if col == self.COL_TYPE:
+            return target.object_type or "-"
+        if col == self.COL_MAG:
+            return f"{target.magnitude:.2f}" if target.magnitude is not None else "-"
+        if col == self.COL_PRIORITY:
+            return str(target.priority)
+        if col == self.COL_IMPORTANCE:
+            return f"{float(item.get('importance', 0.0) or 0.0):.1f}"
+        if col == self.COL_SCORE:
+            return f"{metrics.score:.1f}"
+        if col == self.COL_AIRMASS:
+            best_airmass = _safe_float(item.get("best_airmass"))
+            return f"{best_airmass:.2f}" if best_airmass is not None else "-"
+        if col == self.COL_HOURS:
+            return f"{metrics.hours_above_limit:.1f}"
+        if col == self.COL_WINDOW:
+            return f"{self._window_start(item).strftime('%H:%M')} - {self._window_end(item).strftime('%H:%M')}"
+        if col == self.COL_MOON_SEP:
+            min_sep = _safe_float(item.get("min_window_moon_sep"))
+            return f"{min_sep:.1f}" if min_sep is not None else "-"
+        if col == self.COL_ACTION:
+            return "Added" if item.get("added_to_plan") else "Add"
+        return None
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):  # noqa: N802
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self.headers[section]
+        return None
+
+    def flags(self, index: QModelIndex):  # noqa: N802
+        if not index.isValid():
+            return Qt.ItemIsEnabled
+        return Qt.ItemIsSelectable | Qt.ItemIsEnabled
+
+    def sort(self, column: int, order: Qt.SortOrder = Qt.AscendingOrder) -> None:
+        self._sort_column = int(column)
+        self._sort_order = order
+        self._rebuild_rows()
+
+    def set_filters(
+        self,
+        min_importance: float,
+        min_score: float,
+        min_hours: float,
+        min_moon_sep: float,
+        max_airmass: float,
+        max_magnitude: float,
+    ) -> None:
+        self._min_importance = float(min_importance)
+        self._min_score = float(min_score)
+        self._min_hours = float(min_hours)
+        self._min_moon_sep = float(min_moon_sep)
+        self._max_airmass = float(max_airmass)
+        self._max_magnitude = float(max_magnitude)
+        self._rebuild_rows()
+
+    def filtered_count(self) -> int:
+        return sum(1 for item in self._all_rows if self._passes_filters(item))
+
+    def total_count(self) -> int:
+        return len(self._all_rows)
+
+    def suggestion_at(self, row: int) -> dict[str, object]:
+        return self._visible_rows[row]
+
+    def mark_added(self, target: Target) -> None:
+        changed = False
+        for item in self._all_rows:
+            item_target = item.get("target")
+            if isinstance(item_target, Target) and _targets_match(item_target, target):
+                item["added_to_plan"] = True
+                changed = True
+        if changed:
+            self._rebuild_rows()
+
+    def replace_suggestions(self, suggestions: list[dict[str, object]]) -> None:
+        self.beginResetModel()
+        self._all_rows = suggestions
+        self._visible_rows = []
+        self._hover_row = None
+        self._hover_name_row = None
+        self._hover_action_row = None
+        self.endResetModel()
+        self._rebuild_rows()
+
+    def set_action_hover_row(self, row: Optional[int]) -> None:
+        new_row = row if row is not None and 0 <= row < len(self._visible_rows) else None
+        if new_row == self._hover_action_row:
+            return
+        old_row = self._hover_action_row
+        self._hover_action_row = new_row
+        for changed_row in (old_row, new_row):
+            if changed_row is None:
+                continue
+            idx = self.index(changed_row, self.COL_ACTION)
+            self.dataChanged.emit(idx, idx, [Qt.BackgroundRole, Qt.ForegroundRole])
+
+    def set_hover_row(self, row: Optional[int]) -> None:
+        new_row = row if row is not None and 0 <= row < len(self._visible_rows) else None
+        if new_row == self._hover_row:
+            return
+        old_row = self._hover_row
+        self._hover_row = new_row
+        for changed_row in (old_row, new_row):
+            if changed_row is None:
+                continue
+            left = self.index(changed_row, 0)
+            right = self.index(changed_row, self.columnCount() - 1)
+            self.dataChanged.emit(
+                left,
+                right,
+                [Qt.BackgroundRole, Qt.ForegroundRole, Qt.FontRole],
+            )
+
+    def set_name_hover_row(self, row: Optional[int]) -> None:
+        new_row = row if row is not None and 0 <= row < len(self._visible_rows) else None
+        if new_row == self._hover_name_row:
+            return
+        old_row = self._hover_name_row
+        self._hover_name_row = new_row
+        for changed_row in (old_row, new_row):
+            if changed_row is None:
+                continue
+            idx = self.index(changed_row, self.COL_NAME)
+            self.dataChanged.emit(idx, idx, [Qt.BackgroundRole, Qt.ForegroundRole, Qt.FontRole])
+
+
+class SuggestedTargetsDialog(QDialog):
+    def __init__(
+        self,
+        suggestions: list[dict[str, object]],
+        notes: list[str],
+        moon_sep_threshold: float,
+        initial_score_filter: float,
+        bhtom_base_url: str,
+        add_callback: Callable[[Target], bool],
+        reload_callback: Optional[Callable[[], tuple[list[dict[str, object]], list[str]]]] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.setWindowTitle("Suggested Targets")
+        self.resize(1280, 680)
+        self._add_callback = add_callback
+        self._reload_callback = reload_callback
+        self._bhtom_base_url = bhtom_base_url.rstrip("/")
+        self._notes = notes
+        self._settings = (
+            parent.settings
+            if parent is not None and hasattr(parent, "settings")
+            else QSettings("YourCompany", "AstroPlanner")
+        )
+        self._filter_defaults = {
+            "importance": float(BHTOM_SUGGESTION_MIN_IMPORTANCE),
+            "score": float(initial_score_filter),
+            "hours": 0.0,
+            "moon_sep": float(moon_sep_threshold),
+            "airmass": 99.0,
+            "magnitude": 99.0,
+        }
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.summary_label = QLabel(self)
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        filters_row = QHBoxLayout()
+        filters_row.setSpacing(8)
+        filters_row.addWidget(QLabel("Importance ≥", self))
+        self.importance_spin = QDoubleSpinBox(self)
+        self.importance_spin.setRange(0.0, 10.0)
+        self.importance_spin.setDecimals(1)
+        self.importance_spin.setSingleStep(0.5)
+        self.importance_spin.setValue(BHTOM_SUGGESTION_MIN_IMPORTANCE)
+        self.importance_spin.setToolTip("Minimum BHTOM importance.")
+        filters_row.addWidget(self.importance_spin)
+
+        filters_row.addWidget(QLabel("Score ≥", self))
+        self.score_spin = QDoubleSpinBox(self)
+        self.score_spin.setRange(0.0, 100.0)
+        self.score_spin.setDecimals(1)
+        self.score_spin.setSingleStep(1.0)
+        self.score_spin.setValue(float(initial_score_filter))
+        filters_row.addWidget(self.score_spin)
+
+        filters_row.addWidget(QLabel("Over Lim ≥", self))
+        self.hours_spin = QDoubleSpinBox(self)
+        self.hours_spin.setRange(0.0, 24.0)
+        self.hours_spin.setDecimals(1)
+        self.hours_spin.setSingleStep(0.5)
+        self.hours_spin.setValue(0.0)
+        self.hours_spin.setToolTip("Minimum hours above the altitude limit in the observing window.")
+        filters_row.addWidget(self.hours_spin)
+
+        filters_row.addWidget(QLabel("Moon Sep ≥", self))
+        self.moon_sep_spin = QDoubleSpinBox(self)
+        self.moon_sep_spin.setRange(0.0, 180.0)
+        self.moon_sep_spin.setDecimals(1)
+        self.moon_sep_spin.setSingleStep(1.0)
+        self.moon_sep_spin.setValue(float(moon_sep_threshold))
+        self.moon_sep_spin.setToolTip("Minimum Moon separation in the best observing window.")
+        filters_row.addWidget(self.moon_sep_spin)
+
+        filters_row.addWidget(QLabel("Min Airmass ≤", self))
+        self.airmass_spin = QDoubleSpinBox(self)
+        self.airmass_spin.setRange(1.0, 99.0)
+        self.airmass_spin.setDecimals(2)
+        self.airmass_spin.setSingleStep(0.1)
+        self.airmass_spin.setValue(99.0)
+        self.airmass_spin.setToolTip("Maximum minimum airmass in the best observing window. Leave at 99 to disable this filter.")
+        filters_row.addWidget(self.airmass_spin)
+
+        filters_row.addWidget(QLabel("Mag ≤", self))
+        self.magnitude_spin = QDoubleSpinBox(self)
+        self.magnitude_spin.setRange(-5.0, 99.0)
+        self.magnitude_spin.setDecimals(1)
+        self.magnitude_spin.setSingleStep(0.5)
+        self.magnitude_spin.setValue(99.0)
+        self.magnitude_spin.setToolTip("Maximum magnitude. Leave at 99 to disable this filter.")
+        filters_row.addWidget(self.magnitude_spin)
+
+        filters_row.addStretch(1)
+        self.reset_filters_btn = QPushButton("Reset", self)
+        self.reset_filters_btn.setToolTip("Restore the default suggested-target filters.")
+        filters_row.addWidget(self.reset_filters_btn)
+        self.reload_btn = QPushButton("Reload", self)
+        self.reload_btn.setToolTip("Fetch a fresh BHTOM target list and rebuild suggestions.")
+        self.reload_btn.setEnabled(self._reload_callback is not None)
+        filters_row.addWidget(self.reload_btn)
+        layout.addLayout(filters_row)
+
+        self._restore_filter_settings()
+
+        self.table_model = SuggestionTableModel(suggestions, moon_sep_threshold, self)
+        self.table_view = QTableView(self)
+        self.table_view.setModel(self.table_model)
+        self.table_view.setSelectionBehavior(QTableView.SelectRows)
+        self.table_view.setSelectionMode(QTableView.SingleSelection)
+        self.table_view.setSortingEnabled(True)
+        self.table_view.setEditTriggers(QTableView.NoEditTriggers)
+        self.table_view.setHorizontalScrollMode(QTableView.ScrollPerPixel)
+        self.table_view.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.table_view.setMouseTracking(True)
+        self.table_view.verticalHeader().setVisible(False)
+        self.table_view.setShowGrid(False)
+        self.table_view.viewport().installEventFilter(self)
+        header = self.table_view.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        self.table_view.setColumnWidth(
+            SuggestionTableModel.COL_NAME,
+            self._default_name_column_width(suggestions),
+        )
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_TYPE, 128)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_MAG, 64)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_PRIORITY, 42)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_IMPORTANCE, 88)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_SCORE, 76)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_AIRMASS, 96)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_HOURS, 92)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_WINDOW, 140)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_MOON_SEP, 90)
+        self.table_view.setColumnWidth(SuggestionTableModel.COL_ACTION, 74)
+        layout.addWidget(self.table_view, 1)
+
+        self.notes_label = QLabel(self)
+        self.notes_label.setWordWrap(True)
+        self.notes_label.setVisible(bool(notes))
+        layout.addWidget(self.notes_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self.importance_spin.valueChanged.connect(self._apply_filters)
+        self.score_spin.valueChanged.connect(self._apply_filters)
+        self.hours_spin.valueChanged.connect(self._apply_filters)
+        self.moon_sep_spin.valueChanged.connect(self._apply_filters)
+        self.airmass_spin.valueChanged.connect(self._apply_filters)
+        self.magnitude_spin.valueChanged.connect(self._apply_filters)
+        self.reset_filters_btn.clicked.connect(self._reset_filters_to_defaults)
+        self.reload_btn.clicked.connect(self._reload_suggestions)
+        self.table_model.modelReset.connect(self._refresh_dialog_state)
+        self.table_view.clicked.connect(self._on_table_clicked)
+        self.table_view.entered.connect(self._on_table_entered)
+
+        self.table_view.sortByColumn(SuggestionTableModel.COL_IMPORTANCE, Qt.DescendingOrder)
+        self._apply_filters()
+
+    def _default_name_column_width(self, suggestions: list[dict[str, object]]) -> int:
+        name_font = QFont(self.table_view.font())
+        name_font.setBold(True)
+        name_metrics = QFontMetrics(name_font)
+        header_metrics = QFontMetrics(self.table_view.horizontalHeader().font())
+        max_width = header_metrics.horizontalAdvance(SuggestionTableModel.headers[SuggestionTableModel.COL_NAME])
+        for item in suggestions:
+            target = item.get("target")
+            if isinstance(target, Target):
+                max_width = max(max_width, name_metrics.horizontalAdvance(target.name))
+        return max_width + 24
+
+    @Slot()
+    def _apply_filters(self) -> None:
+        self._save_filter_settings()
+        self.table_model.set_filters(
+            self.importance_spin.value(),
+            self.score_spin.value(),
+            self.hours_spin.value(),
+            self.moon_sep_spin.value(),
+            self.airmass_spin.value(),
+            self.magnitude_spin.value(),
+        )
+
+    def _restore_filter_settings(self) -> None:
+        self.importance_spin.setValue(
+            self._settings.value(
+                "suggestions/minImportance",
+                self._filter_defaults["importance"],
+                type=float,
+            )
+        )
+        self.score_spin.setValue(
+            self._settings.value(
+                "suggestions/minScore",
+                self._filter_defaults["score"],
+                type=float,
+            )
+        )
+        self.hours_spin.setValue(
+            self._settings.value(
+                "suggestions/minHours",
+                self._filter_defaults["hours"],
+                type=float,
+            )
+        )
+        self.moon_sep_spin.setValue(
+            self._settings.value(
+                "suggestions/minMoonSep",
+                self._filter_defaults["moon_sep"],
+                type=float,
+            )
+        )
+        self.airmass_spin.setValue(
+            self._settings.value(
+                "suggestions/maxAirmass",
+                self._filter_defaults["airmass"],
+                type=float,
+            )
+        )
+        self.magnitude_spin.setValue(
+            self._settings.value(
+                "suggestions/maxMagnitude",
+                self._filter_defaults["magnitude"],
+                type=float,
+            )
+        )
+
+    def _save_filter_settings(self) -> None:
+        self._settings.setValue("suggestions/minImportance", self.importance_spin.value())
+        self._settings.setValue("suggestions/minScore", self.score_spin.value())
+        self._settings.setValue("suggestions/minHours", self.hours_spin.value())
+        self._settings.setValue("suggestions/minMoonSep", self.moon_sep_spin.value())
+        self._settings.setValue("suggestions/maxAirmass", self.airmass_spin.value())
+        self._settings.setValue("suggestions/maxMagnitude", self.magnitude_spin.value())
+
+    @Slot()
+    def _reset_filters_to_defaults(self) -> None:
+        blockers = [
+            QSignalBlocker(self.importance_spin),
+            QSignalBlocker(self.score_spin),
+            QSignalBlocker(self.hours_spin),
+            QSignalBlocker(self.moon_sep_spin),
+            QSignalBlocker(self.airmass_spin),
+            QSignalBlocker(self.magnitude_spin),
+        ]
+        self.importance_spin.setValue(self._filter_defaults["importance"])
+        self.score_spin.setValue(self._filter_defaults["score"])
+        self.hours_spin.setValue(self._filter_defaults["hours"])
+        self.moon_sep_spin.setValue(self._filter_defaults["moon_sep"])
+        self.airmass_spin.setValue(self._filter_defaults["airmass"])
+        self.magnitude_spin.setValue(self._filter_defaults["magnitude"])
+        del blockers
+        self._apply_filters()
+
+    @Slot()
+    def _reload_suggestions(self) -> None:
+        if self._reload_callback is None:
+            return
+        self.reload_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            suggestions, notes = self._reload_callback()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Reload Suggestions", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.reload_btn.setEnabled(True)
+
+        self._notes = notes
+        self.table_model.replace_suggestions(suggestions)
+        self.table_view.setColumnWidth(
+            SuggestionTableModel.COL_NAME,
+            self._default_name_column_width(suggestions),
+        )
+        self._refresh_dialog_state()
+
+    @Slot()
+    def _refresh_dialog_state(self) -> None:
+        filtered = self.table_model.filtered_count()
+        total = self.table_model.total_count()
+        self.summary_label.setText(
+            f"Showing {filtered} matching BHTOM targets "
+            f"(loaded {total}, base importance ≥ {BHTOM_SUGGESTION_MIN_IMPORTANCE:.1f})."
+        )
+        if self._notes:
+            self.notes_label.setText("Notes: " + " | ".join(self._notes))
+            self.notes_label.setVisible(True)
+        else:
+            self.notes_label.clear()
+            self.notes_label.setVisible(False)
+
+    @Slot(QModelIndex)
+    def _on_table_clicked(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        if index.column() == SuggestionTableModel.COL_NAME:
+            self._open_bhtom_target(index.row())
+            return
+        if index.column() != SuggestionTableModel.COL_ACTION:
+            return
+        item = self.table_model.suggestion_at(index.row())
+        if bool(item.get("added_to_plan")):
+            return
+        self._add_row_to_plan(index.row())
+
+    @Slot(QModelIndex)
+    def _on_table_entered(self, index: QModelIndex) -> None:
+        hover_row: Optional[int] = index.row() if index.isValid() else None
+        name_hover_row: Optional[int] = None
+        action_hover_row: Optional[int] = None
+        if index.isValid():
+            if index.column() == SuggestionTableModel.COL_NAME:
+                name_hover_row = index.row()
+            elif index.column() == SuggestionTableModel.COL_ACTION:
+                item = self.table_model.suggestion_at(index.row())
+                if not bool(item.get("added_to_plan")):
+                    action_hover_row = index.row()
+        self.table_model.set_hover_row(hover_row)
+        self.table_model.set_name_hover_row(name_hover_row)
+        self.table_model.set_action_hover_row(action_hover_row)
+        self.table_view.viewport().setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if (action_hover_row is not None or name_hover_row is not None)
+            else Qt.CursorShape.ArrowCursor
+        )
+
+    def eventFilter(self, watched, event):  # noqa: D401
+        if watched is self.table_view.viewport() and event.type() == QEvent.Type.Leave:
+            self.table_model.set_hover_row(None)
+            self.table_model.set_name_hover_row(None)
+            self.table_model.set_action_hover_row(None)
+            self.table_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        return super().eventFilter(watched, event)
+
+    def _open_bhtom_target(self, row: int) -> None:
+        item = self.table_model.suggestion_at(row)
+        target = item.get("target")
+        if not isinstance(target, Target):
+            return
+        slug = quote(target.name.strip(), safe="")
+        if not slug:
+            return
+        QDesktopServices.openUrl(QUrl(f"{self._bhtom_base_url}/targets/{slug}/"))
+
+    def _add_row_to_plan(self, row: int) -> None:
+        item = self.table_model.suggestion_at(row)
+        target = item.get("target")
+        if not isinstance(target, Target):
+            return
+        if self._add_callback(target):
+            self.table_model.mark_added(target)
 
 # --------------------------------------------------
 # --- Astronomy Worker (runs in separate QThread) ---
@@ -1955,11 +2912,20 @@ class TargetTableModel(QAbstractTableModel):
             return QBrush(QColor("#000000"))
 
         if role == Qt.ToolTipRole and col == self.COL_NAME:
+            display_type = tgt.object_type
+            parent_widget = self.parent()
+            if _object_type_is_unknown(display_type) and parent_widget is not None and hasattr(parent_widget, "_bhtom_type_for_target"):
+                try:
+                    fallback_type = parent_widget._bhtom_type_for_target(tgt)
+                except Exception:
+                    fallback_type = ""
+                if fallback_type:
+                    display_type = fallback_type
             extras: list[str] = []
-            if tgt.object_type:
-                extras.append(f"Type: {tgt.object_type}")
+            if display_type and not _object_type_is_unknown(display_type):
+                extras.append(f"Type: {display_type}")
             if tgt.magnitude is not None:
-                extras.append(f"Mag: {tgt.magnitude:.1f}")
+                extras.append(f"{_target_magnitude_label(tgt)}: {tgt.magnitude:.1f}")
             if tgt.size_arcmin is not None:
                 extras.append(f"Size: {tgt.size_arcmin:.1f}'")
             extras.append(f"Priority: {tgt.priority}")
@@ -3236,6 +4202,7 @@ class MainWindow(QMainWindow):
         self.target_metrics: dict[str, TargetNightMetrics] = {}
         self.target_windows: dict[str, tuple[datetime, datetime]] = {}
         self._simbad_meta_cache: dict[str, tuple[Optional[float], str]] = {}
+        self._simbad_compact_cache: dict[str, dict[str, object]] = {}
         self._gaia_alerts_cache: dict[str, dict[str, str]] = {}
         self._gaia_alerts_cache_loaded_at = 0.0
         self._meta_worker: Optional[MetadataLookupWorker] = None
@@ -3276,6 +4243,9 @@ class MainWindow(QMainWindow):
         self._cutout_cache_order: list[str] = []
         self._finder_cache: dict[str, QPixmap] = {}
         self._finder_cache_order: list[str] = []
+        self._bhtom_candidate_cache_key: Optional[tuple[str, str]] = None
+        self._bhtom_candidate_cache: Optional[list[dict[str, object]]] = None
+        self._bhtom_candidate_cache_loaded_at = 0.0
         self._finder_workers: list[FinderChartWorker] = []
         self._finder_worker: Optional[FinderChartWorker] = None
         self._finder_request_id = 0
@@ -3663,6 +4633,9 @@ class MainWindow(QMainWindow):
         table_settings_btn.setMinimumHeight(28)
         table_settings_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogListView))
         table_settings_btn.clicked.connect(self.open_table_settings)
+        suggest_targets_btn = QPushButton("Suggest Targets")
+        suggest_targets_btn.setMinimumHeight(28)
+        suggest_targets_btn.clicked.connect(self._ai_suggest_targets)
         self.ai_toggle_btn = QPushButton("AI Assistant")
         self.ai_toggle_btn.setMinimumHeight(28)
         self.ai_toggle_btn.setCheckable(True)
@@ -3698,6 +4671,7 @@ class MainWindow(QMainWindow):
         actions_l.setContentsMargins(10, 6, 10, 6)
         actions_l.setSpacing(8)
         actions_l.addWidget(add_btn)
+        actions_l.addWidget(suggest_targets_btn)
         actions_l.addWidget(toggle_obs_btn)
         actions_l.addWidget(self.edit_object_btn)
         actions_l.addWidget(load_plan_btn)
@@ -3805,6 +4779,7 @@ class MainWindow(QMainWindow):
                 value_widget.setFont(self.info_value_font)
                 value_widget.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             form.insertRow(row_idx, title_label, value_widget)
+            return title_label
 
         _add_info_row(left_info_form, 0, "🕑 Local time:", self.localtime_label)
         _add_info_row(left_info_form, 1, "🌐 UTC time:", self.utctime_label)
@@ -3818,7 +4793,7 @@ class MainWindow(QMainWindow):
         _add_info_row(right_info_form, 0, "☀️ Sun altitude:", self.sun_alt_label)
         _add_info_row(right_info_form, 1, "🌙 Moon altitude:", self.moon_alt_label)
         _add_info_row(right_info_form, 2, "🎯 Selected target:", self.sel_name_label)
-        _add_info_row(right_info_form, 3, "Type / Mag:", self.sel_type_label)
+        self.sel_type_title_label = _add_info_row(right_info_form, 3, "Type / Mag:", self.sel_type_label)
         _add_info_row(right_info_form, 4, "Score:", self.sel_score_label)
         _add_info_row(right_info_form, 5, "Best window:", self.sel_window_label)
         _add_info_row(right_info_form, 6, "Notes:", details_row)
@@ -4143,6 +5118,7 @@ class MainWindow(QMainWindow):
 
         target_menu = menubar.addMenu("&Targets")
         target_menu.addAction(self.add_act)
+        target_menu.addAction(self.ai_suggest_act)
         target_menu.addAction(self.toggle_obs_act)
 
         view_menu = menubar.addMenu("&View")
@@ -4151,7 +5127,6 @@ class MainWindow(QMainWindow):
 
         ai_menu = menubar.addMenu("&AI")
         ai_menu.addAction(self.ai_describe_act)
-        ai_menu.addAction(self.ai_suggest_act)
         ai_menu.addSeparator()
         ai_menu.addAction(self.ai_toggle_panel_act)
 
@@ -4458,6 +5433,7 @@ class MainWindow(QMainWindow):
         rows = self._selected_rows()
         if not rows:
             self.sel_name_label.setText("-")
+            self.sel_type_title_label.setText("Type / Mag:")
             self.sel_type_label.setText("-")
             self.sel_score_label.setText("-")
             self.sel_window_label.setText("-")
@@ -4475,10 +5451,14 @@ class MainWindow(QMainWindow):
             self._update_cutout_preview_for_target(None)
             return
         tgt = self.targets[row]
+        self._ensure_known_target_type(tgt)
         self.sel_name_label.setText(tgt.name)
+        self.sel_type_title_label.setText(
+            "Type / Last Mag:" if _target_magnitude_label(tgt) == "Last Mag" else "Type / Mag:"
+        )
         mag_txt = f"{tgt.magnitude:.2f}" if tgt.magnitude is not None else "-"
         type_txt = tgt.object_type or "-"
-        self.sel_type_label.setText(f"{type_txt} / {mag_txt}")
+        self.sel_type_label.setText(f"{type_txt} / {_target_magnitude_label(tgt)} {mag_txt}")
 
         metrics = self.target_metrics.get(tgt.name)
         if metrics:
@@ -4725,6 +5705,7 @@ class MainWindow(QMainWindow):
         rows = self._selected_rows()
         if not rows:
             return
+        target = self.targets[rows[0]]
 
         menu = QMenu(self.table_view)
         menu.setAttribute(Qt.WA_TranslucentBackground, False)
@@ -4734,16 +5715,29 @@ class MainWindow(QMainWindow):
         menu_font.setPointSize(max(menu_font.pointSize(), 11))
         menu.setFont(menu_font)
         edit_obj_act = menu.addAction("Edit object...")
+        open_bhtom_act = None
+        if _normalize_catalog_token(target.source_catalog) == "bhtom":
+            open_bhtom_act = menu.addAction("Open in BHTOM")
         toggle_act = menu.addAction("Toggle observed")
         menu.addSeparator()
         delete_act = menu.addAction("Remove selected")
         chosen = menu.exec(self.table_view.viewport().mapToGlobal(pos))
         if chosen == edit_obj_act:
             self._edit_object_for_row(rows[0])
+        elif open_bhtom_act is not None and chosen == open_bhtom_act:
+            self._open_target_in_bhtom(target)
         elif chosen == toggle_act:
             self._toggle_observed_selected()
         elif chosen == delete_act:
             self._delete_selected_targets()
+
+    def _open_target_in_bhtom(self, target: Target) -> None:
+        if _normalize_catalog_token(target.source_catalog) != "bhtom":
+            return
+        slug = quote(target.name.strip(), safe="")
+        if not slug:
+            return
+        QDesktopServices.openUrl(QUrl(f"{self._bhtom_api_base_url()}/targets/{slug}/"))
 
     def _read_site_float(self, edit: QLineEdit) -> float:
         return float(edit.text().strip().replace(",", "."))
@@ -4895,7 +5889,21 @@ class MainWindow(QMainWindow):
         default_sort = self.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE, type=int)
         cols = self.table_model.columnCount()
         if 0 <= default_sort < cols:
-            self.table_view.sortByColumn(default_sort, Qt.AscendingOrder)
+            self.table_model.sort(default_sort, Qt.AscendingOrder)
+            self.table_view.horizontalHeader().setSortIndicator(default_sort, Qt.AscendingOrder)
+
+    def _reapply_current_table_sort(self) -> None:
+        if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
+            return
+        header = self.table_view.horizontalHeader()
+        section = header.sortIndicatorSection()
+        order = header.sortIndicatorOrder()
+        cols = self.table_model.columnCount()
+        if 0 <= section < cols:
+            self.table_model.sort(section, order)
+            header.setSortIndicator(section, order)
+            return
+        self._apply_default_sort()
 
     @Slot()
     def _load_plan(self):
@@ -4997,15 +6005,32 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Resolve error", str(exc))
             return
-        self.table_model.append_target(target)
+        self._append_target_to_plan(target)
+
+    def _plan_contains_target(self, target: Target) -> bool:
+        return any(_targets_match(existing, target) for existing in self.targets)
+
+    def _append_target_to_plan(self, target: Target) -> bool:
+        if self._plan_contains_target(target):
+            QMessageBox.information(self, "Already in plan", f"{target.name} is already present in the current plan.")
+            return False
+
+        target_copy = Target(**target.model_dump())
+        self._ensure_known_target_type(target_copy)
+        self.table_model.append_target(target_copy)
         self._recompute_recommended_order_cache()
-        # Reapply settings & default sort after layout change
         self._apply_table_settings()
         self._apply_default_sort()
         self._fetch_missing_magnitudes_async()
-        self._update_selected_details()
-        # Debounce and update plot after adding a target
         self._replot_timer.start()
+
+        for row_idx, existing in enumerate(self.targets):
+            if existing is target_copy or _targets_match(existing, target_copy):
+                self.table_view.selectRow(row_idx)
+                self.table_view.scrollTo(self.table_model.index(row_idx, TargetTableModel.COL_NAME))
+                break
+        self._update_selected_details()
+        return True
 
     @Slot()
     def _run_plan(self):
@@ -5283,6 +6308,7 @@ class MainWindow(QMainWindow):
         self.table_model.hours_above_limit = hour_vals
         self.table_model.row_enabled = row_enabled
         self._recompute_recommended_order_cache()
+        self._reapply_current_table_sort()
         self._apply_table_row_visibility()
         self._emit_table_data_changed()
 
@@ -5509,6 +6535,7 @@ class MainWindow(QMainWindow):
         self.table_model.current_azs = data["azs"]
         self.table_model.current_seps = data["seps"]
         self.table_model.row_enabled = self._recompute_row_enabled_from_current()
+        self._reapply_current_table_sort()
         self._apply_table_row_visibility()
         self._emit_table_data_changed()
         self._update_status_bar()
@@ -6026,7 +7053,13 @@ class MainWindow(QMainWindow):
             ra_deg, dec_deg = parse_ra_dec_query(query)
         except Exception:
             return None
-        return Target(name=query, ra=ra_deg, dec=dec_deg)
+        return Target(
+            name=query,
+            ra=ra_deg,
+            dec=dec_deg,
+            source_catalog="coordinates",
+            source_object_id=query,
+        )
 
     def _resolve_target_simbad(self, query: str) -> Target:
         try:
@@ -6060,6 +7093,8 @@ class MainWindow(QMainWindow):
                     name=name_res,
                     ra=ra_deg,
                     dec=dec_deg,
+                    source_catalog="simbad",
+                    source_object_id=name_res or query,
                     magnitude=magnitude,
                     object_type=object_type,
                 )
@@ -6068,7 +7103,10 @@ class MainWindow(QMainWindow):
 
         try:
             coord = SkyCoord.from_name(query)
-            return Target.from_skycoord(query, coord)
+            target = Target.from_skycoord(query, coord)
+            target.source_catalog = "simbad"
+            target.source_object_id = query
+            return target
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"No SIMBAD/Sesame match for '{query}'.") from exc
 
@@ -6100,6 +7138,8 @@ class MainWindow(QMainWindow):
                 name=name,
                 ra=float(ra_deg),
                 dec=float(dec_deg),
+                source_catalog="gaia_dr3",
+                source_object_id=designation or source_id or name,
                 magnitude=magnitude,
                 object_type="Gaia DR3 source",
             )
@@ -6258,6 +7298,8 @@ class MainWindow(QMainWindow):
             name=name,
             ra=float(ra_deg),
             dec=float(dec_deg),
+            source_catalog="gaia_alerts",
+            source_object_id=name,
             magnitude=magnitude,
             object_type=object_type,
         )
@@ -6511,6 +7553,8 @@ class MainWindow(QMainWindow):
             name=name,
             ra=float(ra_deg),
             dec=float(dec_deg),
+            source_catalog="tns",
+            source_object_id=name,
             magnitude=magnitude,
             object_type=object_type,
         )
@@ -6555,6 +7599,8 @@ class MainWindow(QMainWindow):
             name=name or query,
             ra=float(ra_deg),
             dec=float(dec_deg),
+            source_catalog="ned",
+            source_object_id=(name or query),
             object_type=object_type,
         )
 
@@ -6566,6 +7612,8 @@ class MainWindow(QMainWindow):
                 f"LSST name lookup for '{query}' is unavailable. Use coordinates or another source."
             ) from exc
         target = Target.from_skycoord(query, coord)
+        target.source_catalog = "lsst"
+        target.source_object_id = query
         target.object_type = "LSST candidate"
         return target
 
@@ -6620,10 +7668,6 @@ class MainWindow(QMainWindow):
         describe_btn = QPushButton("Describe Object")
         describe_btn.clicked.connect(self._ai_describe_target)
         btn_col.addWidget(describe_btn)
-
-        suggest_btn = QPushButton("Suggest Targets")
-        suggest_btn.clicked.connect(self._ai_suggest_targets)
-        btn_col.addWidget(suggest_btn)
 
         btn_col.addStretch(1)
         btn_widget = QWidget(panel)
@@ -6920,6 +7964,730 @@ class MainWindow(QMainWindow):
         "Use the provided session context and prioritize objects practical for the current site and night."
     )
 
+    def _format_target_coords_compact(self, target: Target) -> str:
+        ra_txt = Angle(target.ra, u.deg).to_string(unit=u.hourangle, sep=":", pad=True, precision=0)
+        dec_txt = Angle(target.dec, u.deg).to_string(unit=u.deg, sep=":", alwayssign=True, pad=True, precision=0)
+        return f"{ra_txt} {dec_txt}"
+
+    def _format_target_best_window_compact(self, target: Target) -> str:
+        window = self.target_windows.get(target.name)
+        if window is None:
+            return ""
+        tz_name = "UTC"
+        if isinstance(getattr(self, "last_payload", None), dict):
+            tz_name = str(self.last_payload.get("tz", "UTC"))
+        try:
+            tz = pytz.timezone(tz_name)
+        except Exception:
+            tz = pytz.UTC
+        try:
+            start = window[0].astimezone(tz).strftime("%H:%M")
+            end = window[1].astimezone(tz).strftime("%H:%M")
+        except Exception:
+            start = window[0].strftime("%H:%M")
+            end = window[1].strftime("%H:%M")
+        return f"{start}-{end}"
+
+    @staticmethod
+    def _format_compact_number(value: float, *, decimals_small: int = 3) -> str:
+        abs_value = abs(float(value))
+        if abs_value >= 100:
+            return f"{value:.0f}"
+        if abs_value >= 10:
+            return f"{value:.1f}"
+        if abs_value >= 1:
+            return f"{value:.2f}"
+        return f"{value:.{decimals_small}f}"
+
+    @staticmethod
+    def _format_signed_value(value: float, decimals: int = 2) -> str:
+        return f"{float(value):+.{decimals}f}"
+
+    def _is_star_like_target(self, target: Target, details: dict[str, object]) -> bool:
+        object_type = _normalize_catalog_token(target.object_type)
+        if "*" in object_type:
+            return True
+        sp_type = str(details.get("sp_type", "")).strip()
+        if sp_type:
+            return True
+        return any(marker in object_type for marker in ("star", "nova", "binary", "cv"))
+
+    def _format_distance_text(self, details: dict[str, object]) -> str:
+        distance_value = details.get("distance_value")
+        unit = str(details.get("distance_unit", "")).strip()
+        if not isinstance(distance_value, (int, float)) or not unit:
+            return ""
+        value = float(distance_value)
+        plus_err = details.get("distance_plus_err")
+        minus_err = details.get("distance_minus_err")
+        value_txt = self._format_compact_number(value, decimals_small=3)
+        if isinstance(plus_err, (int, float)) and isinstance(minus_err, (int, float)):
+            plus_abs = abs(float(plus_err))
+            minus_abs = abs(float(minus_err))
+            if math.isfinite(plus_abs) and math.isfinite(minus_abs):
+                if abs(plus_abs - minus_abs) <= max(0.1, 0.05 * max(plus_abs, minus_abs, 1.0)):
+                    err_txt = self._format_compact_number(max(plus_abs, minus_abs), decimals_small=3)
+                    return f"{value_txt} +/- {err_txt} {unit}"
+                plus_txt = self._format_compact_number(plus_abs, decimals_small=3)
+                minus_txt = self._format_compact_number(minus_abs, decimals_small=3)
+                return f"{value_txt} +{plus_txt}/-{minus_txt} {unit}"
+        return f"{value_txt} {unit}"
+
+    def _format_size_text(self, details: dict[str, object]) -> str:
+        major = details.get("size_major_arcmin")
+        minor = details.get("size_minor_arcmin")
+        if not isinstance(major, (int, float)):
+            return ""
+        major_txt = self._format_compact_number(float(major), decimals_small=2)
+        if isinstance(minor, (int, float)) and math.isfinite(float(minor)):
+            minor_val = float(minor)
+            if abs(float(major) - minor_val) > 0.05:
+                minor_txt = self._format_compact_number(minor_val, decimals_small=2)
+                return f"{major_txt} x {minor_txt} arcmin"
+        return f"{major_txt} arcmin"
+
+    def _format_kinematics_text(self, details: dict[str, object]) -> str:
+        parts: list[str] = []
+        radial_velocity = details.get("radial_velocity_kms")
+        if isinstance(radial_velocity, (int, float)):
+            rv_txt = self._format_compact_number(float(radial_velocity), decimals_small=2)
+            parts.append(f"rv {rv_txt} km/s")
+        redshift = details.get("redshift")
+        if isinstance(redshift, (int, float)) and math.isfinite(float(redshift)):
+            parts.append(f"z {float(redshift):+.5f}")
+        return ", ".join(parts)
+
+    def _get_simbad_compact_data(self, target: Target) -> dict[str, object]:
+        cache_keys = [
+            target.name.strip().lower(),
+            target.source_object_id.strip().lower(),
+        ]
+        primary_key = cache_keys[0]
+        if primary_key:
+            primary_cached = self._simbad_compact_cache.get(primary_key)
+            if primary_cached is not None:
+                return dict(primary_cached)
+        secondary_key = cache_keys[1]
+        if secondary_key and secondary_key != primary_key:
+            secondary_cached = self._simbad_compact_cache.get(secondary_key)
+            if secondary_cached is not None:
+                secondary_status = str(secondary_cached.get("_simbad_status", "")).strip().lower()
+                if secondary_status == "matched":
+                    return dict(secondary_cached)
+
+        query_candidates: list[str] = []
+        for candidate in (target.name, target.source_object_id):
+            query = candidate.strip()
+            if query and query.lower() not in {item.lower() for item in query_candidates}:
+                query_candidates.append(query)
+
+        try:
+            custom = Simbad()
+            custom.add_votable_fields(
+                "V",
+                "R",
+                "B",
+                "sp",
+                "parallax",
+                "mesdistance",
+                "mesfe_h",
+                "velocity",
+                "galdim_majaxis",
+                "galdim_minaxis",
+            )
+            result = None
+            row_idx = 0
+            match_mode = ""
+            for query in query_candidates:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=NoResultsWarning)
+                    result = custom.query_object(query)
+                if _simbad_has_row(result):
+                    match_mode = "name"
+                    break
+            if not _simbad_has_row(result):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=NoResultsWarning)
+                    result = custom.query_region(target.skycoord, radius=120 * u.arcsec)
+                row_idx = _simbad_best_row_index(result, reference_coord=target.skycoord)
+                if _simbad_has_row(result):
+                    match_mode = "coordinates"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SIMBAD compact lookup failed for '%s': %s", target.name, exc)
+            return {"_simbad_status": "lookup_failed"}
+
+        if not _simbad_has_row(result):
+            compact_data = {"_simbad_status": "not_found"}
+            for key in cache_keys:
+                if key:
+                    self._simbad_compact_cache[key] = dict(compact_data)
+            return compact_data
+
+        compact_data = _extract_simbad_compact_measurements(result, row_idx=row_idx)
+        compact_data["_simbad_status"] = "matched"
+        if match_mode:
+            compact_data["_simbad_match_mode"] = match_mode
+        if match_mode == "coordinates":
+            row_coord = _simbad_row_coord(result, row_idx=row_idx)
+            if row_coord is not None:
+                try:
+                    compact_data["_simbad_sep_arcsec"] = float(row_coord.separation(target.skycoord).arcsec)
+                except Exception:
+                    pass
+        main_id = _extract_simbad_name(result, target.name, row_idx=row_idx).strip().lower()
+        for key in (*cache_keys, main_id):
+            if key:
+                self._simbad_compact_cache[key] = dict(compact_data)
+        return compact_data
+
+    def _build_compact_target_description(self, target: Target) -> str:
+        self._ensure_known_target_type(target)
+        lines = [f"Source: {_target_source_label(target.source_catalog)}"]
+        bhtom_importance = self._bhtom_importance_for_target(target)
+
+        source_id = target.source_object_id.strip()
+        if source_id and _normalize_catalog_token(source_id) != _normalize_catalog_token(target.name):
+            lines.append(f"Catalog ID: {source_id}")
+        if target.object_type:
+            lines.append(f"Type: {target.object_type}")
+        if bhtom_importance is not None:
+            lines.append(f"BHTOM importance: {bhtom_importance:.1f}")
+        details = self._get_simbad_compact_data(target)
+        simbad_status = str(details.get("_simbad_status", "")).strip().lower()
+        simbad_match_mode = str(details.get("_simbad_match_mode", "")).strip().lower()
+        if simbad_status == "matched":
+            if simbad_match_mode == "coordinates":
+                simbad_sep_arcsec = _safe_float(details.get("_simbad_sep_arcsec"))
+                if simbad_sep_arcsec is not None and math.isfinite(simbad_sep_arcsec):
+                    lines.append(f"SIMBAD: coordinate match ({simbad_sep_arcsec:.1f}\")")
+                else:
+                    lines.append("SIMBAD: coordinate match")
+            else:
+                lines.append("SIMBAD: name match")
+        elif simbad_status == "not_found":
+            lines.append("SIMBAD: not found")
+        elif simbad_status == "lookup_failed":
+            lines.append("SIMBAD: unavailable")
+        photometry = details.get("photometry", {})
+        if photometry:
+            phot_txt = ", ".join(
+                f"{band} {float(photometry[band]):.2f}" for band in ("B", "V", "R")
+                if isinstance(photometry, dict) and band in photometry
+            )
+            if phot_txt:
+                lines.append(f"Photometry: {phot_txt}")
+        elif target.magnitude is not None:
+            lines.append(f"{_target_magnitude_label(target)}: {target.magnitude:.2f}")
+        lines.append(f"Coords: {self._format_target_coords_compact(target)}")
+
+        is_star_like = self._is_star_like_target(target, details)
+        if is_star_like:
+            stellar_parts: list[str] = []
+            sp_type = str(details.get("sp_type", "")).strip()
+            if sp_type:
+                stellar_parts.append(f"SpT {sp_type}")
+            parallax = details.get("parallax_mas")
+            if isinstance(parallax, (int, float)):
+                parallax_txt = f"{float(parallax):.3f} mas"
+                parallax_err = details.get("parallax_err_mas")
+                if isinstance(parallax_err, (int, float)) and math.isfinite(float(parallax_err)):
+                    parallax_txt = f"{float(parallax):.3f} +/- {float(parallax_err):.3f} mas"
+                stellar_parts.append(f"parallax {parallax_txt}")
+            if stellar_parts:
+                lines.append("Stellar: " + ", ".join(stellar_parts))
+
+            distance_txt = self._format_distance_text(details)
+            if distance_txt:
+                lines.append(f"Distance: {distance_txt}")
+        else:
+            size_txt = self._format_size_text(details)
+            if size_txt:
+                lines.append(f"Angular size: {size_txt}")
+            kinematics_txt = self._format_kinematics_text(details)
+            if kinematics_txt:
+                lines.append(f"Kinematics: {kinematics_txt}")
+
+        physical_parts: list[str] = []
+        teff_k = details.get("teff_k")
+        if is_star_like and isinstance(teff_k, (int, float)):
+            physical_parts.append(f"Teff {float(teff_k):.0f} K")
+        fe_h = details.get("fe_h")
+        if isinstance(fe_h, (int, float)):
+            physical_parts.append(f"[Fe/H] {self._format_signed_value(float(fe_h), decimals=2)}")
+        if physical_parts:
+            lines.append(("Atmosphere: " if is_star_like else "Physical: ") + ", ".join(physical_parts))
+
+        metrics = self.target_metrics.get(target.name)
+        best_window = self._format_target_best_window_compact(target)
+        tonight_parts: list[str] = []
+        if best_window:
+            tonight_parts.append(f"best {best_window}")
+        if metrics is not None:
+            tonight_parts.append(f"max alt {metrics.max_altitude_deg:.0f} deg")
+            tonight_parts.append(f"over limit {metrics.hours_above_limit:.1f} h")
+            tonight_parts.append(f"score {metrics.score:.1f}")
+        elif self.targets:
+            tonight_parts.append("run visibility calculation for tonight's window")
+        if tonight_parts:
+            lines.append("Tonight: " + ", ".join(tonight_parts))
+        return "\n".join(lines)
+
+    def _bhtom_api_base_url(self) -> str:
+        return (os.getenv("BHTOM_API_BASE_URL", "") or BHTOM_API_BASE_URL).strip().rstrip("/")
+
+    def _bhtom_api_token(self) -> str:
+        token = (
+            self.settings.value("general/bhtomApiToken", "", type=str)
+            or os.getenv("BHTOM_API_TOKEN", "")
+        ).strip()
+        if not token:
+            raise RuntimeError("Suggest Targets requires a BHTOM API token in Settings -> General Settings.")
+        return token
+
+    def _fetch_bhtom_target_page(self, page: int, token: Optional[str] = None) -> object:
+        auth_token = token or self._bhtom_api_token()
+        endpoint = f"{self._bhtom_api_base_url()}{BHTOM_TARGET_LIST_PATH}"
+        body = json.dumps(
+            {
+                "page": page,
+                "type": "SIDEREAL",
+                "importanceMin": BHTOM_SUGGESTION_MIN_IMPORTANCE,
+            }
+        ).encode("utf-8")
+        req = Request(
+            endpoint,
+            data=body,
+            headers={
+                "Authorization": f"Token {auth_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "AstroPlanner/1.0 (desktop app)",
+            },
+        )
+        try:
+            with urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                detail = ""
+            if exc.code in {401, 403}:
+                raise RuntimeError("BHTOM unauthorized (401/403). Check BHTOM_API_TOKEN.") from exc
+            if detail:
+                raise RuntimeError(f"BHTOM request failed ({exc.code}): {detail[:240]}") from exc
+            raise RuntimeError(f"BHTOM request failed ({exc.code}).") from exc
+        except Exception as exc:
+            raise RuntimeError(f"BHTOM lookup failed: {exc}") from exc
+
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError("BHTOM returned non-JSON response.") from exc
+
+    @staticmethod
+    def _extract_bhtom_items(payload: object) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if not isinstance(payload, dict):
+            return []
+
+        for key in ("results", "targets", "items", "data", "objects"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                for nested_key in ("results", "targets", "items", "data", "objects"):
+                    nested_value = value.get(nested_key)
+                    if isinstance(nested_value, list):
+                        return [item for item in nested_value if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _bhtom_payload_has_more(payload: object, page: int, item_count: int) -> bool:
+        if isinstance(payload, dict):
+            next_value = payload.get("next")
+            if next_value not in (None, "", False):
+                return True
+            for key in ("has_next", "hasNext"):
+                if payload.get(key) is True:
+                    return True
+            total_pages = None
+            for key in ("totalPages", "total_pages", "numPages", "num_pages", "pages", "page_count"):
+                total_pages = _safe_int(payload.get(key))
+                if total_pages is not None:
+                    break
+            if total_pages is not None:
+                return page < total_pages
+            total_count = None
+            for key in ("count", "total", "totalCount", "recordsTotal"):
+                total_count = _safe_int(payload.get(key))
+                if total_count is not None:
+                    break
+            if total_count is not None:
+                return page * BHTOM_PAGE_SIZE < total_count
+        return item_count >= BHTOM_PAGE_SIZE and page < BHTOM_MAX_SUGGESTION_PAGES
+
+    @staticmethod
+    def _pick_first_present(sources: list[dict[str, Any]], *keys: str) -> object:
+        for source in sources:
+            for key in keys:
+                if key in source and source[key] not in (None, ""):
+                    return source[key]
+        return None
+
+    def _build_bhtom_candidate(self, item: dict[str, Any]) -> Optional[dict[str, object]]:
+        nested_sources = [item]
+        for key in ("target", "target_data", "data", "object", "coordinates"):
+            nested = item.get(key)
+            if isinstance(nested, dict):
+                nested_sources.append(nested)
+
+        name_raw = self._pick_first_present(nested_sources, "name", "target_name", "display_name", "identifier")
+        name = _normalize_catalog_display_name(name_raw)
+        if not name:
+            return None
+
+        ra_deg = _safe_float(self._pick_first_present(nested_sources, "ra", "raDeg", "ra_deg", "rightAscension"))
+        dec_deg = _safe_float(self._pick_first_present(nested_sources, "dec", "decDeg", "dec_deg", "declination"))
+        if ra_deg is None or dec_deg is None:
+            return None
+
+        classification = str(
+            self._pick_first_present(
+                nested_sources,
+                "classification",
+                "object_type",
+                "objectType",
+                "targetClass",
+                "class",
+            )
+            or ""
+        ).strip()
+        magnitude = _safe_float(
+            self._pick_first_present(
+                nested_sources,
+                "mag_last",
+                "last_mag",
+                "lastMagnitude",
+                "magnitude",
+                "mag",
+            )
+        )
+        importance = _safe_float(self._pick_first_present(nested_sources, "importance", "importance_value")) or 0.0
+        bhtom_priority = _safe_int(self._pick_first_present(nested_sources, "priority", "observing_priority")) or 0
+        target_priority = max(1, min(5, int(bhtom_priority))) if bhtom_priority > 0 else 3
+        sun_separation = _safe_float(
+            self._pick_first_present(nested_sources, "sun_separation", "sunSeparation", "sun")
+        )
+        source_id_raw = self._pick_first_present(nested_sources, "id", "pk", "target_id", "targetId", "name")
+        source_id = str(source_id_raw).strip() if source_id_raw is not None else name
+
+        return {
+            "target": Target(
+                name=name,
+                ra=float(ra_deg),
+                dec=float(dec_deg),
+                source_catalog="bhtom",
+                source_object_id=source_id or name,
+                magnitude=magnitude,
+                object_type=classification,
+                priority=target_priority,
+            ),
+            "importance": float(importance),
+            "bhtom_priority": int(bhtom_priority),
+            "sun_separation": float(sun_separation) if sun_separation is not None else None,
+        }
+
+    def _fetch_bhtom_target_candidates(self) -> list[dict[str, object]]:
+        token = self._bhtom_api_token()
+        cache_key = (self._bhtom_api_base_url(), token)
+        cache_age = perf_counter() - self._bhtom_candidate_cache_loaded_at
+        if (
+            self._bhtom_candidate_cache_key == cache_key
+            and self._bhtom_candidate_cache is not None
+            and cache_age < BHTOM_SUGGESTION_CACHE_TTL_S
+        ):
+            return list(self._bhtom_candidate_cache)
+
+        candidates: list[dict[str, object]] = []
+        seen_keys: set[str] = set()
+
+        for page in range(1, BHTOM_MAX_SUGGESTION_PAGES + 1):
+            payload = self._fetch_bhtom_target_page(page, token=token)
+            items = self._extract_bhtom_items(payload)
+            if not items:
+                if page == 1:
+                    if isinstance(payload, dict):
+                        keys = ", ".join(sorted(str(key) for key in payload.keys()))
+                        raise RuntimeError(f"BHTOM returned an unexpected payload shape (keys: {keys or 'none'}).")
+                    raise RuntimeError("BHTOM returned an unexpected payload shape.")
+                break
+
+            for item in items:
+                candidate = self._build_bhtom_candidate(item)
+                if candidate is None:
+                    continue
+                target = candidate["target"]
+                assert isinstance(target, Target)
+                dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+                if not dedupe_key or dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                candidates.append(candidate)
+
+            if not self._bhtom_payload_has_more(payload, page, len(items)):
+                break
+
+        if not candidates:
+            raise RuntimeError("BHTOM returned no usable target candidates.")
+        self._bhtom_candidate_cache_key = cache_key
+        self._bhtom_candidate_cache = list(candidates)
+        self._bhtom_candidate_cache_loaded_at = perf_counter()
+        return list(candidates)
+
+    def _bhtom_type_for_target(self, target: Target) -> str:
+        candidates = self._bhtom_candidate_cache or []
+        if not candidates:
+            return ""
+        target_name = _normalize_catalog_token(target.name)
+        target_source_id = _normalize_catalog_token(target.source_object_id)
+        for candidate in candidates:
+            candidate_target = candidate.get("target")
+            if not isinstance(candidate_target, Target):
+                continue
+            candidate_name = _normalize_catalog_token(candidate_target.name)
+            candidate_source_id = _normalize_catalog_token(candidate_target.source_object_id)
+            if target_source_id and candidate_source_id == target_source_id:
+                candidate_type = candidate_target.object_type.strip()
+                if not _object_type_is_unknown(candidate_type):
+                    return candidate_type
+            if target_name and candidate_name == target_name:
+                candidate_type = candidate_target.object_type.strip()
+                if not _object_type_is_unknown(candidate_type):
+                    return candidate_type
+        return ""
+
+    def _bhtom_importance_for_target(self, target: Target) -> Optional[float]:
+        candidates = self._bhtom_candidate_cache or []
+        if not candidates:
+            return None
+        target_name = _normalize_catalog_token(target.name)
+        target_source_id = _normalize_catalog_token(target.source_object_id)
+        for candidate in candidates:
+            candidate_target = candidate.get("target")
+            if not isinstance(candidate_target, Target):
+                continue
+            candidate_name = _normalize_catalog_token(candidate_target.name)
+            candidate_source_id = _normalize_catalog_token(candidate_target.source_object_id)
+            if (target_source_id and candidate_source_id == target_source_id) or (target_name and candidate_name == target_name):
+                importance = _safe_float(candidate.get("importance"))
+                if importance is not None and math.isfinite(importance):
+                    return float(importance)
+        return None
+
+    def _ensure_known_target_type(self, target: Target) -> str:
+        if not _object_type_is_unknown(target.object_type):
+            return target.object_type
+        bhtom_type = self._bhtom_type_for_target(target)
+        if bhtom_type:
+            target.object_type = bhtom_type
+            return bhtom_type
+        return target.object_type
+
+    def _reload_local_target_suggestions(self) -> tuple[list[dict[str, object]], list[str]]:
+        self._bhtom_candidate_cache_key = None
+        self._bhtom_candidate_cache = None
+        self._bhtom_candidate_cache_loaded_at = 0.0
+        return self._build_local_target_suggestions()
+
+    def _build_local_target_suggestions(self) -> tuple[list[dict[str, object]], list[str]]:
+        payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
+        if not payload:
+            return [], ["Run a visibility calculation first so suggestions use tonight's sky."]
+
+        if not self.table_model.site:
+            return [], ["Set a valid observing site before requesting suggestions."]
+
+        try:
+            tz_name = str(payload.get("tz", self.table_model.site.timezone_name))
+            tz = pytz.timezone(tz_name)
+        except Exception:
+            tz_name = self.table_model.site.timezone_name
+            tz = pytz.UTC
+
+        try:
+            time_datetimes = [t.astimezone(tz) for t in mdates.num2date(payload["times"])]
+        except Exception:
+            return [], ["Visibility samples are unavailable in the current plot state."]
+        if not time_datetimes:
+            return [], ["Visibility samples are unavailable in the current plot state."]
+
+        site = Site(
+            name=self.table_model.site.name,
+            latitude=self._read_site_float(self.lat_edit),
+            longitude=self._read_site_float(self.lon_edit),
+            elevation=self._read_site_float(self.elev_edit),
+        )
+        observer = Observer(location=site.to_earthlocation(), timezone=tz_name)
+        time_samples = Time(time_datetimes)
+        moon_ra = np.array(payload.get("moon_ra", np.full(len(time_datetimes), np.nan)), dtype=float)
+        moon_dec = np.array(payload.get("moon_dec", np.full(len(time_datetimes), np.nan)), dtype=float)
+        if moon_ra.shape[0] != len(time_datetimes) or moon_dec.shape[0] != len(time_datetimes):
+            return [], ["Moon position samples are unavailable in the current plot state."]
+        moon_coords = SkyCoord(ra=moon_ra * u.deg, dec=moon_dec * u.deg)
+
+        sun_alt_series = np.array(payload.get("sun_alt", np.full(len(time_datetimes), np.nan)), dtype=float)
+        sun_alt_limit = self._sun_alt_limit()
+        obs_sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= sun_alt_limit)
+        limit = float(self.limit_spin.value())
+        min_moon_sep = float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0
+        sample_hours = 24.0 / max(len(time_datetimes) - 1, 1)
+
+        current_names = {_normalize_catalog_token(target.name) for target in self.targets}
+        current_source_ids = {_normalize_catalog_token(target.source_object_id) for target in self.targets if target.source_object_id}
+        current_coords = [target.skycoord for target in self.targets]
+
+        candidates = self._fetch_bhtom_target_candidates()
+        ranked: list[dict[str, object]] = []
+        skipped_notes: list[str] = []
+
+        for candidate_info in candidates:
+            target = candidate_info["target"]
+            assert isinstance(target, Target)
+            normalized_name = _normalize_catalog_token(target.name)
+            normalized_source = _normalize_catalog_token(target.source_object_id)
+            if normalized_name in current_names or (normalized_source and normalized_source in current_source_ids):
+                continue
+            if any(float(target.skycoord.separation(coord).deg) < 0.05 for coord in current_coords):
+                continue
+
+            fixed = FixedTarget(name=target.name, coord=target.skycoord)
+            altaz = observer.altaz(time_samples, fixed)
+            altitude = np.array(altaz.alt.deg, dtype=float)  # type: ignore[arg-type]
+            moon_sep = np.array(target.skycoord.separation(moon_coords).deg, dtype=float)
+            metrics = compute_target_metrics(
+                altitude_deg=altitude,
+                moon_sep_deg=moon_sep,
+                limit_altitude=limit,
+                sample_hours=sample_hours,
+                priority=max(1, min(5, int(candidate_info.get("bhtom_priority", 3) or 3))),
+                observed=False,
+                valid_mask=obs_sun_mask,
+            )
+
+            valid_mask = np.isfinite(altitude) & (altitude >= limit) & obs_sun_mask
+            if not valid_mask.any():
+                continue
+
+            valid_indices = np.where(valid_mask)[0]
+            runs = np.split(valid_indices, np.where(np.diff(valid_indices) != 1)[0] + 1)
+            best_run = max(runs, key=len)
+            start_idx = int(best_run[0])
+            end_idx = min(int(best_run[-1]) + 1, len(time_datetimes) - 1)
+            window_start = time_datetimes[start_idx]
+            window_end = time_datetimes[end_idx]
+            best_window_airmass = self._airmass_from_altitude(altitude[best_run])
+            finite_window_airmass = best_window_airmass[np.isfinite(best_window_airmass)]
+            best_airmass = float(np.min(finite_window_airmass)) if finite_window_airmass.size > 0 else None
+            finite_window_moon_sep = moon_sep[best_run][np.isfinite(moon_sep[best_run])]
+            min_window_moon_sep = (
+                float(np.min(finite_window_moon_sep))
+                if finite_window_moon_sep.size > 0
+                else None
+            )
+
+            ranked.append(
+                {
+                    "target": target,
+                    "metrics": metrics,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "best_airmass": best_airmass,
+                    "min_window_moon_sep": min_window_moon_sep,
+                    "moon_sep_warning": (
+                        min_moon_sep > 0.0
+                        and min_window_moon_sep is not None
+                        and round(float(min_window_moon_sep), 1) < min_moon_sep
+                    ),
+                    "added_to_plan": False,
+                    "importance": float(candidate_info.get("importance", 0.0) or 0.0),
+                    "bhtom_priority": int(candidate_info.get("bhtom_priority", 0) or 0),
+                    "sun_separation": candidate_info.get("sun_separation"),
+                }
+            )
+
+        if not ranked:
+            skipped_notes.append("No BHTOM targets matched the current filters and night window.")
+            return [], skipped_notes
+
+        ranked.sort(
+            key=lambda item: (
+                -float(item["importance"]),
+                -int(item["bhtom_priority"]),
+                -float(item["metrics"].score),  # type: ignore[index]
+                -float(item["metrics"].hours_above_limit),  # type: ignore[index]
+                item["window_start"],
+                str(item["target"].name).lower(),  # type: ignore[index]
+            )
+        )
+        return ranked, skipped_notes
+
+    def _format_local_target_suggestions(self, suggestions: list[dict[str, object]], notes: list[str]) -> str:
+        if not suggestions:
+            return "\n".join(notes) if notes else "No suggestions are available."
+
+        min_moon_sep = float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0
+        lines = ["Here are suitable additional targets from BHTOM for tonight:"]
+        for idx, item in enumerate(suggestions, start=1):
+            target = item["target"]
+            metrics = item["metrics"]
+            window_start = item["window_start"]
+            window_end = item["window_end"]
+            assert isinstance(target, Target)
+            assert isinstance(metrics, TargetNightMetrics)
+            assert isinstance(window_start, datetime)
+            assert isinstance(window_end, datetime)
+            start_txt = window_start.strftime("%H:%M")
+            end_txt = window_end.strftime("%H:%M")
+            target_type = target.object_type or "Object"
+            reason_parts = [
+                f"score {metrics.score:.1f}",
+                f"above limit {metrics.hours_above_limit:.1f} h",
+                f"max alt {metrics.max_altitude_deg:.0f} deg",
+            ]
+            importance = item.get("importance")
+            if isinstance(importance, (int, float)) and float(importance) > 0:
+                reason_parts.insert(0, f"BHTOM importance {float(importance):.1f}")
+            bhtom_priority = item.get("bhtom_priority")
+            if isinstance(bhtom_priority, int) and bhtom_priority > 0:
+                reason_parts.insert(1 if reason_parts else 0, f"priority {bhtom_priority}")
+            reason = ", ".join(reason_parts) + "."
+            warning_line = None
+            min_window_moon_sep = item.get("min_window_moon_sep")
+            moon_sep_warning = bool(item.get("moon_sep_warning"))
+            if moon_sep_warning and isinstance(min_window_moon_sep, (int, float)) and math.isfinite(float(min_window_moon_sep)):
+                warning_line = (
+                    f"Warning: Moon separation in the best window drops to {float(min_window_moon_sep):.1f} deg "
+                    f"(< {min_moon_sep:.0f} deg)."
+                )
+            lines.extend(
+                [
+                    f"{idx}. {target.name}",
+                    f"Type: {target_type}",
+                    f"{_target_magnitude_label(target)}: {target.magnitude:.2f}" if target.magnitude is not None else f"{_target_magnitude_label(target)}: -",
+                    f"Best window: {start_txt}-{end_txt}",
+                    f"Reason: {reason}",
+                    *( [warning_line] if warning_line else [] ),
+                    "",
+                ]
+            )
+
+        if notes:
+            lines.append("Notes: " + " | ".join(notes))
+        return "\n".join(lines).strip()
+
     @Slot()
     def _send_ai_query(self) -> None:
         text = self.ai_input.text().strip() if hasattr(self, "ai_input") else ""
@@ -6936,27 +8704,55 @@ class MainWindow(QMainWindow):
         if target is None:
             QMessageBox.information(self, "No selection", "Select one target first.")
             return
-        context = self._build_session_context()
-        prompt = (
-            f"Current session context:\n{context}\n\n"
-            f"Prepare an observing guide for '{target.name}' "
-            f"(RA {target.ra:.3f} deg, Dec {target.dec:.3f} deg). "
-            "Include object type, apparent brightness, practical observing tips, "
-            "suggested magnification range, useful filters, and one short scientific note."
-        )
-        self._dispatch_llm(prompt, tag="describe", label=f"Describe: {target.name}")
+        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
+            self.ai_toggle_btn.setChecked(True)
+        self._append_ai_message(f"Describe: {target.name}", is_user=True)
+        self._append_ai_message(self._build_compact_target_description(target), is_ai=True)
+        worker = self._llm_worker
+        if hasattr(self, "ai_status_label") and (worker is None or not worker.isRunning()):
+            self.ai_status_label.setText("Ready")
 
     @Slot()
     def _ai_suggest_targets(self) -> None:
-        context = self._build_session_context()
-        current_names = ", ".join(target.name for target in self.targets) if self.targets else "none"
-        prompt = (
-            f"Current session context:\n{context}\n\n"
-            f"Current target list: {current_names}\n"
-            "Suggest 5 to 8 additional objects suitable for tonight. "
-            "For each object provide: name, type, best observing window, and one-sentence reason."
+        if hasattr(self, "ai_status_label"):
+            self.ai_status_label.setText("Loading suggestions...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            suggestions, notes = self._build_local_target_suggestions()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Local target suggestion failed: %s", exc)
+            QMessageBox.warning(self, "Suggest Targets", str(exc))
+            if hasattr(self, "ai_status_label"):
+                self.ai_status_label.setText("Ready")
+            QApplication.restoreOverrideCursor()
+            return
+        QApplication.restoreOverrideCursor()
+
+        if not suggestions:
+            QMessageBox.information(
+                self,
+                "Suggest Targets",
+                "\n".join(notes) if notes else "No BHTOM targets matched the current night window.",
+            )
+            if hasattr(self, "ai_status_label"):
+                self.ai_status_label.setText("Ready")
+            return
+
+        dlg = SuggestedTargetsDialog(
+            suggestions=suggestions,
+            notes=notes,
+            moon_sep_threshold=float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0,
+            initial_score_filter=float(self.min_score_spin.value()) if hasattr(self, "min_score_spin") else 0.0,
+            bhtom_base_url=self._bhtom_api_base_url(),
+            add_callback=self._append_target_to_plan,
+            reload_callback=self._reload_local_target_suggestions,
+            parent=self,
         )
-        self._dispatch_llm(prompt, tag="suggest", label="Suggest targets")
+        dlg.exec()
+
+        worker = self._llm_worker
+        if hasattr(self, "ai_status_label") and (worker is None or not worker.isRunning()):
+            self.ai_status_label.setText("Ready")
 
     def _dispatch_llm(self, prompt: str, tag: str, label: str) -> None:
         worker = self._llm_worker
