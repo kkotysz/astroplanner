@@ -67,3 +67,21 @@ On macOS you can also run:
 ```bash
 ./run.command
 ```
+
+## AI Assistant (BitNet)
+
+The AI assistant is designed for a local BitNet server (OpenAI-compatible `/v1/chat/completions`).
+
+Quick start (from project root):
+
+```bash
+docker compose -f docker-compose.bitnet.yml up -d --build
+```
+
+Then in app `Settings -> General Settings` set:
+
+- `LLM server URL`: `http://localhost:8080`
+- `LLM model`: model id returned by `GET /v1/models`
+
+Full BitNet + Docker Compose guide:
+[README_AI_SETUP.md](README_AI_SETUP.md)
