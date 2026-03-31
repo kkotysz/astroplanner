@@ -33,6 +33,9 @@ _LIGHT_TEMPLATE = """
             stop: 1 %(root2)s
         );
     }
+    QDialog {
+        background: %(panel_bg)s;
+    }
     QFrame#SidebarPanel,
     QFrame#TopControlsBar,
     QFrame#ActionsBar,
@@ -63,6 +66,32 @@ _LIGHT_TEMPLATE = """
         subcontrol-origin: margin;
         left: 10px;
         padding: 0 4px;
+    }
+    QTabWidget::pane {
+        background: %(group_bg)s;
+        border: 1px solid %(group_border)s;
+        border-radius: 10px;
+        top: -1px;
+    }
+    QTabBar::tab {
+        background: %(top_bg)s;
+        color: %(section_hint)s;
+        border: 1px solid %(panel_border)s;
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 6px 14px;
+        min-width: 48px;
+    }
+    QTabBar::tab:selected {
+        background: %(group_bg)s;
+        color: %(base_text)s;
+        border: 1px solid %(group_border)s;
+        border-bottom: 1px solid %(group_bg)s;
+    }
+    QTabBar::tab:!selected:hover {
+        background: %(panel_bg)s;
+        color: %(base_text)s;
     }
     QLabel#SectionTitle {
         font-family: %(display_font_family)s;
@@ -418,6 +447,9 @@ _DARK_TEMPLATE = """
             stop: 1 %(root3)s
         );
     }
+    QDialog {
+        background: %(panel_bg)s;
+    }
     QWidget {
         color: %(text)s;
     }
@@ -440,6 +472,32 @@ _DARK_TEMPLATE = """
         color: %(group_text)s;
         border: 1px solid %(group_border)s;
         background: %(group_bg)s;
+    }
+    QTabWidget::pane {
+        background: %(group_bg)s;
+        border: 1px solid %(group_border)s;
+        border-radius: 10px;
+        top: -1px;
+    }
+    QTabBar::tab {
+        background: %(top_bg)s;
+        color: %(section_hint)s;
+        border: 1px solid %(panel_border)s;
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 6px 14px;
+        min-width: 48px;
+    }
+    QTabBar::tab:selected {
+        background: %(group_bg)s;
+        color: %(text)s;
+        border: 1px solid %(group_border)s;
+        border-bottom: 1px solid %(group_bg)s;
+    }
+    QTabBar::tab:!selected:hover {
+        background: %(panel_bg)s;
+        color: %(text)s;
     }
     QLabel#SectionTitle {
         color: %(section_title)s;

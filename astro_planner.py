@@ -904,12 +904,16 @@ class TableSettingsDialog(QDialog):
             setattr(self, f"{key}_btn", btn)
 
         # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply, self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        apply_btn = buttons.button(QDialogButtonBox.Apply)
+        if apply_btn is not None:
+            apply_btn.clicked.connect(self._apply_changes)
         layout.addWidget(buttons)
         self.setMinimumWidth(max(420, self.sizeHint().width()))
-    def accept(self):
+
+    def _apply_changes(self):
         s = self.parent().settings
         s.setValue("table/rowHeight", self.row_height_spin.value())
         s.setValue("table/firstColumnWidth", self.first_col_width_spin.value())
@@ -921,6 +925,9 @@ class TableSettingsDialog(QDialog):
         # Save default sort column
         s.setValue("table/defaultSortColumn", self.sort_combo.currentIndex())
         self.parent()._apply_table_settings()
+
+    def accept(self):
+        self._apply_changes()
         super().accept()
 
 # --- General Settings Dialog ---
@@ -930,6 +937,11 @@ class GeneralSettingsDialog(QDialog):
         super().__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("General Settings")
+        self._original_dark_mode = (
+            parent.settings.value("general/darkMode", False, type=bool)
+            if parent and hasattr(parent, "settings")
+            else False
+        )
         root_layout = QVBoxLayout(self)
         tabs = QTabWidget(self)
         tabs.setDocumentMode(True)
@@ -985,6 +997,17 @@ class GeneralSettingsDialog(QDialog):
         if theme_idx >= 0:
             self.theme_combo.setCurrentIndex(theme_idx)
         general_layout.addRow("Color theme:", self.theme_combo)
+
+        self.dark_mode_chk = QCheckBox("Enable dark mode", self)
+        self.dark_mode_chk.setChecked(
+            parent.settings.value("general/darkMode", False, type=bool)
+            if parent and hasattr(parent, "settings")
+            else False
+        )
+        self.dark_mode_chk.toggled.connect(self._preview_dark_mode)
+        if parent and hasattr(parent, "darkModeChanged"):
+            parent.darkModeChanged.connect(self._sync_dark_mode_checkbox)
+        general_layout.addRow(self.dark_mode_chk)
 
         # Cutout defaults
         self.cutout_view_combo = QComboBox(self)
@@ -1128,19 +1151,45 @@ class GeneralSettingsDialog(QDialog):
         plot_layout.addRow(self.color_blind_chk)
 
         # OK / Cancel
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply, self)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
+        apply_btn = btns.button(QDialogButtonBox.Apply)
+        if apply_btn is not None:
+            apply_btn.clicked.connect(self._apply_changes)
         root_layout.addWidget(btns)
         self.setMinimumSize(560, 460)
         self.resize(640, 520)
 
-    def accept(self):
+    @Slot(bool)
+    def _preview_dark_mode(self, checked: bool):
+        parent = self.parent()
+        if parent and hasattr(parent, "_set_dark_mode_enabled"):
+            parent._set_dark_mode_enabled(checked, persist=False)
+
+    @Slot(bool)
+    def _sync_dark_mode_checkbox(self, enabled: bool):
+        blocker = QSignalBlocker(self.dark_mode_chk)
+        self.dark_mode_chk.setChecked(enabled)
+        del blocker
+
+    def _apply_changes(self):
         s = self.parent().settings
+        rerun_plan = any(
+            (
+                s.value("general/defaultSite", self.site_combo.currentText(), type=str) != self.site_combo.currentText(),
+                s.value("general/timeSamples", self.ts_spin.value(), type=int) != self.ts_spin.value(),
+                s.value("general/showSunPath", self.sun_path_chk.isChecked(), type=bool) != self.sun_path_chk.isChecked(),
+                s.value("general/showMoonPath", self.moon_path_chk.isChecked(), type=bool) != self.moon_path_chk.isChecked(),
+                s.value("general/showObjPath", self.obj_path_chk.isChecked(), type=bool) != self.obj_path_chk.isChecked(),
+                s.value("general/colorBlindMode", self.color_blind_chk.isChecked(), type=bool) != self.color_blind_chk.isChecked(),
+            )
+        )
         s.setValue("general/defaultSite", self.site_combo.currentText())
         s.setValue("general/timeSamples", self.ts_spin.value())
         s.setValue("general/uiFontSize", self.ui_font_spin.value())
         s.setValue("general/uiTheme", self.theme_combo.currentData())
+        s.setValue("general/darkMode", self.dark_mode_chk.isChecked())
         s.setValue("general/showSunPath",  self.sun_path_chk.isChecked())
         s.setValue("general/showMoonPath", self.moon_path_chk.isChecked())
         s.setValue("general/showObjPath",  self.obj_path_chk.isChecked())
@@ -1159,9 +1208,19 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("general/tnsBotName", self.tns_bot_name_edit.text().strip())
         s.setValue("general/tnsEndpoint", _normalize_tns_endpoint_key(self.tns_endpoint_combo.currentData()))
         self.parent()._apply_general_settings()
-        # Immediately re-run the plan so samples take effect
-        self.parent()._run_plan()
+        if rerun_plan:
+            self.parent()._run_plan()
+        self._original_dark_mode = self.dark_mode_chk.isChecked()
+
+    def accept(self):
+        self._apply_changes()
         super().accept()
+
+    def reject(self):
+        parent = self.parent()
+        if parent and hasattr(parent, "_set_dark_mode_enabled"):
+            parent._set_dark_mode_enabled(self._original_dark_mode, persist=True)
+        super().reject()
 
     @Slot()
     def _test_tns_credentials(self):
@@ -3145,6 +3204,8 @@ class TargetTableModel(QAbstractTableModel):
 # --- Main Window ----------------------------------
 # --------------------------------------------------
 class MainWindow(QMainWindow):
+    darkModeChanged = Signal(bool)
+
     def _update_night_details_constraints(self):
         if not hasattr(self, "info_widget") or not hasattr(self, "info_card"):
             return
@@ -3176,6 +3237,18 @@ class MainWindow(QMainWindow):
             if family in available:
                 return family
         return "DejaVu Sans"
+
+    def _set_dark_mode_enabled(self, enabled: bool, persist: bool = True):
+        enabled = bool(enabled)
+        if enabled == getattr(self, "_dark_enabled", False):
+            if persist:
+                self.settings.setValue("general/darkMode", enabled)
+            return
+        self._dark_enabled = enabled
+        if persist:
+            self.settings.setValue("general/darkMode", self._dark_enabled)
+        self._apply_styles()
+        self.darkModeChanged.emit(self._dark_enabled)
 
     def _apply_styles(self):
         """Apply a custom stylesheet, fonts, and default icon sizes."""
@@ -5065,6 +5138,7 @@ class MainWindow(QMainWindow):
         self.exp_act.triggered.connect(self._export_plan)
 
         self.dark_act = QAction("Toggle dark mode", self, shortcut=QKeySequence("Ctrl+D"))
+        self.dark_act.setShortcutContext(Qt.ApplicationShortcut)
         self.dark_act.triggered.connect(self._toggle_dark)
         self.ai_describe_act = QAction("Describe selected object", self, shortcut=QKeySequence("Ctrl+I"))
         self.ai_describe_act.triggered.connect(self._ai_describe_target)
@@ -6836,9 +6910,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _toggle_dark(self):
         """Toggle dark mode while preserving the base stylesheet."""
-        self._dark_enabled = not self._dark_enabled
-        self.settings.setValue("general/darkMode", self._dark_enabled)
-        self._apply_styles()
+        self._set_dark_mode_enabled(not self._dark_enabled, persist=True)
 
     @Slot()
     def _export_plan(self):
