@@ -166,3 +166,6 @@ plan_summary.csv
 
 # Seestar ALP runtime logs (keep only directory placeholder)
 docker/seestar_alp/data/alpyca.log*
+
+# BHTOM observatory presets runtime cache
+config/bhtom_observatory_presets_cache.json
