@@ -163,3 +163,6 @@ astroplanner/.DS_Store
 plan_plot.png
 plan_schedule.ics
 plan_summary.csv
+
+# Seestar ALP runtime logs (keep only directory placeholder)
+docker/seestar_alp/data/alpyca.log*
