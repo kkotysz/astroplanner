@@ -15938,6 +15938,7 @@ class MainWindow(QMainWindow):
         self._ai_messages: list[dict[str, Any]] = []
         self._ai_message_widget_refs: list[dict[str, Any]] = []
         self._ai_stream_message_index: Optional[int] = None
+        self._ai_scroll_bottom_pending = False
         self._ai_stream_render_timer = QTimer(self)
         self._ai_stream_render_timer.setSingleShot(True)
         self._ai_stream_render_timer.timeout.connect(self._flush_ai_stream_render)
@@ -20432,6 +20433,7 @@ class MainWindow(QMainWindow):
         *,
         include_current_snapshot: bool = True,
     ) -> str:
+        self._ensure_known_target_type(target)
         details: list[str] = []
         order_values = getattr(self.table_model, "order_values", [])
         if row_index < len(order_values):
@@ -20443,6 +20445,9 @@ class MainWindow(QMainWindow):
             details.append("observed")
         if target.object_type and not _object_type_is_unknown(target.object_type):
             details.append(f"type {target.object_type}")
+        class_family = self._target_class_family(target)
+        if class_family:
+            details.append(f"family {class_family}")
 
         metrics = self.target_metrics.get(target.name)
         if metrics is not None:
@@ -20726,6 +20731,194 @@ class MainWindow(QMainWindow):
         if omitted > 0:
             summary = f"{summary} (+{omitted} more)"
         return summary + ":\n" + "\n".join(rows)
+
+    @staticmethod
+    def _type_label_class_family(type_label: str) -> str:
+        normalized = _normalize_catalog_display_name(type_label).lower()
+        if not normalized:
+            return ""
+
+        def _contains_token(token: str) -> bool:
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", normalized))
+
+        if any(token in normalized for token in ("quasar", "seyfert", "blazar")) or _contains_token("qso") or _contains_token("agn"):
+            return "AGN"
+        if any(token in normalized for token in ("supernova", "super nowa", "supernowa")) or _contains_token("sn"):
+            return "Supernova"
+        if _contains_token("nova"):
+            return "Nova"
+        if _contains_token("xrb") or "x ray binary" in normalized:
+            return "X-ray binary"
+        if _contains_token("cv") or "cataclysmic" in normalized:
+            return "Cataclysmic variable"
+        if "galaxy" in normalized or "galakty" in normalized:
+            return "Galaxy"
+        if "*" in normalized or "star" in normalized:
+            return "Star"
+        return ""
+
+    def _target_class_family(self, target: Target) -> str:
+        self._ensure_known_target_type(target)
+        return self._type_label_class_family(target.object_type)
+
+    def _find_referenced_target_in_question(self, text: str) -> Optional[Target]:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return None
+
+        candidates: list[tuple[int, Target]] = [(0, target) for target in self.targets]
+        suggestions = list(getattr(self, "_bhtom_ranked_suggestions_cache", []) or [])
+        for item in suggestions:
+            target = item.get("target")
+            if isinstance(target, Target):
+                candidates.append((1, target))
+
+        matched: list[tuple[int, int, int, Target]] = []
+        seen: set[str] = set()
+        for source_rank, target in candidates:
+            dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            positions: list[tuple[int, int]] = []
+            for candidate_name in {target.name.strip(), str(target.source_object_id or "").strip()}:
+                if not candidate_name:
+                    continue
+                pos = self._find_normalized_text_position(raw_text, candidate_name)
+                if pos is None:
+                    continue
+                match_len = len(re.sub(r"[^a-z0-9]+", "", _normalize_catalog_display_name(candidate_name).lower()))
+                positions.append((pos, match_len))
+            if not positions:
+                continue
+            seen.add(dedupe_key)
+            best_pos, best_len = min(positions, key=lambda item: (item[0], -item[1]))
+            matched.append((best_pos, -best_len, source_rank, target))
+
+        if not matched:
+            return None
+        matched.sort(key=lambda item: (item[0], item[1], item[2], item[3].name.lower()))
+        return matched[0][3]
+
+    @staticmethod
+    def _requested_object_class_marker(question: str) -> str:
+        normalized = _normalize_catalog_display_name(question).lower()
+        if not normalized:
+            return ""
+
+        def _contains_token(token: str) -> bool:
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", normalized))
+
+        if _contains_token("agn") or "active galactic nucleus" in normalized:
+            return "agn"
+        if _contains_token("qso") or "quasar" in normalized:
+            return "qso"
+        if "seyfert" in normalized:
+            return "seyfert"
+        if "blazar" in normalized:
+            return "blazar"
+        if any(token in normalized for token in ("supernova", "super nowa", "supernowa")) or _contains_token("sn"):
+            return "supernova"
+        if _contains_token("nova"):
+            return "nova"
+        if _contains_token("xrb") or "x ray binary" in normalized:
+            return "xrb"
+        if _contains_token("cv") or "cataclysmic" in normalized:
+            return "cv"
+        if "galaxy" in normalized:
+            return "galaxy"
+        if _contains_token("star") or "gwiazd" in normalized:
+            return "star"
+        return ""
+
+    @classmethod
+    def _type_matches_requested_class(cls, type_label: str, requested_marker: str) -> bool:
+        normalized = _normalize_catalog_display_name(type_label).lower()
+        family = cls._type_label_class_family(type_label)
+        if not requested_marker:
+            return False
+        if requested_marker == "agn":
+            return family == "AGN"
+        if requested_marker == "supernova":
+            return family == "Supernova"
+        if requested_marker == "nova":
+            return family == "Nova"
+        if requested_marker == "xrb":
+            return family == "X-ray binary"
+        if requested_marker == "cv":
+            return family == "Cataclysmic variable"
+        if requested_marker == "galaxy":
+            return family == "Galaxy"
+        if requested_marker == "star":
+            return family == "Star"
+        if requested_marker == "qso":
+            return "qso" in normalized or "quasar" in normalized
+        if requested_marker == "seyfert":
+            return "seyfert" in normalized
+        if requested_marker == "blazar":
+            return "blazar" in normalized
+        return False
+
+    def _build_local_object_fact_answer(self, question: str) -> Optional[str]:
+        target = self._find_referenced_target_in_question(question)
+        if target is None:
+            return None
+
+        type_label = self._ensure_known_target_type(target).strip()
+        family = self._target_class_family(target)
+        if not type_label and not family:
+            return None
+
+        normalized = _normalize_catalog_display_name(question).lower()
+        requested_marker = self._requested_object_class_marker(question)
+        class_label_map = {
+            "agn": "AGN",
+            "qso": "QSO",
+            "seyfert": "Seyfert",
+            "blazar": "blazar",
+            "supernova": "supernova",
+            "nova": "nova",
+            "xrb": "X-ray binary",
+            "cv": "cataclysmic variable",
+            "galaxy": "galaxy",
+            "star": "star",
+        }
+        if requested_marker:
+            matches = self._type_matches_requested_class(type_label, requested_marker)
+            class_label = class_label_map.get(requested_marker, requested_marker)
+            if matches:
+                detail = type_label or family or class_label
+                answer = f"Yes. {target.name} is classified as {detail}."
+                if family and family != detail:
+                    answer += f" Broad class: {family}."
+                return answer
+            detail = type_label or family or "unknown"
+            answer = f"No. Current metadata classifies {target.name} as {detail}."
+            if family and family != detail:
+                answer += f" Broad class: {family}."
+            return answer
+
+        type_markers = (
+            "what type",
+            "type of object",
+            "what is",
+            "what kind",
+            "jaki typ",
+            "jaki to typ",
+            "jaki to obiekt",
+            "co to za obiekt",
+            "czym jest",
+            "co to jest",
+        )
+        if any(marker in normalized for marker in type_markers):
+            detail = type_label or family
+            if not detail:
+                return None
+            answer = f"{target.name} is classified as {detail}."
+            if family and family != detail:
+                answer += f" Broad class: {family}."
+            return answer
+
+        return None
 
     @staticmethod
     def _find_normalized_text_position(text: str, candidate: str) -> Optional[int]:
@@ -21046,6 +21239,9 @@ class MainWindow(QMainWindow):
             lines.append(f"Catalog ID: {source_id}")
         if target.object_type and not _object_type_is_unknown(target.object_type):
             lines.append(f"Type: {target.object_type}")
+        class_family = self._target_class_family(target)
+        if class_family:
+            lines.append(f"Class family: {class_family}")
 
         bhtom_importance = self._bhtom_importance_for_target(target)
         if bhtom_importance is not None:
@@ -21246,6 +21442,9 @@ class MainWindow(QMainWindow):
             lines.append(f"Catalog ID: {source_id}")
         if target.object_type:
             lines.append(f"Type: {target.object_type}")
+        class_family = self._target_class_family(target)
+        if class_family:
+            lines.append(f"Class family: {class_family}")
         if bhtom_importance is not None:
             lines.append(f"BHTOM importance: {bhtom_importance:.1f}")
         details = self._get_simbad_compact_data(target)
@@ -22161,6 +22360,16 @@ class MainWindow(QMainWindow):
         text = self.ai_input.text().strip() if hasattr(self, "ai_input") else ""
         if not text:
             return
+        worker = self._llm_worker
+        local_fact_answer = self._build_local_object_fact_answer(text)
+        if local_fact_answer is not None and not (worker is not None and worker.isRunning()):
+            self.ai_input.clear()
+            if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
+                self.ai_toggle_btn.setChecked(True)
+            self._append_ai_message(text, is_user=True)
+            self._append_ai_message(local_fact_answer, is_ai=True)
+            self._set_ai_status("Ready", tone="info")
+            return
         selected_target = self._selected_target_or_none()
         if self._looks_like_object_scoped_query(text) and selected_target is None:
             QMessageBox.information(
@@ -22189,7 +22398,8 @@ class MainWindow(QMainWindow):
             f"Selected object context:\n"
             f"{compact_description}\n\n"
             f"User question about the selected object: {question}\n\n"
-            "Answer in no more than 4 short sentences and stay grounded in the selected object context."
+            "Answer in no more than 4 short sentences and stay grounded in the selected object context. "
+            "Treat the provided Type and Class family fields as authoritative for classification questions."
         )
 
     def _build_fast_general_llm_prompt(self, question: str) -> str:
@@ -22584,12 +22794,34 @@ class MainWindow(QMainWindow):
         flush_list()
         return "".join(blocks)
 
-    def _scroll_ai_output_to_bottom(self) -> None:
+    def _perform_ai_scroll_to_bottom(self) -> None:
         if not hasattr(self, "ai_output"):
             return
+        if hasattr(self, "ai_output_content"):
+            self.ai_output_content.adjustSize()
+            layout = self.ai_output_content.layout()
+            if layout is not None:
+                layout.activate()
         scroll = self.ai_output.verticalScrollBar()
         if scroll is not None:
             scroll.setValue(scroll.maximum())
+
+    def _scroll_ai_output_to_bottom(self, *, deferred: bool = True) -> None:
+        if not hasattr(self, "ai_output"):
+            return
+        self._perform_ai_scroll_to_bottom()
+        if not deferred:
+            return
+        if self._ai_scroll_bottom_pending:
+            return
+        self._ai_scroll_bottom_pending = True
+
+        def _deferred_scroll() -> None:
+            self._ai_scroll_bottom_pending = False
+            self._perform_ai_scroll_to_bottom()
+            QTimer.singleShot(0, self._perform_ai_scroll_to_bottom)
+
+        QTimer.singleShot(0, _deferred_scroll)
 
     def _apply_ai_message_body_widget(
         self,
@@ -22961,7 +23193,7 @@ class MainWindow(QMainWindow):
         finally:
             self.ai_output.setUpdatesEnabled(True)
 
-        self._scroll_ai_output_to_bottom()
+        self._scroll_ai_output_to_bottom(deferred=True)
         self._refresh_ai_panel_action_buttons()
 
     def _flush_ai_stream_render(self) -> None:
@@ -22971,7 +23203,7 @@ class MainWindow(QMainWindow):
         if not self._update_ai_message_widget(idx, streaming=True):
             self._render_ai_messages()
             return
-        self._scroll_ai_output_to_bottom()
+        self._scroll_ai_output_to_bottom(deferred=False)
         self._refresh_ai_panel_action_buttons()
 
     def _start_ai_response_message(self) -> None:
