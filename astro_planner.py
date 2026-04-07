@@ -15935,7 +15935,7 @@ class MainWindow(QMainWindow):
         self._llm_last_warmup_key: tuple[str, str] = ("", "")
         self._ai_runtime_status = ""
         self._ai_runtime_status_tone = "info"
-        self._ai_messages: list[dict[str, str]] = []
+        self._ai_messages: list[dict[str, Any]] = []
         self._ai_message_widget_refs: list[dict[str, Any]] = []
         self._ai_stream_message_index: Optional[int] = None
         self._ai_stream_render_timer = QTimer(self)
@@ -22402,6 +22402,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "ai_export_chat_btn"):
             self.ai_export_chat_btn.setEnabled(has_messages)
 
+    def _visible_action_targets_for_message(self, message: dict[str, Any]) -> list[Target]:
+        targets = message.get("action_targets")
+        if not isinstance(targets, list):
+            return []
+        visible: list[Target] = []
+        for target in targets:
+            if not isinstance(target, Target):
+                continue
+            if self._plan_contains_target(target):
+                continue
+            visible.append(target)
+        return visible
+
     def _add_ai_suggested_target(self, target: Target) -> None:
         added = self._append_target_to_plan(target, refresh=True, notify_duplicate=False)
         if added:
@@ -22912,7 +22925,7 @@ class MainWindow(QMainWindow):
                         streaming=False,
                     )
                 else:
-                    action_targets = [] if is_streaming_message else self._extract_addable_bhtom_targets_from_ai_text(raw_text)
+                    action_targets = [] if is_streaming_message else self._visible_action_targets_for_message(message)
                     widget, refs = self._build_ai_message_widget(
                         kind="ai",
                         body_html=body_html,
@@ -22982,13 +22995,15 @@ class MainWindow(QMainWindow):
         if idx is not None and 0 <= idx < len(self._ai_messages):
             self._ai_messages[idx]["kind"] = "ai"
             self._ai_messages[idx]["text"] = text
-            if not self._update_ai_message_widget(idx, streaming=False):
-                self._render_ai_messages()
-            else:
-                self._scroll_ai_output_to_bottom()
-                self._refresh_ai_panel_action_buttons()
+            self._ai_messages[idx]["action_targets"] = self._extract_addable_bhtom_targets_from_ai_text(text)
+            self._ai_stream_message_index = None
+            self._render_ai_messages()
         else:
-            self._append_ai_message(text, is_ai=True)
+            self._append_ai_message(
+                text,
+                is_ai=True,
+                action_targets=self._extract_addable_bhtom_targets_from_ai_text(text),
+            )
         self._ai_stream_message_index = None
 
     def _fail_ai_response(self, message: str) -> None:
@@ -23013,9 +23028,13 @@ class MainWindow(QMainWindow):
         is_user: bool = False,
         is_ai: bool = False,
         is_error: bool = False,
+        action_targets: Optional[list[Target]] = None,
     ) -> int:
         kind = "user" if is_user else "error" if is_error else "ai" if is_ai else "info"
-        self._ai_messages.append({"kind": kind, "text": str(text)})
+        payload: dict[str, Any] = {"kind": kind, "text": str(text)}
+        if action_targets:
+            payload["action_targets"] = list(action_targets)
+        self._ai_messages.append(payload)
         self._render_ai_messages()
         return len(self._ai_messages) - 1
 
