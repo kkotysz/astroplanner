@@ -44,19 +44,23 @@ from __future__ import annotations
 
 # Standard library imports
 import argparse
+import base64
+import copy
 import csv
+import hashlib
 import html as html_module
 import io
 import json
 import math
 import os
+import re
 import sys
 import threading
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 from time import perf_counter
@@ -82,6 +86,8 @@ from timezonefinder import TimezoneFinder
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as mpl_font_manager
+from matplotlib import patheffects as mpl_patheffects
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 import warnings
 import logging
@@ -89,16 +95,96 @@ import shiboken6 as shb   # PySide6 helper (isValid,objId)
 from astroplanner.exporters import export_metrics_csv, export_observation_ics
 from astroplanner.parsing import parse_dec_to_deg, parse_ra_dec_query, parse_ra_to_deg
 from astroplanner.scoring import TargetNightMetrics, compute_target_metrics
+from astroplanner.seestar import (
+    SEESTAR_ALP_LP_FILTER_AUTO,
+    SEESTAR_ALP_LP_FILTER_OFF,
+    SEESTAR_ALP_LP_FILTER_ON,
+    SEESTAR_ALP_DEFAULT_BASE_URL,
+    SEESTAR_ALP_DEFAULT_CLIENT_ID,
+    SEESTAR_ALP_DEFAULT_DEVICE_NUM,
+    SEESTAR_ALP_DEFAULT_GAIN,
+    SEESTAR_ALP_DEFAULT_HONOR_QUEUE_TIMES,
+    SEESTAR_ALP_DEFAULT_WAIT_UNTIL_LOCAL_TIME,
+    SEESTAR_ALP_DEFAULT_STARTUP_SEQUENCE,
+    SEESTAR_ALP_DEFAULT_STARTUP_POLAR_ALIGN,
+    SEESTAR_ALP_DEFAULT_STARTUP_AUTO_FOCUS,
+    SEESTAR_ALP_DEFAULT_STARTUP_DARK_FRAMES,
+    SEESTAR_ALP_DEFAULT_CAPTURE_FLATS,
+    SEESTAR_ALP_DEFAULT_FLATS_WAIT_S,
+    SEESTAR_ALP_AF_MODE_OFF,
+    SEESTAR_ALP_AF_MODE_PER_RUN,
+    SEESTAR_ALP_AF_MODE_PER_TARGET,
+    SEESTAR_ALP_DEFAULT_SCHEDULE_AUTOFOCUS_MODE,
+    SEESTAR_ALP_DEFAULT_SCHEDULE_AUTOFOCUS,
+    SEESTAR_ALP_DEFAULT_AUTOFOCUS_TRY_COUNT,
+    SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE,
+    SEESTAR_ALP_DEFAULT_PARK_AFTER_SESSION,
+    SEESTAR_ALP_DEFAULT_SHUTDOWN_AFTER_SESSION,
+    SEESTAR_ALP_DEFAULT_NUM_TRIES,
+    SEESTAR_ALP_DEFAULT_PANEL_OVERLAP_PERCENT,
+    SEESTAR_ALP_DEFAULT_RETRY_WAIT_S,
+    SEESTAR_ALP_DEFAULT_STACK_EXPOSURE_MS,
+    SEESTAR_ALP_DEFAULT_TIMEOUT_S,
+    SEESTAR_ALP_DEFAULT_USE_AUTOFOCUS,
+    SEESTAR_CAMPAIGN_PRESET_BL_LAC,
+    SEESTAR_DEFAULT_BLOCK_MINUTES,
+    SEESTAR_DEVICE_PROFILE_ALP,
+    SEESTAR_DEVICE_PROFILE,
+    SEESTAR_METHOD_ALP,
+    SEESTAR_METHOD_GUIDED,
+    SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET,
+    SEESTAR_TEMPLATE_SCOPE_SINGLE_TARGET,
+    NightQueueSiteSnapshot,
+    SeestarAlpAdapter,
+    SeestarSessionTemplate,
+    SeestarTargetSessionItem,
+    build_alp_web_ui_url,
+    build_session_queue,
+    builtin_seestar_session_templates,
+    default_science_checklist_items,
+    dump_user_seestar_session_templates,
+    load_user_seestar_session_templates,
+    normalize_seestar_alp_schedule_autofocus_mode,
+    render_alp_backend_status_text,
+    seestar_alp_schedule_autofocus_mode_label,
+    SeestarAlpClient,
+    SeestarAlpConfig,
+    SeestarGuidedAdapter,
+)
 from astroplanner.theme import (
+    DEFAULT_DARK_MODE,
     DEFAULT_UI_THEME,
     THEME_CHOICES,
-    COLORBLIND_HIGHLIGHT,
     COLORBLIND_LINE_COLORS,
-    DEFAULT_HIGHLIGHT,
     DEFAULT_LINE_COLORS,
     build_stylesheet,
+    highlight_palette_for_theme,
+    line_palette_for_theme,
     normalize_theme_key,
+    resolve_theme_tokens,
 )
+
+try:
+    from PIL import Image, ImageDraw
+except Exception:  # pragma: no cover - optional runtime dependency
+    Image = None  # type: ignore[assignment]
+    ImageDraw = None  # type: ignore[assignment]
+
+try:
+    import plotly
+    from plotly.io import to_html as plotly_to_html
+    from plotly.subplots import make_subplots as plotly_make_subplots
+    import plotly.graph_objects as go
+
+    _plotly_base_dir = Path(plotly.__file__).resolve().parent / "package_data"
+    _PLOTLY_JS_BASE_DIR = str(_plotly_base_dir) if (_plotly_base_dir / "plotly.min.js").exists() else ""
+    _HAS_PLOTLY = True
+except Exception:  # pragma: no cover - optional runtime dependency
+    plotly_to_html = None  # type: ignore[assignment]
+    plotly_make_subplots = None  # type: ignore[assignment]
+    go = None  # type: ignore[assignment]
+    _PLOTLY_JS_BASE_DIR = ""
+    _HAS_PLOTLY = False
 
 # ── Logging configuration ─────────────────────────────────────────────
 logging.basicConfig(
@@ -151,15 +237,38 @@ CUTOUT_MAX_FOV_ARCMIN = 120
 CUTOUT_MIN_SIZE_PX = 128
 CUTOUT_MAX_SIZE_PX = 800
 CUTOUT_CACHE_MAX = 24
+# Fetch a slightly wider field for Aladin so zoom-out/pan has context around target.
+CUTOUT_ALADIN_FETCH_MARGIN = 1.28
+# Keep at least ~2 deg on the shorter axis for panning context without
+# making telescope FOV overlays too small at max zoom.
+CUTOUT_ALADIN_FETCH_MIN_ARCMIN = 120.0
+# Prefer dynamic fetch size based on telescope FOV when available.
+CUTOUT_ALADIN_FETCH_TELESCOPE_MARGIN = 5.0
+CUTOUT_ALADIN_FETCH_TELESCOPE_MAX_ARCMIN = 480.0
+# How much to widen fetched Aladin context when user zooms out past 1x.
+CUTOUT_ALADIN_CONTEXT_STEP = 1.6
+# Slight initial zoom so panning works immediately after load.
+CUTOUT_ALADIN_INITIAL_PAN_ZOOM = 1.50
+# Request higher native cutout resolution so zoom quality stays acceptable.
+CUTOUT_ALADIN_FETCH_RES_MULT = 2.2
+CUTOUT_ALADIN_FETCH_MIN_SHORT_PX = 900
+CUTOUT_ALADIN_FETCH_MAX_EDGE_PX = 1440
 FINDER_HTTP_TIMEOUT_S = 5.0
 FINDER_WORKER_TIMEOUT_MS = 10000
 FINDER_RETRY_COOLDOWN_S = 45.0
 BHTOM_API_BASE_URL = "https://bh-tom2.astrouw.edu.pl"
 BHTOM_TARGET_LIST_PATH = "/targets/getTargetList/"
+BHTOM_OBSERVATORY_LIST_PATH = "/observatory/getObservatoryList/"
 BHTOM_MAX_SUGGESTION_PAGES = 5
+BHTOM_MAX_OBSERVATORY_PAGES = 20
 BHTOM_PAGE_SIZE = 200
 BHTOM_SUGGESTION_MIN_IMPORTANCE = 2.0
 BHTOM_SUGGESTION_CACHE_TTL_S = 60 * 60
+BHTOM_OBSERVATORY_CACHE_TTL_S = 60 * 60
+DEFAULT_LIMITING_MAGNITUDE = 19.0
+QUICK_TARGETS_DEFAULT_COUNT = 10
+QUICK_TARGETS_MIN_COUNT = 1
+QUICK_TARGETS_MAX_COUNT = 50
 
 
 @dataclass(frozen=True)
@@ -291,6 +400,545 @@ def _extract_simbad_metadata(result, row_idx: int = 0) -> tuple[Optional[float],
             object_type = _decode_simbad_value(raw)
 
     return magnitude, object_type
+
+
+def _airmass_from_altitude_values(altitude_deg: object) -> np.ndarray:
+    altitude = np.asarray(altitude_deg, dtype=float)
+    airmass = np.full_like(altitude, np.nan, dtype=float)
+    valid = np.isfinite(altitude) & (altitude > 0.0)
+    if np.any(valid):
+        alt_valid = altitude[valid]
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            denom = np.sin(np.radians(alt_valid)) + 0.50572 * np.power(alt_valid + 6.07995, -1.6364)
+            airmass[valid] = 1.0 / denom
+    return airmass
+
+
+def _fetch_bhtom_target_page_payload(endpoint_base_url: str, token: str, page: int) -> object:
+    endpoint = f"{endpoint_base_url.rstrip('/')}{BHTOM_TARGET_LIST_PATH}"
+    body = json.dumps(
+        {
+            "page": int(page),
+            "type": "SIDEREAL",
+            "importanceMin": BHTOM_SUGGESTION_MIN_IMPORTANCE,
+        }
+    ).encode("utf-8")
+    req = Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": f"Token {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "AstroPlanner/1.0 (desktop app)",
+        },
+    )
+    try:
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            detail = ""
+        if exc.code in {401, 403}:
+            raise RuntimeError("BHTOM unauthorized (401/403). Check BHTOM account/token.") from exc
+        if detail:
+            raise RuntimeError(f"BHTOM request failed ({exc.code}): {detail[:240]}") from exc
+        raise RuntimeError(f"BHTOM request failed ({exc.code}).") from exc
+    except Exception as exc:
+        raise RuntimeError(f"BHTOM lookup failed: {exc}") from exc
+
+    try:
+        return json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError("BHTOM returned non-JSON response.") from exc
+
+
+def _extract_bhtom_items(payload: object) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("results", "targets", "items", "data", "objects"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            for nested_key in ("results", "targets", "items", "data", "objects"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, list):
+                    return [item for item in nested_value if isinstance(item, dict)]
+    return []
+
+
+def _bhtom_payload_has_more(payload: object, page: int, item_count: int) -> bool:
+    if isinstance(payload, dict):
+        next_value = payload.get("next")
+        if next_value not in (None, "", False):
+            return True
+        for key in ("has_next", "hasNext"):
+            if payload.get(key) is True:
+                return True
+        total_pages = None
+        for key in ("totalPages", "total_pages", "numPages", "num_pages", "pages", "page_count"):
+            total_pages = _safe_int(payload.get(key))
+            if total_pages is not None:
+                break
+        if total_pages is not None:
+            return page < total_pages
+        total_count = None
+        for key in ("count", "total", "totalCount", "recordsTotal"):
+            total_count = _safe_int(payload.get(key))
+            if total_count is not None:
+                break
+        if total_count is not None:
+            return page * BHTOM_PAGE_SIZE < total_count
+    return item_count >= BHTOM_PAGE_SIZE and page < BHTOM_MAX_SUGGESTION_PAGES
+
+
+def _fetch_bhtom_observatory_page_payload(endpoint_base_url: str, token: str, page: int) -> object:
+    endpoint = f"{endpoint_base_url.rstrip('/')}{BHTOM_OBSERVATORY_LIST_PATH}"
+    body = urlencode({"page": int(page)}).encode("utf-8")
+    req = Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": f"Token {token}",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "Accept": "application/json",
+            "User-Agent": "AstroPlanner/1.0 (desktop app)",
+        },
+    )
+    try:
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            detail = ""
+        if exc.code in {401, 403}:
+            raise RuntimeError("BHTOM unauthorized (401/403). Check BHTOM account/token.") from exc
+        if detail:
+            raise RuntimeError(f"BHTOM observatory request failed ({exc.code}): {detail[:240]}") from exc
+        raise RuntimeError(f"BHTOM observatory request failed ({exc.code}).") from exc
+    except Exception as exc:
+        raise RuntimeError(f"BHTOM observatory lookup failed: {exc}") from exc
+
+    try:
+        return json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError("BHTOM observatory endpoint returned non-JSON response.") from exc
+
+
+def _extract_bhtom_observatory_items(payload: object) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("data", "results", "observatories", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            if len(value) == 1 and isinstance(value[0], list):
+                return [item for item in value[0] if isinstance(item, dict)]
+            rows = [item for item in value if isinstance(item, dict)]
+            if rows:
+                return rows
+        if isinstance(value, dict):
+            for nested_key in ("data", "results", "observatories", "items"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, list):
+                    return [item for item in nested_value if isinstance(item, dict)]
+
+    # Sometimes a single observatory can be returned directly.
+    if "name" in payload and ("lat" in payload or "latitude" in payload):
+        return [payload]
+    return []
+
+
+def _bhtom_observatory_payload_has_more(payload: object, page: int, item_count: int) -> bool:
+    if isinstance(payload, dict):
+        for key in ("next",):
+            next_value = payload.get(key)
+            if next_value not in (None, "", False):
+                return True
+        for key in ("has_next", "hasNext"):
+            if payload.get(key) is True:
+                return True
+
+        total_pages = None
+        for key in ("num_pages", "numPages", "total_pages", "totalPages", "pages", "page_count"):
+            total_pages = _safe_int(payload.get(key))
+            if total_pages is not None:
+                break
+        current_page = None
+        for key in ("page", "current_page", "currentPage"):
+            current_page = _safe_int(payload.get(key))
+            if current_page is not None:
+                break
+        if total_pages is not None:
+            current = current_page if current_page is not None else int(page)
+            return current < total_pages
+    return item_count >= BHTOM_PAGE_SIZE and page < BHTOM_MAX_OBSERVATORY_PAGES
+
+
+def _bhtom_camera_detector_shape(camera: dict[str, Any]) -> tuple[int, int]:
+    def _dimension(*keys: str) -> int:
+        value = _safe_int(_pick_first_present([camera], *keys))
+        if value is None or value <= 0:
+            return 0
+        return int(value)
+
+    width = _dimension(
+        "detector_width_px",
+        "detectorWidthPx",
+        "width_px",
+        "width",
+        "x_size",
+        "xSize",
+        "nx",
+        "res_x",
+        "resolution_x",
+    )
+    height = _dimension(
+        "detector_height_px",
+        "detectorHeightPx",
+        "height_px",
+        "height",
+        "y_size",
+        "ySize",
+        "ny",
+        "res_y",
+        "resolution_y",
+    )
+    if width > 0 and height > 0:
+        return width, height
+
+    # Fallback for compact string formats like "4096x4096".
+    shape_raw = _pick_first_present([camera], "detector_shape", "detectorShape", "resolution")
+    shape_txt = str(shape_raw or "").strip().lower().replace(" ", "")
+    for sep in ("x", "×", "*"):
+        if sep in shape_txt:
+            parts = shape_txt.split(sep)
+            if len(parts) >= 2:
+                try:
+                    width = int(float(parts[0]))
+                    height = int(float(parts[1]))
+                except Exception:
+                    continue
+                if width > 0 and height > 0:
+                    return width, height
+    return 0, 0
+
+
+def _build_bhtom_observatory_presets(items: list[dict[str, Any]]) -> list[dict[str, object]]:
+    presets: list[dict[str, object]] = []
+    used_keys: set[str] = set()
+    for obs in items:
+        obs_name = _normalize_catalog_display_name(
+            _pick_first_present([obs], "name", "observatory_name", "title", "site_name")
+        )
+        if not obs_name:
+            continue
+
+        lat = _safe_float(_pick_first_present([obs], "lat", "latitude"))
+        lon = _safe_float(_pick_first_present([obs], "lon", "longitude"))
+        if lat is None or lon is None:
+            continue
+        elev = _safe_float(_pick_first_present([obs], "altitude", "elevation", "alt")) or 0.0
+        lim_mag = _safe_float(
+            _pick_first_present([obs], "approx_lim_mag", "limiting_magnitude", "limitingMagnitude")
+        )
+        aperture_raw = _safe_float(
+            _pick_first_present([obs], "aperture", "telescope_diameter_mm", "diameter_mm")
+        )
+        aperture_mm: Optional[float] = None
+        if aperture_raw is not None and math.isfinite(aperture_raw) and aperture_raw > 0:
+            # BHTOM aperture can appear as meters (e.g. 0.6) or millimeters (e.g. 600).
+            aperture_mm = float(aperture_raw * 1000.0 if aperture_raw <= 30.0 else aperture_raw)
+        focal_mm = _safe_float(_pick_first_present([obs], "focal_length", "focal_length_mm", "focalLengthMm"))
+        obs_id_raw = _pick_first_present([obs], "id", "pk", "observatory_id")
+        obs_id = str(obs_id_raw).strip() if obs_id_raw is not None else obs_name
+
+        camera_rows: list[dict[str, Any]] = []
+        cameras_payload = obs.get("cameras")
+        if isinstance(cameras_payload, list):
+            camera_rows = [cam for cam in cameras_payload if isinstance(cam, dict)]
+
+        if not camera_rows:
+            key = f"obs:{obs_id}|cam:none"
+            while key in used_keys:
+                key = f"{key}-"
+            used_keys.add(key)
+            site = Site(
+                name=obs_name,
+                latitude=float(lat),
+                longitude=float(lon),
+                elevation=float(elev),
+                limiting_magnitude=float(lim_mag if lim_mag is not None else DEFAULT_LIMITING_MAGNITUDE),
+                telescope_diameter_mm=float(aperture_mm if aperture_mm is not None else 0.0),
+                focal_length_mm=float(focal_mm if focal_mm is not None else 0.0),
+                pixel_size_um=0.0,
+                detector_width_px=0,
+                detector_height_px=0,
+            )
+            presets.append(
+                {
+                    "key": key,
+                    "label": obs_name,
+                    "source": "bhtom",
+                    "site": site,
+                    "observatory_id": obs_id,
+                    "camera_id": "",
+                }
+            )
+            continue
+
+        for cam_idx, cam in enumerate(camera_rows):
+            cam_name = _normalize_catalog_display_name(
+                _pick_first_present([cam], "camera_name", "name", "prefix", "model", "code")
+            )
+            prefix = _normalize_catalog_display_name(_pick_first_present([cam], "prefix"))
+            cam_id_raw = _pick_first_present([cam], "id", "pk", "camera_id")
+            cam_id = str(cam_id_raw).strip() if cam_id_raw is not None else (prefix or cam_name or f"cam{cam_idx + 1}")
+            label_suffix = prefix or cam_name or f"camera {cam_idx + 1}"
+            key = f"obs:{obs_id}|cam:{cam_id}"
+            while key in used_keys:
+                key = f"{key}-"
+            used_keys.add(key)
+
+            pixel_um = _safe_float(_pick_first_present([cam], "pixel_size_um", "pixel_size", "pixelSize"))
+            det_w, det_h = _bhtom_camera_detector_shape(cam)
+            site = Site(
+                name=f"{obs_name} [{label_suffix}]",
+                latitude=float(lat),
+                longitude=float(lon),
+                elevation=float(elev),
+                limiting_magnitude=float(lim_mag if lim_mag is not None else DEFAULT_LIMITING_MAGNITUDE),
+                telescope_diameter_mm=float(aperture_mm if aperture_mm is not None else 0.0),
+                focal_length_mm=float(focal_mm if focal_mm is not None else 0.0),
+                pixel_size_um=float(pixel_um if pixel_um is not None else 0.0),
+                detector_width_px=int(det_w),
+                detector_height_px=int(det_h),
+            )
+            presets.append(
+                {
+                    "key": key,
+                    "label": f"{obs_name} | {label_suffix}",
+                    "source": "bhtom",
+                    "site": site,
+                    "observatory_id": obs_id,
+                    "camera_id": cam_id,
+                }
+            )
+
+    presets.sort(key=lambda item: str(item.get("label", "")).lower())
+    return presets
+
+
+def _pick_first_present(sources: list[dict[str, Any]], *keys: str) -> object:
+    for source in sources:
+        for key in keys:
+            if key in source and source[key] not in (None, ""):
+                return source[key]
+    return None
+
+
+def _build_bhtom_candidate_from_item(item: dict[str, Any]) -> Optional[dict[str, object]]:
+    nested_sources = [item]
+    for key in ("target", "target_data", "data", "object", "coordinates"):
+        nested = item.get(key)
+        if isinstance(nested, dict):
+            nested_sources.append(nested)
+
+    name_raw = _pick_first_present(nested_sources, "name", "target_name", "display_name", "identifier")
+    name = _normalize_catalog_display_name(name_raw)
+    if not name:
+        return None
+
+    ra_deg = _safe_float(_pick_first_present(nested_sources, "ra", "raDeg", "ra_deg", "rightAscension"))
+    dec_deg = _safe_float(_pick_first_present(nested_sources, "dec", "decDeg", "dec_deg", "declination"))
+    if ra_deg is None or dec_deg is None:
+        return None
+
+    classification = str(
+        _pick_first_present(
+            nested_sources,
+            "classification",
+            "object_type",
+            "objectType",
+            "targetClass",
+            "class",
+        )
+        or ""
+    ).strip()
+    magnitude = _safe_float(
+        _pick_first_present(
+            nested_sources,
+            "mag_last",
+            "last_mag",
+            "lastMagnitude",
+            "magnitude",
+            "mag",
+        )
+    )
+    importance = _safe_float(_pick_first_present(nested_sources, "importance", "importance_value")) or 0.0
+    bhtom_priority = _safe_int(_pick_first_present(nested_sources, "priority", "observing_priority")) or 0
+    target_priority = max(1, min(5, int(bhtom_priority))) if bhtom_priority > 0 else 3
+    sun_separation = _safe_float(
+        _pick_first_present(nested_sources, "sun_separation", "sunSeparation", "sun")
+    )
+    source_id_raw = _pick_first_present(nested_sources, "id", "pk", "target_id", "targetId", "name")
+    source_id = str(source_id_raw).strip() if source_id_raw is not None else name
+
+    return {
+        "target": Target(
+            name=name,
+            ra=float(ra_deg),
+            dec=float(dec_deg),
+            source_catalog="bhtom",
+            source_object_id=source_id or name,
+            magnitude=magnitude,
+            object_type=classification,
+            priority=target_priority,
+        ),
+        "importance": float(importance),
+        "bhtom_priority": int(bhtom_priority),
+        "sun_separation": float(sun_separation) if sun_separation is not None else None,
+    }
+
+
+def _rank_local_target_suggestions_from_candidates(
+    payload: dict[str, object],
+    site: "Site",
+    targets: list["Target"],
+    limit_altitude: float,
+    sun_alt_limit: float,
+    min_moon_sep: float,
+    candidates: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[str]]:
+    skipped_notes: list[str] = []
+    try:
+        tz_name = str(payload.get("tz", site.timezone_name))
+        tz = pytz.timezone(tz_name)
+    except Exception:
+        tz_name = site.timezone_name
+        tz = pytz.UTC
+
+    try:
+        time_datetimes = [t.astimezone(tz) for t in mdates.num2date(payload["times"])]
+    except Exception:
+        return [], ["Visibility samples are unavailable in the current plot state."]
+    if not time_datetimes:
+        return [], ["Visibility samples are unavailable in the current plot state."]
+
+    observer = Observer(location=site.to_earthlocation(), timezone=tz_name)
+    time_samples = Time(time_datetimes)
+    moon_ra = np.array(payload.get("moon_ra", np.full(len(time_datetimes), np.nan)), dtype=float)
+    moon_dec = np.array(payload.get("moon_dec", np.full(len(time_datetimes), np.nan)), dtype=float)
+    if moon_ra.shape[0] != len(time_datetimes) or moon_dec.shape[0] != len(time_datetimes):
+        return [], ["Moon position samples are unavailable in the current plot state."]
+    moon_coords = SkyCoord(ra=moon_ra * u.deg, dec=moon_dec * u.deg)
+
+    sun_alt_series = np.array(payload.get("sun_alt", np.full(len(time_datetimes), np.nan)), dtype=float)
+    obs_sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= float(sun_alt_limit))
+    sample_hours = 24.0 / max(len(time_datetimes) - 1, 1)
+
+    current_names = {_normalize_catalog_token(target.name) for target in targets}
+    current_source_ids = {_normalize_catalog_token(target.source_object_id) for target in targets if target.source_object_id}
+    current_coords = [target.skycoord for target in targets]
+
+    ranked: list[dict[str, object]] = []
+
+    for candidate_info in candidates:
+        target = candidate_info.get("target")
+        if not isinstance(target, Target):
+            continue
+        normalized_name = _normalize_catalog_token(target.name)
+        normalized_source = _normalize_catalog_token(target.source_object_id)
+        if normalized_name in current_names or (normalized_source and normalized_source in current_source_ids):
+            continue
+        if any(float(target.skycoord.separation(coord).deg) < 0.05 for coord in current_coords):
+            continue
+
+        try:
+            fixed = FixedTarget(name=target.name, coord=target.skycoord)
+            altaz = observer.altaz(time_samples, fixed)
+            altitude = np.array(altaz.alt.deg, dtype=float)  # type: ignore[arg-type]
+            moon_sep = np.array(target.skycoord.separation(moon_coords).deg, dtype=float)
+            metrics = compute_target_metrics(
+                altitude_deg=altitude,
+                moon_sep_deg=moon_sep,
+                limit_altitude=float(limit_altitude),
+                sample_hours=sample_hours,
+                priority=max(1, min(5, int(candidate_info.get("bhtom_priority", 3) or 3))),
+                observed=False,
+                valid_mask=obs_sun_mask,
+            )
+        except Exception:
+            continue
+
+        valid_mask = np.isfinite(altitude) & (altitude >= float(limit_altitude)) & obs_sun_mask
+        if not valid_mask.any():
+            continue
+
+        valid_indices = np.where(valid_mask)[0]
+        runs = np.split(valid_indices, np.where(np.diff(valid_indices) != 1)[0] + 1)
+        best_run = max(runs, key=len)
+        start_idx = int(best_run[0])
+        end_idx = min(int(best_run[-1]) + 1, len(time_datetimes) - 1)
+        window_start = time_datetimes[start_idx]
+        window_end = time_datetimes[end_idx]
+        best_window_airmass = _airmass_from_altitude_values(altitude[best_run])
+        finite_window_airmass = best_window_airmass[np.isfinite(best_window_airmass)]
+        best_airmass = float(np.min(finite_window_airmass)) if finite_window_airmass.size > 0 else None
+        finite_window_moon_sep = moon_sep[best_run][np.isfinite(moon_sep[best_run])]
+        min_window_moon_sep = (
+            float(np.min(finite_window_moon_sep))
+            if finite_window_moon_sep.size > 0
+            else None
+        )
+
+        ranked.append(
+            {
+                "target": target,
+                "metrics": metrics,
+                "window_start": window_start,
+                "window_end": window_end,
+                "best_airmass": best_airmass,
+                "min_window_moon_sep": min_window_moon_sep,
+                "moon_sep_warning": (
+                    float(min_moon_sep) > 0.0
+                    and min_window_moon_sep is not None
+                    and round(float(min_window_moon_sep), 1) < float(min_moon_sep)
+                ),
+                "added_to_plan": False,
+                "importance": float(candidate_info.get("importance", 0.0) or 0.0),
+                "bhtom_priority": int(candidate_info.get("bhtom_priority", 0) or 0),
+                "sun_separation": candidate_info.get("sun_separation"),
+            }
+        )
+
+    if not ranked:
+        skipped_notes.append("No BHTOM targets matched the current filters and night window.")
+        return [], skipped_notes
+
+    ranked.sort(
+        key=lambda item: (
+            -float(item["importance"]),
+            -int(item["bhtom_priority"]),
+            -float(item["metrics"].score),  # type: ignore[index]
+            -float(item["metrics"].hours_above_limit),  # type: ignore[index]
+            item["window_start"],
+            str(item["target"].name).lower(),  # type: ignore[index]
+        )
+    )
+    return ranked, skipped_notes
 
 
 def _extract_simbad_photometry(result, row_idx: int = 0) -> dict[str, float]:
@@ -651,10 +1299,17 @@ def _sanitize_cutout_size_px(value: object) -> int:
 
 # GUI imports (PySide6)
 from PySide6.QtCore import (
+    Property,
     QAbstractTableModel,
     QDate,
+    QElapsedTimer,
+    QEasingCurve,
     QEvent,
     QModelIndex,
+    QObject,
+    QPoint,
+    QPropertyAnimation,
+    QRectF,
     QSignalBlocker,
     Qt,
     QThread,
@@ -682,14 +1337,24 @@ from PySide6.QtGui import (
     QIcon,
     QImage,
     QKeySequence,
+    QLinearGradient,
     QPalette,
     QPainter,
     QPen,
     QPixmap,
     QShortcut,
+    QTextDocument,
 )
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+
+    _HAS_QTWEBENGINE = True
+except Exception:  # pragma: no cover - optional runtime dependency
+    QWebEngineView = None  # type: ignore[assignment]
+    _HAS_QTWEBENGINE = False
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -697,26 +1362,35 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
     QFormLayout,
+    QGridLayout,
     QHeaderView,
     QFileDialog,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
     QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
     QProgressBar,
-    QProgressDialog,
     QScrollArea,
     QSplitter,
+    QStackedLayout,
     QSpinBox,
     QSlider,
     QStyle,
+    QStyleOptionViewItem,
     QSizePolicy,
     QTableView,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QToolButton,
+    QListWidget,
+    QListWidgetItem,
     QVBoxLayout,
     QWidget,
     QColorDialog,
@@ -728,6 +1402,569 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+_HAS_MPL_CANVAS = True
+
+
+def _configure_tab_widget(tab_widget: QTabWidget, *, document_mode: bool = True) -> QTabWidget:
+    """Normalize tab widgets so native tab-bar chrome doesn't leak through custom themes."""
+    tab_widget.setDocumentMode(document_mode)
+    try:
+        tab_widget.setUsesScrollButtons(True)
+    except Exception:
+        pass
+    try:
+        tab_widget.setElideMode(Qt.TextElideMode.ElideNone)
+    except Exception:
+        pass
+    bar = tab_widget.tabBar()
+    bar.setExpanding(False)
+    bar.setElideMode(Qt.TextElideMode.ElideNone)
+    if hasattr(bar, "setUsesScrollButtons"):
+        try:
+            bar.setUsesScrollButtons(True)
+        except Exception:
+            pass
+    tab_widget.tabBar().setDrawBase(False)
+    return tab_widget
+
+
+def _fit_dialog_to_screen(
+    dialog: QDialog,
+    *,
+    preferred_width: int,
+    preferred_height: int,
+    min_width: int,
+    min_height: int,
+) -> None:
+    screen = dialog.screen()
+    if screen is None and isinstance(dialog.parentWidget(), QWidget):
+        screen = dialog.parentWidget().screen()
+    if screen is None:
+        screen = QApplication.primaryScreen()
+
+    hint = dialog.sizeHint()
+    target_w = max(int(min_width), int(preferred_width), int(hint.width()))
+    target_h = max(int(min_height), int(preferred_height), int(hint.height()))
+
+    if screen is not None:
+        available = screen.availableGeometry()
+        max_w = max(420, available.width() - 24)
+        max_h = max(320, available.height() - 24)
+        target_w = min(max_w, target_w)
+        target_h = min(max_h, target_h)
+        min_width = min(max_w, max(int(min_width), min(int(hint.width()), target_w)))
+        min_height = min(max_h, max(int(min_height), min(int(hint.height()), target_h)))
+
+    dialog.setMinimumSize(int(min_width), int(min_height))
+    dialog.resize(int(target_w), int(target_h))
+
+
+_DISPLAY_FONT_PATH = Path(__file__).resolve().parent / "assets" / "fonts" / "Rajdhani-SemiBold.ttf"
+_DISPLAY_FONT_LOADED = False
+_DISPLAY_FONT_CSS_CACHE: Optional[str] = None
+_DISPLAY_WEB_FONT_FAMILY = "Rajdhani Web"
+
+
+def _repolish_widget(widget: Optional[QWidget]) -> None:
+    if widget is None:
+        return
+    style = widget.style()
+    if style is None:
+        widget.update()
+        return
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
+
+
+def _set_dynamic_property(widget: Optional[QWidget], name: str, value: object) -> None:
+    if widget is None:
+        return
+    widget.setProperty(name, value)
+
+
+def _embedded_display_font_css() -> str:
+    global _DISPLAY_FONT_CSS_CACHE
+    if _DISPLAY_FONT_CSS_CACHE is not None:
+        return _DISPLAY_FONT_CSS_CACHE
+    if not _DISPLAY_FONT_PATH.exists():
+        _DISPLAY_FONT_CSS_CACHE = ""
+        return _DISPLAY_FONT_CSS_CACHE
+    try:
+        encoded = base64.b64encode(_DISPLAY_FONT_PATH.read_bytes()).decode("ascii")
+    except Exception:
+        _DISPLAY_FONT_CSS_CACHE = ""
+        return _DISPLAY_FONT_CSS_CACHE
+    _DISPLAY_FONT_CSS_CACHE = (
+        "@font-face{"
+        f"font-family:'{_DISPLAY_WEB_FONT_FAMILY}';"
+        f"src:url(data:font/ttf;base64,{encoded}) format('truetype');"
+        "font-style:normal;"
+        "font-weight:600;"
+        "font-display:swap;"
+        "}"
+    )
+    return _DISPLAY_FONT_CSS_CACHE
+
+
+def _plot_font_css_stack(theme_tokens: Optional[dict[str, str]] = None) -> str:
+    fallback = "Arial, sans-serif"
+    if theme_tokens:
+        fallback = str(theme_tokens.get("display_font_family", theme_tokens.get("font_family", fallback)))
+    if _DISPLAY_FONT_PATH.exists():
+        return f'"{_DISPLAY_WEB_FONT_FAMILY}", {fallback}'
+    return fallback
+
+
+def _set_button_variant(button: Optional[QWidget], variant: str) -> None:
+    _set_dynamic_property(button, "variant", str(variant))
+
+
+def _set_label_tone(label: Optional[QWidget], tone: str) -> None:
+    _set_dynamic_property(label, "tone", str(tone))
+
+
+def _set_widget_invalid(widget: Optional[QWidget], invalid: bool) -> None:
+    _set_dynamic_property(widget, "invalid", bool(invalid))
+
+
+def _theme_tokens_from_widget(widget: object) -> dict[str, str]:
+    current = widget
+    for _ in range(6):
+        tokens = getattr(current, "_theme_tokens", None)
+        if isinstance(tokens, dict):
+            return tokens
+        parent = getattr(current, "parent", None)
+        if not callable(parent):
+            break
+        current = parent()
+        if current is None:
+            break
+    return {}
+
+
+def _theme_color_from_widget(widget: object, key: str, fallback: str) -> str:
+    tokens = _theme_tokens_from_widget(widget)
+    value = tokens.get(key) if isinstance(tokens, dict) else None
+    return str(value or fallback)
+
+
+def _theme_qcolor_from_widget(widget: object, key: str, fallback: str) -> QColor:
+    color = QColor(_theme_color_from_widget(widget, key, fallback))
+    if color.isValid():
+        return color
+    return QColor(fallback)
+
+
+def _mix_qcolors_for_theme(first: QColor, second: QColor, first_ratio: float) -> QColor:
+    ratio = max(0.0, min(1.0, float(first_ratio)))
+    other_ratio = 1.0 - ratio
+    return QColor(
+        int(round(first.red() * ratio + second.red() * other_ratio)),
+        int(round(first.green() * ratio + second.green() * other_ratio)),
+        int(round(first.blue() * ratio + second.blue() * other_ratio)),
+    )
+
+
+def _qcolor_rgba_css_for_theme(color: QColor, alpha: float) -> str:
+    use_color = QColor(color)
+    if not use_color.isValid():
+        use_color = QColor("#59f3ff")
+    return f"rgba({use_color.red()}, {use_color.green()}, {use_color.blue()}, {max(0.0, min(1.0, float(alpha))):.3f})"
+
+
+def _qcolor_rgba_mpl_for_theme(color: QColor, alpha: float) -> tuple[float, float, float, float]:
+    use_color = QColor(color)
+    if not use_color.isValid():
+        use_color = QColor("#59f3ff")
+    return (
+        float(use_color.redF()),
+        float(use_color.greenF()),
+        float(use_color.blueF()),
+        max(0.0, min(1.0, float(alpha))),
+    )
+
+
+def _softened_plot_grid_qcolor_from_tokens(theme_tokens: Optional[dict[str, str]]) -> QColor:
+    tokens = theme_tokens if isinstance(theme_tokens, dict) else {}
+    base = QColor(str(tokens.get("plot_grid", "#2f4666")))
+    panel = QColor(str(tokens.get("plot_panel_bg", "#162334")))
+    if not base.isValid():
+        base = QColor("#2f4666")
+    if not panel.isValid():
+        panel = QColor("#162334")
+    return _mix_qcolors_for_theme(base, panel, 0.34)
+
+
+def _softened_plot_grid_css_from_tokens(theme_tokens: Optional[dict[str, str]], *, alpha: float = 1.0) -> str:
+    return _qcolor_rgba_css_for_theme(_softened_plot_grid_qcolor_from_tokens(theme_tokens), alpha)
+
+
+def _softened_plot_grid_rgba_from_tokens(theme_tokens: Optional[dict[str, str]], *, alpha: float = 1.0) -> tuple[float, float, float, float]:
+    return _qcolor_rgba_mpl_for_theme(_softened_plot_grid_qcolor_from_tokens(theme_tokens), alpha)
+
+
+def _composite_qcolor(foreground: QColor, background: QColor) -> QColor:
+    fg = QColor(foreground)
+    bg = QColor(background)
+    if not fg.isValid():
+        return bg if bg.isValid() else QColor()
+    if not bg.isValid() or fg.alpha() >= 255:
+        return fg
+    alpha = fg.alphaF()
+    out = QColor(
+        round(fg.red() * alpha + bg.red() * (1.0 - alpha)),
+        round(fg.green() * alpha + bg.green() * (1.0 - alpha)),
+        round(fg.blue() * alpha + bg.blue() * (1.0 - alpha)),
+    )
+    return out
+
+
+def _contrast_text_for_background(background: QColor, *, table_bg: Optional[QColor] = None) -> QColor:
+    bg = QColor(background)
+    if not bg.isValid():
+        return QColor("#f6fbff")
+    if table_bg is not None and table_bg.isValid() and bg.alpha() < 255:
+        bg = _composite_qcolor(bg, table_bg)
+    luminance = (
+        0.2126 * float(bg.red()) +
+        0.7152 * float(bg.green()) +
+        0.0722 * float(bg.blue())
+    ) / 255.0
+    return QColor("#061118" if luminance > 0.58 else "#f6fbff")
+
+
+def _icon_pen(color: QColor, width: float) -> QPen:
+    pen = QPen(color)
+    pen.setWidthF(width)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    return pen
+
+
+def _button_icon_palette(widget: object) -> tuple[QColor, QColor, QColor]:
+    variant = ""
+    if hasattr(widget, "property"):
+        try:
+            variant = str(widget.property("variant") or "")
+        except Exception:
+            variant = ""
+    if variant == "primary":
+        fg = _theme_qcolor_from_widget(widget, "btn_text", "#f7fbff")
+    elif variant == "ghost":
+        fg = _theme_qcolor_from_widget(widget, "strip_label", "#a4b4c8")
+    else:
+        fg = _theme_qcolor_from_widget(widget, "section_title", "#eef4fc")
+    accent = _theme_qcolor_from_widget(widget, "accent_primary", "#59f3ff")
+    accent_secondary = _theme_qcolor_from_widget(widget, "accent_secondary", "#ff4da6")
+    return fg, accent, accent_secondary
+
+
+def _build_button_icon_pixmap(kind: str, fg: QColor, accent: QColor, accent_secondary: QColor, size: int = 18) -> QPixmap:
+    px = QPixmap(size, size)
+    px.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(px)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    stroke = max(1.5, float(size) * 0.11)
+    painter.setPen(_icon_pen(fg, stroke))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    kind = str(kind or "").strip().lower()
+    s = float(size)
+    m = s * 0.2
+
+    def line(x1: float, y1: float, x2: float, y2: float) -> None:
+        painter.drawLine(int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
+
+    def ellipse(x: float, y: float, w: float, h: float) -> None:
+        painter.drawEllipse(int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+
+    def dot(x: float, y: float, r: float = 1.7) -> None:
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(accent_secondary)
+        painter.drawEllipse(int(round(x - r)), int(round(y - r)), int(round(r * 2)), int(round(r * 2)))
+        painter.restore()
+
+    if kind in {"add", "new"}:
+        line(s * 0.5, m, s * 0.5, s - m)
+        line(m, s * 0.5, s - m, s * 0.5)
+        dot(s * 0.77, s * 0.23)
+    elif kind in {"quick", "flash"}:
+        line(s * 0.56, m, s * 0.33, s * 0.48)
+        line(s * 0.33, s * 0.48, s * 0.50, s * 0.48)
+        line(s * 0.50, s * 0.48, s * 0.42, s - m)
+        line(s * 0.42, s - m, s * 0.68, s * 0.54)
+        line(s * 0.68, s * 0.54, s * 0.52, s * 0.54)
+    elif kind in {"suggest", "spark", "ai"}:
+        line(s * 0.5, m, s * 0.5, s - m)
+        line(m, s * 0.5, s - m, s * 0.5)
+        line(s * 0.26, s * 0.26, s * 0.74, s * 0.74)
+        line(s * 0.74, s * 0.26, s * 0.26, s * 0.74)
+        dot(s * 0.76, s * 0.24)
+    elif kind in {"toggle", "observed", "ok", "apply"}:
+        line(s * 0.23, s * 0.56, s * 0.42, s * 0.74)
+        line(s * 0.42, s * 0.74, s * 0.78, s * 0.30)
+        dot(s * 0.76, s * 0.24)
+    elif kind in {"cancel", "clear"}:
+        line(m, m, s - m, s - m)
+        line(s - m, m, m, s - m)
+    elif kind in {"remove", "delete"}:
+        line(m, s * 0.5, s - m, s * 0.5)
+    elif kind in {"edit", "pencil"}:
+        line(s * 0.28, s * 0.72, s * 0.72, s * 0.28)
+        line(s * 0.62, s * 0.24, s * 0.76, s * 0.38)
+        line(s * 0.24, s * 0.76, s * 0.38, s * 0.62)
+        dot(s * 0.78, s * 0.22)
+    elif kind in {"load", "open"}:
+        line(m, s * 0.72, s - m, s * 0.72)
+        line(m, s * 0.72, m, s * 0.58)
+        line(s - m, s * 0.72, s - m, s * 0.58)
+        line(s * 0.5, m, s * 0.5, s * 0.58)
+        line(s * 0.5, s * 0.58, s * 0.34, s * 0.42)
+        line(s * 0.5, s * 0.58, s * 0.66, s * 0.42)
+    elif kind in {"save"}:
+        painter.drawRoundedRect(int(round(m)), int(round(m)), int(round(s - 2 * m)), int(round(s - 2 * m)), 3, 3)
+        line(s * 0.32, m + 1, s * 0.32, s * 0.45)
+        line(s * 0.32, s * 0.45, s * 0.68, s * 0.45)
+        line(s * 0.28, s * 0.67, s * 0.72, s * 0.67)
+    elif kind in {"weather", "cloud"}:
+        ellipse(s * 0.22, s * 0.42, s * 0.28, s * 0.22)
+        ellipse(s * 0.40, s * 0.32, s * 0.30, s * 0.26)
+        ellipse(s * 0.56, s * 0.44, s * 0.22, s * 0.18)
+        line(s * 0.24, s * 0.59, s * 0.72, s * 0.59)
+        dot(s * 0.76, s * 0.28)
+    elif kind in {"lookup", "resolve"}:
+        ellipse(s * 0.22, s * 0.22, s * 0.36, s * 0.36)
+        line(s * 0.52, s * 0.52, s * 0.74, s * 0.74)
+        line(s * 0.40, s * 0.28, s * 0.40, s * 0.52)
+        line(s * 0.28, s * 0.40, s * 0.52, s * 0.40)
+    elif kind in {"send"}:
+        line(m, s * 0.54, s - m, m)
+        line(s - m, m, s * 0.62, s - m)
+        line(s * 0.62, s - m, s * 0.50, s * 0.56)
+        line(s * 0.50, s * 0.56, m, s * 0.54)
+    elif kind in {"seestar", "target"}:
+        ellipse(s * 0.22, s * 0.22, s * 0.56, s * 0.56)
+        line(s * 0.5, m, s * 0.5, s * 0.34)
+        line(s * 0.5, s * 0.66, s * 0.5, s - m)
+        line(m, s * 0.5, s * 0.34, s * 0.5)
+        line(s * 0.66, s * 0.5, s - m, s * 0.5)
+        dot(s * 0.5, s * 0.5, 1.8)
+    elif kind in {"refresh"}:
+        painter.drawArc(int(round(m)), int(round(m)), int(round(s - 2 * m)), int(round(s - 2 * m)), int(25 * 16), int(280 * 16))
+        line(s * 0.72, s * 0.18, s * 0.82, s * 0.18)
+        line(s * 0.82, s * 0.18, s * 0.82, s * 0.30)
+    elif kind in {"link", "open-link"}:
+        line(s * 0.28, s * 0.72, s * 0.72, s * 0.28)
+        line(s * 0.50, s * 0.28, s * 0.72, s * 0.28)
+        line(s * 0.72, s * 0.28, s * 0.72, s * 0.50)
+        line(s * 0.30, s * 0.34, s * 0.30, s * 0.70)
+        line(s * 0.30, s * 0.70, s * 0.66, s * 0.70)
+    elif kind in {"describe"}:
+        painter.drawRoundedRect(int(round(m)), int(round(s * 0.24)), int(round(s - 2 * m)), int(round(s * 0.40)), 4, 4)
+        line(s * 0.34, s * 0.66, s * 0.46, s * 0.56)
+        line(s * 0.46, s * 0.56, s * 0.56, s * 0.66)
+        dot(s * 0.76, s * 0.30)
+    else:
+        ellipse(m, m, s - 2 * m, s - 2 * m)
+        dot(s * 0.72, s * 0.28)
+
+    painter.end()
+    return px
+
+
+def _build_button_icon(button: object, kind: str, size: int = 18) -> QIcon:
+    fg, accent, accent_secondary = _button_icon_palette(button)
+    disabled = _theme_qcolor_from_widget(button, "state_disabled", "#7f8ca3")
+    icon = QIcon()
+    icon.addPixmap(_build_button_icon_pixmap(kind, fg, accent, accent_secondary, size), QIcon.Mode.Normal, QIcon.State.Off)
+    icon.addPixmap(_build_button_icon_pixmap(kind, fg, accent_secondary, accent, size), QIcon.Mode.Active, QIcon.State.Off)
+    icon.addPixmap(_build_button_icon_pixmap(kind, disabled, disabled, disabled, size), QIcon.Mode.Disabled, QIcon.State.Off)
+    return icon
+
+
+def _set_button_icon_kind(button: Optional[QWidget], kind: str, size: int = 16) -> None:
+    if button is None or not hasattr(button, "setIcon"):
+        return
+    button.setProperty("icon_kind", str(kind))
+    button.setProperty("icon_size", int(size))
+    button.setIcon(_build_button_icon(button, kind, size))
+    if hasattr(button, "setIconSize"):
+        button.setIconSize(QSize(int(size), int(size)))
+
+
+def _refresh_button_icons(root: Optional[QWidget]) -> None:
+    if root is None:
+        return
+    widgets = [root, *root.findChildren(QWidget)]
+    for widget in widgets:
+        if not hasattr(widget, "property") or not hasattr(widget, "setIcon"):
+            continue
+        kind = widget.property("icon_kind")
+        if not kind:
+            continue
+        size = int(widget.property("icon_size") or 16)
+        widget.setIcon(_build_button_icon(widget, str(kind), size))
+        if hasattr(widget, "setIconSize"):
+            widget.setIconSize(QSize(size, size))
+    _refresh_button_hover_glow(root)
+
+
+_BUTTON_HOVER_GLOW_FILTER: Optional[QObject] = None
+
+
+class _ButtonHoverGlowFilter(QObject):
+    def eventFilter(self, watched, event):  # noqa: D401
+        if not isinstance(watched, QWidget):
+            return False
+        event_type = event.type()
+        if event_type in (QEvent.Type.Enter, QEvent.Type.HoverEnter):
+            _apply_button_hover_glow(watched, True)
+        elif event_type in (
+            QEvent.Type.Leave,
+            QEvent.Type.HoverLeave,
+            QEvent.Type.Hide,
+            QEvent.Type.EnabledChange,
+            QEvent.Type.PaletteChange,
+            QEvent.Type.StyleChange,
+        ):
+            _apply_button_hover_glow(watched, watched.isEnabled() and watched.underMouse())
+        return False
+
+
+def _apply_button_hover_glow(widget: QWidget, enabled: bool) -> None:
+    if not isinstance(widget, QPushButton):
+        return
+    if bool(widget.property("weather_link")):
+        enabled = False
+    current = widget.graphicsEffect()
+    if not enabled or not widget.isEnabled():
+        if isinstance(current, QGraphicsDropShadowEffect):
+            widget.setGraphicsEffect(None)
+        return
+    color = _theme_qcolor_from_widget(widget, "button_hover_glow", "#ff7ecf")
+    aura = _theme_qcolor_from_widget(widget, "button_hover_aura", "#ff7ecf")
+    effect: QGraphicsDropShadowEffect
+    if isinstance(current, QGraphicsDropShadowEffect):
+        effect = current
+    else:
+        effect = QGraphicsDropShadowEffect(widget)
+        effect.setOffset(0.0, 0.0)
+        widget.setGraphicsEffect(effect)
+    glow_color = QColor(aura if aura.isValid() else color)
+    if not glow_color.isValid():
+        glow_color = QColor("#ff7ecf")
+    variant = str(widget.property("variant") or "")
+    blur_radius = 36.0 if variant in {"primary", "secondary"} else 32.0
+    alpha_floor = 210 if variant in {"primary", "secondary"} else 188
+    if glow_color.alpha() < alpha_floor:
+        glow_color.setAlpha(alpha_floor)
+    glow_color = QColor(
+        max(glow_color.red(), color.red()),
+        max(glow_color.green(), color.green()),
+        max(glow_color.blue(), color.blue()),
+        glow_color.alpha(),
+    )
+    effect.setBlurRadius(blur_radius)
+    effect.setColor(glow_color)
+
+
+def _refresh_button_hover_glow(root: Optional[QWidget]) -> None:
+    global _BUTTON_HOVER_GLOW_FILTER
+    if root is None:
+        return
+    if _BUTTON_HOVER_GLOW_FILTER is None:
+        _BUTTON_HOVER_GLOW_FILTER = _ButtonHoverGlowFilter(QApplication.instance())
+    widgets = [root, *root.findChildren(QWidget)]
+    for widget in widgets:
+        if not isinstance(widget, QPushButton):
+            continue
+        if not bool(widget.property("_hover_glow_installed")):
+            widget.installEventFilter(_BUTTON_HOVER_GLOW_FILTER)
+            widget.setProperty("_hover_glow_installed", True)
+        _apply_button_hover_glow(widget, widget.isEnabled() and widget.underMouse())
+
+
+_LEGACY_TABLE_HIGHLIGHT_DEFAULTS = {
+    "below": "#ffe0ea",
+    "limit": "#fff2cf",
+    "above": "#d9ffe9",
+}
+_LEGACY_TABLE_HIGHLIGHT_COLORBLIND = {
+    "below": "#ffb18e",
+    "limit": "#ffe680",
+    "above": "#9bf985",
+}
+
+
+def _canonical_color_token(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    color = QColor(text)
+    if color.isValid():
+        return color.name().lower()
+    return re.sub(r"\s+", "", text.lower())
+
+
+def _resolve_table_highlight_color(settings: object, key: str, default_color: str) -> str:
+    if settings is None or not hasattr(settings, "value"):
+        return str(default_color)
+    raw = str(settings.value(f"table/color/{key}", default_color) or "").strip()
+    if not raw:
+        return str(default_color)
+    normalized = _canonical_color_token(raw)
+    auto_colors = {
+        _canonical_color_token(_LEGACY_TABLE_HIGHLIGHT_DEFAULTS.get(key, "")),
+        _canonical_color_token(_LEGACY_TABLE_HIGHLIGHT_COLORBLIND.get(key, "")),
+    }
+    for theme_key, _label in THEME_CHOICES:
+        for dark_enabled in (False, True):
+            palette = highlight_palette_for_theme(theme_key, dark_enabled=dark_enabled, color_blind=False)
+            auto_colors.update({
+                _canonical_color_token(palette.below),
+                _canonical_color_token(palette.limit),
+                _canonical_color_token(palette.above),
+            })
+    colorblind_palette = highlight_palette_for_theme(DEFAULT_UI_THEME, dark_enabled=False, color_blind=True)
+    auto_colors.update({
+        _canonical_color_token(colorblind_palette.below),
+        _canonical_color_token(colorblind_palette.limit),
+        _canonical_color_token(colorblind_palette.above),
+    })
+    if normalized in auto_colors:
+        return str(default_color)
+    return raw
+
+
+def _style_dialog_button_box(
+    button_box: Optional[QDialogButtonBox],
+    *,
+    ok: str = "secondary",
+    cancel: str = "ghost",
+    apply: str = "secondary",
+    close: str = "secondary",
+) -> None:
+    if button_box is None:
+        return
+    mapping = {
+        QDialogButtonBox.Ok: ok,
+        QDialogButtonBox.Cancel: cancel,
+        QDialogButtonBox.Apply: apply,
+        QDialogButtonBox.Close: close,
+    }
+    icon_mapping = {
+        QDialogButtonBox.Ok: "ok",
+        QDialogButtonBox.Cancel: "cancel",
+        QDialogButtonBox.Apply: "apply",
+        QDialogButtonBox.Close: "cancel",
+    }
+    for role, variant in mapping.items():
+        btn = button_box.button(role)
+        if btn is not None:
+            _set_button_variant(btn, variant)
+            _set_button_icon_kind(btn, icon_mapping.get(role, "spark"), 14)
+
 
 # --- Custom delegate to preserve model background for column 0 even when selected ---
 from PySide6.QtWidgets import QStyledItemDelegate, QStyle
@@ -739,6 +1976,319 @@ class TargetTableView(QTableView):
     Ctrl+Backspace so that only the macOS-native shortcut deletes rows.
     """
     deleteRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._forced_row_height: Optional[int] = None
+
+    def set_forced_row_height(self, height: int) -> None:
+        value = max(10, int(height))
+        self._forced_row_height = value
+        header = self.verticalHeader()
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        header.setDefaultSectionSize(value)
+        header.setMinimumSectionSize(value)
+        header.setMaximumSectionSize(value)
+        for row in range(self.model().rowCount() if self.model() is not None else 0):
+            self.setRowHeight(row, value)
+        self.updateGeometries()
+        self.viewport().update()
+
+    def setModel(self, model) -> None:  # type: ignore[override]
+        super().setModel(model)
+        if self._forced_row_height is not None:
+            self.set_forced_row_height(self._forced_row_height)
+
+    def sizeHintForRow(self, row: int) -> int:  # noqa: D401
+        if self._forced_row_height is not None:
+            return int(self._forced_row_height)
+        return super().sizeHintForRow(row)
+
+
+class NeonToggleSwitch(QAbstractButton):
+    """Compact animated neon switch used for the Altitude/Airmass toggle."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("NeonToggleSwitch")
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._offset = 0.0
+        self._switch_anim = QPropertyAnimation(self, b"offset", self)
+        self._switch_anim.setDuration(170)
+        self._switch_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.toggled.connect(self._animate_to_checked_state)
+        self.setFixedSize(70, 34)
+
+    def sizeHint(self) -> QSize:  # noqa: D401
+        return QSize(70, 34)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: D401
+        return self.sizeHint()
+
+    def _get_offset(self) -> float:
+        return float(self._offset)
+
+    def _set_offset(self, value: float) -> None:
+        self._offset = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    offset = Property(float, _get_offset, _set_offset)
+
+    def _animate_to_checked_state(self, checked: bool) -> None:
+        try:
+            self._switch_anim.stop()
+        except Exception:
+            pass
+        self._switch_anim.setStartValue(self._offset)
+        self._switch_anim.setEndValue(1.0 if checked else 0.0)
+        self._switch_anim.start()
+
+    def setChecked(self, checked: bool) -> None:  # type: ignore[override]
+        changed = bool(checked) != self.isChecked()
+        super().setChecked(bool(checked))
+        if not changed:
+            self._set_offset(1.0 if self.isChecked() else 0.0)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: D401
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.toggle()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: D401
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.toggle()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: D401
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        track_rect = QRectF(1.0, 3.0, float(self.width() - 2), float(self.height() - 6))
+        radius = track_rect.height() / 2.0
+        panel_color = _theme_qcolor_from_widget(self, "plot_panel_bg", "#162334")
+        primary_color = _theme_qcolor_from_widget(self, "accent_primary", "#18d8f2")
+        secondary_color = _theme_qcolor_from_widget(self, "accent_secondary", "#ff4fd8")
+        state_color = QColor(secondary_color if self.isChecked() else primary_color)
+        border_color = _theme_qcolor_from_widget(self, "panel_border", "#20506a")
+        knob_color = _theme_qcolor_from_widget(self, "btn_text", "#f6fbff")
+        if self.isChecked():
+            off_color = QColor(panel_color)
+            mix_ratio = 0.26 + max(0.0, min(1.0, self._offset * 0.72))
+        else:
+            off_color = QColor(panel_color)
+            mix_ratio = 0.74
+        groove_mix = QColor(
+            round(off_color.red() + (state_color.red() - off_color.red()) * mix_ratio),
+            round(off_color.green() + (state_color.green() - off_color.green()) * mix_ratio),
+            round(off_color.blue() + (state_color.blue() - off_color.blue()) * mix_ratio),
+            round(off_color.alpha() + (state_color.alpha() - off_color.alpha()) * mix_ratio),
+        )
+
+        if self.isEnabled():
+            glow_color = QColor(state_color)
+            glow_color.setAlpha(int(76 + (72 * self._offset if self.isChecked() else 28)))
+            painter.setPen(QPen(glow_color, 3.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(track_rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+
+        painter.setPen(QPen(border_color, 1.2))
+        painter.setBrush(groove_mix)
+        painter.drawRoundedRect(track_rect, radius, radius)
+
+        highlight_rect = QRectF(track_rect.left() + 2.0, track_rect.top() + 2.0, track_rect.width() * 0.42, max(2.0, track_rect.height() * 0.28))
+        highlight = QColor(state_color)
+        highlight.setAlpha(46 if self.isEnabled() else 18)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(highlight)
+        painter.drawRoundedRect(highlight_rect, highlight_rect.height() / 2.0, highlight_rect.height() / 2.0)
+
+        scan_color = QColor(knob_color)
+        scan_color.setAlpha(18 if self.isEnabled() else 8)
+        painter.setPen(QPen(scan_color, 1.0))
+        for idx in range(3):
+            y = track_rect.top() + 5.0 + idx * 5.0
+            painter.drawLine(track_rect.left() + 8.0, y, track_rect.right() - 8.0, y)
+
+        handle_d = track_rect.height() - 4.0
+        min_x = track_rect.left() + 2.0
+        max_x = track_rect.right() - handle_d - 2.0
+        handle_x = min_x + (max_x - min_x) * self._offset
+        handle_rect = QRectF(handle_x, track_rect.top() + 2.0, handle_d, handle_d)
+
+        handle_glow = QColor(state_color if self.isEnabled() else border_color)
+        handle_glow.setAlpha(96 if self.isEnabled() else 28)
+        painter.setPen(QPen(handle_glow, 2.0))
+        painter.setBrush(knob_color)
+        painter.drawEllipse(handle_rect)
+
+        inner_dot = QColor(state_color if self.isChecked() else border_color)
+        inner_dot.setAlpha(200 if self.isEnabled() else 90)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(inner_dot)
+        painter.drawEllipse(handle_rect.center(), 2.1, 2.1)
+
+
+class SkeletonShimmerWidget(QWidget):
+    """Animated skeleton placeholder used while charts or images are loading."""
+
+    def __init__(self, variant: str = "plot", parent=None):
+        super().__init__(parent)
+        self._variant = str(variant or "plot").strip().lower()
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        try:
+            self._timer.setTimerType(Qt.PreciseTimer)
+        except Exception:
+            pass
+        self._timer.timeout.connect(self._advance)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._timer.start()
+
+    def showEvent(self, event) -> None:  # noqa: D401
+        if not self._timer.isActive():
+            self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:  # noqa: D401
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def _advance(self) -> None:
+        self._phase = (self._phase + 0.028) % 1.35
+        self.update()
+
+    @staticmethod
+    def _mix_colors(first: QColor, second: QColor, ratio: float) -> QColor:
+        ratio = max(0.0, min(1.0, float(ratio)))
+        other = 1.0 - ratio
+        return QColor(
+            int(round(first.red() * ratio + second.red() * other)),
+            int(round(first.green() * ratio + second.green() * other)),
+            int(round(first.blue() * ratio + second.blue() * other)),
+            int(round(first.alpha() * ratio + second.alpha() * other)),
+        )
+
+    def _spec(self) -> list[tuple[float, float, float, float, float]]:
+        if self._variant == "image":
+            return [
+                (0.00, 0.00, 1.00, 1.00, 16.0),
+                (0.05, 0.07, 0.34, 0.06, 8.0),
+                (0.05, 0.16, 0.52, 0.04, 7.0),
+                (0.05, 0.23, 0.42, 0.04, 7.0),
+                (0.73, 0.09, 0.17, 0.17, 999.0),
+            ]
+        if self._variant == "inline":
+            return [
+                (0.00, 0.16, 0.26, 0.56, 999.0),
+                (0.30, 0.16, 0.18, 0.56, 999.0),
+                (0.52, 0.16, 0.14, 0.56, 999.0),
+            ]
+        if self._variant == "table":
+            return [
+                (0.00, 0.00, 1.00, 0.12, 12.0),
+                (0.03, 0.03, 0.18, 0.04, 8.0),
+                (0.24, 0.03, 0.10, 0.04, 8.0),
+                (0.38, 0.03, 0.08, 0.04, 8.0),
+                (0.50, 0.03, 0.10, 0.04, 8.0),
+                (0.65, 0.03, 0.16, 0.04, 8.0),
+                (0.85, 0.03, 0.10, 0.04, 8.0),
+                (0.02, 0.18, 0.96, 0.10, 10.0),
+                (0.03, 0.205, 0.28, 0.04, 8.0),
+                (0.37, 0.205, 0.10, 0.04, 8.0),
+                (0.52, 0.205, 0.16, 0.04, 8.0),
+                (0.76, 0.205, 0.16, 0.04, 8.0),
+                (0.02, 0.32, 0.96, 0.10, 10.0),
+                (0.03, 0.345, 0.34, 0.04, 8.0),
+                (0.43, 0.345, 0.12, 0.04, 8.0),
+                (0.60, 0.345, 0.11, 0.04, 8.0),
+                (0.77, 0.345, 0.15, 0.04, 8.0),
+                (0.02, 0.46, 0.96, 0.10, 10.0),
+                (0.03, 0.485, 0.25, 0.04, 8.0),
+                (0.35, 0.485, 0.14, 0.04, 8.0),
+                (0.55, 0.485, 0.18, 0.04, 8.0),
+                (0.79, 0.485, 0.13, 0.04, 8.0),
+                (0.02, 0.60, 0.96, 0.10, 10.0),
+                (0.03, 0.625, 0.31, 0.04, 8.0),
+                (0.40, 0.625, 0.10, 0.04, 8.0),
+                (0.57, 0.625, 0.15, 0.04, 8.0),
+                (0.79, 0.625, 0.14, 0.04, 8.0),
+                (0.02, 0.74, 0.96, 0.10, 10.0),
+                (0.03, 0.765, 0.22, 0.04, 8.0),
+                (0.31, 0.765, 0.18, 0.04, 8.0),
+                (0.56, 0.765, 0.13, 0.04, 8.0),
+                (0.75, 0.765, 0.17, 0.04, 8.0),
+            ]
+        return [
+            (0.00, 0.00, 0.60, 0.08, 10.0),
+            (0.00, 0.13, 0.82, 0.05, 8.0),
+            (0.00, 0.22, 0.74, 0.05, 8.0),
+            (0.00, 0.34, 1.00, 0.50, 16.0),
+            (0.05, 0.40, 0.88, 0.04, 7.0),
+            (0.05, 0.50, 0.76, 0.04, 7.0),
+            (0.05, 0.60, 0.82, 0.04, 7.0),
+            (0.05, 0.70, 0.64, 0.04, 7.0),
+            (0.00, 0.89, 0.28, 0.06, 999.0),
+            (0.32, 0.89, 0.22, 0.06, 999.0),
+        ]
+
+    def paintEvent(self, event) -> None:  # noqa: D401
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        if rect.width() <= 2 or rect.height() <= 2:
+            return
+
+        loading_bg = _theme_qcolor_from_widget(self, "loading_bg", "#162334")
+        loading_border = _theme_qcolor_from_widget(self, "loading_border", "#20506a")
+        loading_shimmer = _theme_qcolor_from_widget(self, "loading_shimmer", "#4fd8ff")
+        accent_primary = _theme_qcolor_from_widget(self, "accent_primary", "#59f3ff")
+        base_fill = self._mix_colors(loading_bg, loading_border, 0.76)
+        block_fill = self._mix_colors(loading_bg, loading_border, 0.66)
+        highlight = self._mix_colors(loading_shimmer, accent_primary, 0.60)
+
+        painter.setPen(Qt.NoPen)
+        for x_ratio, y_ratio, w_ratio, h_ratio, radius in self._spec():
+            block = QRectF(
+                rect.left() + rect.width() * x_ratio,
+                rect.top() + rect.height() * y_ratio,
+                rect.width() * w_ratio,
+                rect.height() * h_ratio,
+            )
+            if block.width() <= 1 or block.height() <= 1:
+                continue
+            rad = min(float(radius), block.width() / 2.0, block.height() / 2.0)
+            painter.setBrush(block_fill)
+            painter.drawRoundedRect(block, rad, rad)
+
+            shimmer = QLinearGradient(
+                block.left() + (block.width() * (self._phase - 0.48)),
+                block.top(),
+                block.left() + (block.width() * (self._phase + 0.22)),
+                block.bottom(),
+            )
+            left = QColor(base_fill)
+            left.setAlpha(0)
+            mid = QColor(highlight)
+            mid.setAlpha(110 if self._variant == "plot" else 92)
+            right = QColor(base_fill)
+            right.setAlpha(0)
+            shimmer.setColorAt(0.0, left)
+            shimmer.setColorAt(0.50, mid)
+            shimmer.setColorAt(1.0, right)
+            painter.setBrush(shimmer)
+            painter.drawRoundedRect(block, rad, rad)
+        painter.end()
 
     def keyPressEvent(self, event):
         """
@@ -766,22 +2316,36 @@ class CoverImageLabel(QLabel):
     """Render pixmap preserving aspect ratio, centered in available space."""
 
     resized = Signal(int, int)
+    zoomOutLimitReached = Signal()
 
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
         self._source_pixmap = QPixmap()
+        self._overlay_painter: Optional[Callable[..., None]] = None
+        self._zoom_enabled = False
+        self._zoom_factor = 1.0
+        self._zoom_min = 1.0
+        self._zoom_max = 18.0
+        self._pan_offset = QPoint(0, 0)
+        self._drag_active = False
+        self._drag_start = QPoint(0, 0)
+        self._drag_origin = QPoint(0, 0)
 
     def setPixmap(self, pixmap):  # type: ignore[override]
         if pixmap is None or pixmap.isNull():
             self._source_pixmap = QPixmap()
+            self._drag_active = False
             super().setPixmap(QPixmap())
+            self.reset_zoom()
             return
         self._source_pixmap = pixmap.copy()
         self._apply_cover_pixmap()
 
     def setText(self, text: str):  # type: ignore[override]
         self._source_pixmap = QPixmap()
+        self._drag_active = False
         super().setText(text)
+        self.reset_zoom()
 
     def resizeEvent(self, event):  # noqa: D401
         super().resizeEvent(event)
@@ -789,26 +2353,155 @@ class CoverImageLabel(QLabel):
             self._apply_cover_pixmap()
         self.resized.emit(self.width(), self.height())
 
-    def _apply_cover_pixmap(self):
-        if self._source_pixmap.isNull():
-            super().setPixmap(QPixmap())
+    def wheelEvent(self, event):  # noqa: D401
+        if not self._zoom_enabled or self._source_pixmap.isNull():
+            super().wheelEvent(event)
             return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        if delta < 0 and self._zoom_factor <= (self._zoom_min + 1e-3):
+            self.zoomOutLimitReached.emit()
+            event.accept()
+            return
+        step = float(delta) / 120.0
+        factor = 1.17 ** step
+        self.set_zoom(self._zoom_factor * factor)
+        event.accept()
+
+    def mousePressEvent(self, event):  # noqa: D401
+        if (
+            self._zoom_enabled
+            and not self._source_pixmap.isNull()
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._can_pan_current_view()
+        ):
+            self._drag_active = True
+            self._drag_start = event.position().toPoint()
+            self._drag_origin = QPoint(self._pan_offset)
+            self._update_cursor()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: D401
+        if self._drag_active and self._zoom_enabled:
+            delta = event.position().toPoint() - self._drag_start
+            self._pan_offset = self._drag_origin + delta
+            self._apply_cover_pixmap()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: D401
+        if self._drag_active and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_active = False
+            self._update_cursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):  # noqa: D401
+        if self._zoom_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self.reset_zoom()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def set_zoom_enabled(self, enabled: bool) -> None:
+        self._zoom_enabled = bool(enabled)
+        self._update_cursor()
+
+    def set_overlay_painter(self, callback: Optional[Callable[..., None]]) -> None:
+        self._overlay_painter = callback
+        if not self._source_pixmap.isNull():
+            self._apply_cover_pixmap()
+
+    def set_zoom(self, factor: float) -> None:
+        try:
+            value = float(factor)
+        except (TypeError, ValueError):
+            value = 1.0
+        value = max(self._zoom_min, min(self._zoom_max, value))
+        if abs(value - self._zoom_factor) < 1e-4:
+            return
+        self._zoom_factor = value
+        if abs(self._zoom_factor - 1.0) <= 1e-3:
+            self._pan_offset = QPoint(0, 0)
+        self._apply_cover_pixmap()
+        self._update_cursor()
+
+    def zoom_factor(self) -> float:
+        return float(self._zoom_factor)
+
+    def reset_zoom(self) -> None:
+        self._zoom_factor = 1.0
+        self._pan_offset = QPoint(0, 0)
+        if not self._source_pixmap.isNull():
+            self._apply_cover_pixmap()
+        self._update_cursor()
+
+    def _update_cursor(self) -> None:
+        if not self._zoom_enabled or self._source_pixmap.isNull() or not self._can_pan_current_view():
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        self.setCursor(Qt.CursorShape.ClosedHandCursor if self._drag_active else Qt.CursorShape.OpenHandCursor)
+
+    def _can_pan_current_view(self) -> bool:
+        if not self._zoom_enabled or self._source_pixmap.isNull():
+            return False
         w = max(1, self.width())
         h = max(1, self.height())
+        scale_target_w = max(1, int(round(w * self._zoom_factor)))
+        scale_target_h = max(1, int(round(h * self._zoom_factor)))
         scaled = self._source_pixmap.scaled(
-            w,
-            h,
+            scale_target_w,
+            scale_target_h,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
+        return abs(int(scaled.width()) - int(w)) > 1 or abs(int(scaled.height()) - int(h)) > 1
+
+    def _apply_cover_pixmap(self):
+        if self._source_pixmap.isNull():
+            super().setPixmap(QPixmap())
+            self._update_cursor()
+            return
+        w = max(1, self.width())
+        h = max(1, self.height())
+        scale_target_w = max(1, int(round(w * self._zoom_factor)))
+        scale_target_h = max(1, int(round(h * self._zoom_factor)))
+        scaled = self._source_pixmap.scaled(
+            scale_target_w,
+            scale_target_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        max_dx = max(0, abs(scaled.width() - w) // 2)
+        max_dy = max(0, abs(scaled.height() - h) // 2)
+        self._pan_offset.setX(max(-max_dx, min(max_dx, self._pan_offset.x())))
+        self._pan_offset.setY(max(-max_dy, min(max_dy, self._pan_offset.y())))
         canvas = QPixmap(w, h)
         canvas.fill(Qt.GlobalColor.transparent)
         painter = QPainter(canvas)
-        x = (w - scaled.width()) // 2
-        y = (h - scaled.height()) // 2
+        x = ((w - scaled.width()) // 2) + self._pan_offset.x()
+        y = ((h - scaled.height()) // 2) + self._pan_offset.y()
         painter.drawPixmap(x, y, scaled)
+        if self._overlay_painter is not None:
+            try:
+                # Preferred signature:
+                # overlay(painter, widget_w, widget_h, image_x, image_y, image_w, image_h)
+                self._overlay_painter(painter, w, h, x, y, scaled.width(), scaled.height())
+            except TypeError:
+                try:
+                    self._overlay_painter(painter, w, h)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         painter.end()
         super().setPixmap(canvas)
+        self._update_cursor()
 
 
 def _normalized_css_color(value: object) -> str:
@@ -821,6 +2514,13 @@ def _normalized_css_color(value: object) -> str:
     return color.name().lower()
 
 
+def _swatch_text_color(value: object, *, dark: str = "#f6fbff", light: str = "#101720") -> str:
+    color = QColor(str(value or ""))
+    if not color.isValid():
+        return dark
+    return dark if color.lightnessF() < 0.60 else light
+
+
 class NoSelectBackgroundDelegate(QStyledItemDelegate):
     """Delegate that preserves model background for the target-name column when selected."""
     def paint(self, painter, option, index):
@@ -829,6 +2529,196 @@ class NoSelectBackgroundDelegate(QStyledItemDelegate):
             option.state &= ~QStyle.State_Selected
         super().paint(painter, option, index)
 
+
+class TargetTableGlowDelegate(QStyledItemDelegate):
+    """Custom paint for the main targets table with visible status tint and subtle neon text glow."""
+
+    @staticmethod
+    def _brush_to_color(value: object) -> QColor:
+        if isinstance(value, QBrush):
+            return QColor(value.color())
+        if isinstance(value, QColor):
+            return QColor(value)
+        return QColor()
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        model = index.model()
+        color_mode = str(getattr(model, "color_mode", "text_glow") or "text_glow").strip().lower()
+        if color_mode not in {"background", "text_glow"}:
+            color_mode = "text_glow"
+
+        cell_rect = opt.rect.adjusted(0, 0, -1, -1)
+        bg_color = self._brush_to_color(index.data(Qt.BackgroundRole))
+        fg_color = self._brush_to_color(index.data(Qt.ForegroundRole))
+        if not fg_color.isValid():
+            fg_color = _theme_qcolor_from_widget(widget, "base_text", "#f6fbff")
+        if not bg_color.isValid():
+            if color_mode == "text_glow" and index.row() % 2 == 1:
+                bg_color = _theme_qcolor_from_widget(widget, "table_surface_alt", "#101a28")
+            else:
+                bg_color = _theme_qcolor_from_widget(widget, "table_surface", "#0e1622")
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        painter.fillRect(cell_rect, bg_color)
+
+        if opt.state & QStyle.State_Selected:
+            overlay = _theme_qcolor_from_widget(widget, "table_sel_bg", "#163455")
+            overlay.setAlpha(52 if bg_color.alpha() >= 140 else 96)
+            painter.fillRect(cell_rect, overlay)
+            border = _theme_qcolor_from_widget(widget, "accent_primary", "#59f3ff")
+            border.setAlpha(132)
+            painter.setPen(QPen(border, 1))
+            painter.drawRect(cell_rect)
+
+        draw_opt = QStyleOptionViewItem(opt)
+        draw_opt.text = ""
+        draw_opt.icon = QIcon()
+        if draw_opt.state & QStyle.State_Selected:
+            draw_opt.state &= ~QStyle.State_Selected
+        style.drawControl(QStyle.CE_ItemViewItem, draw_opt, painter, widget)
+
+        text = str(index.data(Qt.DisplayRole) or "")
+        if text:
+            draw_font = QFont(draw_opt.font)
+            if color_mode == "text_glow":
+                draw_font.setWeight(QFont.Weight.DemiBold if not (opt.state & QStyle.State_Selected) else QFont.Weight.Bold)
+            painter.setFont(draw_font)
+            draw_opt.font = draw_font
+            text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, draw_opt, widget)
+            if not text_rect.isValid():
+                text_rect = cell_rect.adjusted(8, 0, -8, 0)
+            text_rect = text_rect.adjusted(2, 0, -2, 0)
+            alignment = index.data(Qt.TextAlignmentRole)
+            flags = int(alignment) if alignment is not None else int(Qt.AlignLeft | Qt.AlignVCenter)
+            flags |= int(Qt.TextSingleLine)
+            elided = QFontMetrics(draw_font).elidedText(text, Qt.ElideRight, max(10, text_rect.width()))
+
+            if color_mode == "text_glow":
+                glow = QColor(fg_color)
+                if not glow.isValid():
+                    glow = _theme_qcolor_from_widget(widget, "accent_primary", "#59f3ff")
+                glow.setAlpha(92 if (opt.state & QStyle.State_Selected) else 70)
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.setPen(glow)
+                    painter.drawText(text_rect.translated(dx, dy), flags, elided)
+            else:
+                glow = QColor(bg_color)
+                if not glow.isValid() or glow.alpha() <= 0:
+                    glow = _theme_qcolor_from_widget(widget, "accent_primary", "#59f3ff")
+                glow.setAlpha(118 if (opt.state & QStyle.State_Selected) else 82)
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.setPen(glow)
+                    painter.drawText(text_rect.translated(dx, dy), flags, elided)
+
+            painter.setPen(fg_color)
+            painter.drawText(text_rect, flags, elided)
+
+        painter.restore()
+
+
+class SuggestedTargetsDelegate(QStyledItemDelegate):
+    """Custom paint for Suggested Targets so row hover and Add action stay visually obvious."""
+
+    @staticmethod
+    def _brush_to_color(value: object) -> QColor:
+        if isinstance(value, QBrush):
+            return QColor(value.color())
+        if isinstance(value, QColor):
+            return QColor(value)
+        return QColor()
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        model = index.model()
+        row = index.row()
+
+        cell_rect = opt.rect.adjusted(0, 0, -1, -1)
+        bg_color = self._brush_to_color(index.data(Qt.BackgroundRole))
+        fg_color = self._brush_to_color(index.data(Qt.ForegroundRole))
+        if not bg_color.isValid():
+            if index.row() % 2 == 1:
+                bg_color = _theme_qcolor_from_widget(widget, "table_alt", "#131a28")
+            else:
+                bg_color = _theme_qcolor_from_widget(widget, "table_bg", "#0f1722")
+        if not fg_color.isValid():
+            fg_color = _theme_qcolor_from_widget(widget, "base_text", "#f6fbff")
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(cell_rect, bg_color)
+
+        if opt.state & QStyle.State_Selected:
+            overlay = _theme_qcolor_from_widget(widget, "table_sel_bg", "#163455")
+            overlay.setAlpha(56 if bg_color.alpha() >= 140 else 96)
+            painter.fillRect(cell_rect, overlay)
+
+        draw_opt = QStyleOptionViewItem(opt)
+        draw_opt.text = ""
+        draw_opt.icon = QIcon()
+        if draw_opt.state & QStyle.State_Selected:
+            draw_opt.state &= ~QStyle.State_Selected
+        style.drawControl(QStyle.CE_ItemViewItem, draw_opt, painter, widget)
+
+        text = str(index.data(Qt.DisplayRole) or "")
+        if text:
+            draw_font = QFont(index.data(Qt.FontRole) or draw_opt.font)
+            painter.setFont(draw_font)
+            text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, draw_opt, widget)
+            if not text_rect.isValid():
+                text_rect = cell_rect.adjusted(8, 0, -8, 0)
+            text_rect = text_rect.adjusted(2, 0, -2, 0)
+            alignment = index.data(Qt.TextAlignmentRole)
+            flags = int(alignment) if alignment is not None else int(Qt.AlignLeft | Qt.AlignVCenter)
+            flags |= int(Qt.TextSingleLine)
+            elided = QFontMetrics(draw_font).elidedText(text, Qt.ElideRight, max(10, text_rect.width()))
+            hover_glow_color = _theme_qcolor_from_widget(widget, "button_hover_glow", "#ff7ecf")
+            row_hover_glow = row == getattr(model, "_hover_row", None)
+            name_hover_glow = index.column() == getattr(model, "COL_NAME", -1) and row == getattr(model, "_hover_name_row", None)
+            action_hover_glow = index.column() == getattr(model, "COL_ACTION", -1) and row == getattr(model, "_hover_action_row", None)
+
+            col_action = getattr(model, "COL_ACTION", -1)
+            if index.column() == col_action and text == "Add":
+                action_color = _theme_qcolor_from_widget(widget, "state_success", "#53f58a")
+                glow = QColor(action_color)
+                glow.setAlpha(84)
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.setPen(glow)
+                    painter.drawText(text_rect.translated(dx, dy), flags, elided)
+                fg_color = action_color
+                if action_hover_glow:
+                    strong_glow = QColor(action_color)
+                    strong_glow.setAlpha(120)
+                    for dx, dy in (
+                        (-2, 0), (2, 0), (0, -2), (0, 2),
+                        (-1, -1), (-1, 1), (1, -1), (1, 1),
+                    ):
+                        painter.setPen(strong_glow)
+                        painter.drawText(text_rect.translated(dx, dy), flags, elided)
+
+            if row_hover_glow or name_hover_glow:
+                text_glow = QColor(fg_color if name_hover_glow else hover_glow_color)
+                text_glow.setAlpha(78 if name_hover_glow else 56)
+                for dx, dy in (
+                    (-1, 0), (1, 0), (0, -1), (0, 1),
+                    (-1, -1), (-1, 1), (1, -1), (1, 1),
+                ):
+                    painter.setPen(text_glow)
+                    painter.drawText(text_rect.translated(dx, dy), flags, elided)
+
+            painter.setPen(fg_color)
+            painter.drawText(text_rect, flags, elided)
+
+        painter.restore()
+
 # --- Table Settings Dialog ---
 class TableSettingsDialog(QDialog):
     """Dialog to configure table parameters."""
@@ -836,40 +2726,86 @@ class TableSettingsDialog(QDialog):
         super().__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("Table Settings")
-        layout = QFormLayout(self)
-        # Row height
+        root_layout = QVBoxLayout(self)
+        tabs = _configure_tab_widget(QTabWidget(self))
+        root_layout.addWidget(tabs, 1)
+
+        appearance_tab = QWidget(self)
+        appearance_layout = QFormLayout(appearance_tab)
+        columns_tab = QWidget(self)
+        columns_layout = QVBoxLayout(columns_tab)
+        colors_tab = QWidget(self)
+        colors_layout = QFormLayout(colors_tab)
+
+        tabs.addTab(appearance_tab, "Appearance")
+        tabs.addTab(columns_tab, "Columns")
+        tabs.addTab(colors_tab, "Colors")
+
+        appearance_hint = QLabel(
+            "Tune how the main targets table looks without changing the overall app theme.",
+            appearance_tab,
+        )
+        appearance_hint.setObjectName("SectionHint")
+        appearance_hint.setWordWrap(True)
+        appearance_layout.addRow(appearance_hint)
+
         self.row_height_spin = QSpinBox(self)
         self.row_height_spin.setRange(10, 100)
         init_h = parent.settings.value("table/rowHeight", 24, type=int) if parent and hasattr(parent, "settings") else 24
         self.row_height_spin.setValue(init_h)
-        layout.addRow("Row height:", self.row_height_spin)
-        # Name-column width
+        appearance_layout.addRow("Row height:", self.row_height_spin)
+
         self.first_col_width_spin = QSpinBox(self)
         self.first_col_width_spin.setRange(50, 500)
         init_w = parent.settings.value("table/firstColumnWidth", 100, type=int) if parent and hasattr(parent, "settings") else 100
         self.first_col_width_spin.setValue(init_w)
-        layout.addRow("Name column width:", self.first_col_width_spin)
+        appearance_layout.addRow("Name column min width:", self.first_col_width_spin)
 
-        # Font size
         self.font_spin = QSpinBox(self)
         self.font_spin.setRange(8, 16)
         init_fs = parent.settings.value("table/fontSize", 11, type=int) if parent and hasattr(parent, "settings") else 11
         self.font_spin.setValue(init_fs)
-        layout.addRow("Font size:", self.font_spin)
+        appearance_layout.addRow("Font size:", self.font_spin)
 
-        # Column visibility
+        self.color_mode_combo = QComboBox(self)
+        self.color_mode_combo.addItem("Colored background", "background")
+        self.color_mode_combo.addItem("Colored text + glow", "text_glow")
+        init_color_mode = (
+            str(parent.settings.value("table/colorMode", "text_glow", type=str) or "text_glow")
+            if parent and hasattr(parent, "settings")
+            else "text_glow"
+        ).strip().lower()
+        if init_color_mode not in {"background", "text_glow"}:
+            init_color_mode = "text_glow"
+        color_mode_idx = self.color_mode_combo.findData(init_color_mode)
+        if color_mode_idx >= 0:
+            self.color_mode_combo.setCurrentIndex(color_mode_idx)
+        appearance_layout.addRow("Status color mode:", self.color_mode_combo)
+
         self.col_checks = {}
+        columns_hint = QLabel(
+            "Choose which columns are visible in the main targets table.",
+            columns_tab,
+        )
+        columns_hint.setObjectName("SectionHint")
+        columns_hint.setWordWrap(True)
+        columns_layout.addWidget(columns_hint)
+        columns_grid = QGridLayout()
+        columns_grid.setContentsMargins(0, 0, 0, 0)
+        columns_grid.setHorizontalSpacing(16)
+        columns_grid.setVerticalSpacing(8)
         if parent is not None and hasattr(parent, "table_model"):
             for idx, lbl in enumerate(parent.table_model.headers[:-1]):
                 chk = QCheckBox(lbl, self)
                 val = parent.settings.value(f"table/col{idx}", True, type=bool) if parent and hasattr(parent, "settings") else True
                 chk.setChecked(val)
-                layout.addRow(f"Show {lbl}:", chk)
                 self.col_checks[idx] = chk
+                pos = len(self.col_checks) - 1
+                columns_grid.addWidget(chk, pos // 2, pos % 2)
+        columns_layout.addLayout(columns_grid)
+        columns_layout.addStretch(1)
 
-        # Default sort column
         self.sort_combo = QComboBox(self)
-        # Populate with column headers
         headers = parent.table_model.headers if parent and hasattr(parent, "table_model") else []
         self.sort_combo.addItems(headers)
         init_sort = (
@@ -877,47 +2813,96 @@ class TableSettingsDialog(QDialog):
             if parent and hasattr(parent, "settings")
             else TargetTableModel.COL_SCORE
         )
-        # Clamp to valid range
         if 0 <= init_sort < len(headers):
             self.sort_combo.setCurrentIndex(init_sort)
-        layout.addRow("Default sort column:", self.sort_combo)
+        appearance_layout.addRow("Default sort column:", self.sort_combo)
 
-        # Highlight colors
-        default_colors = {"below":"#ff8080","limit":"#ffff80","above":"#b3ffb3"}
+        active_theme = getattr(parent, "_theme_name", DEFAULT_UI_THEME) if parent is not None else DEFAULT_UI_THEME
+        active_dark = bool(getattr(parent, "_dark_enabled", False)) if parent is not None else False
+        highlight_defaults = highlight_palette_for_theme(
+            active_theme,
+            dark_enabled=active_dark,
+            color_blind=bool(getattr(parent, "color_blind_mode", False)) if parent is not None else False,
+        )
+        default_colors = {
+            "below": highlight_defaults.below,
+            "limit": highlight_defaults.limit,
+            "above": highlight_defaults.above,
+        }
         self.selected_colors: dict[str, str] = {}
-        def _pick_color(key, btn):
-            col = QColorDialog.getColor(
-                QColor(self.selected_colors.get(key, default_colors[key])),
-                self,
-                f"Pick {key} color",
+        colors_hint = QLabel(
+            "These three colors drive object status tinting in both table color modes.",
+            colors_tab,
+        )
+        colors_hint.setObjectName("SectionHint")
+        colors_hint.setWordWrap(True)
+        colors_layout.addRow(colors_hint)
+        for key, label in (("below", "Below limit"), ("limit", "Near limit"), ("above", "Above limit")):
+            btn = QPushButton(self)
+            init = (
+                _resolve_table_highlight_color(getattr(parent, "settings", None), key, default_colors[key])
+                if parent is not None
+                else default_colors[key]
             )
-            if col.isValid():
-                btn.setStyleSheet(f"background:{col.name()}")
-                self.selected_colors[key] = col.name()
-        for key in ("below","limit","above"):
-            btn = QPushButton(f"{key.capitalize()} highlight", self)
-            init = parent.settings.value(f"table/color/{key}", default_colors[key]) if parent and hasattr(parent, "settings") else default_colors[key]
             self.selected_colors[key] = str(init)
-            btn.setStyleSheet(f"background:{init}")
-            btn.clicked.connect(lambda _,k=key,b=btn: _pick_color(k,b))
-            layout.addRow(f"{key.capitalize()} color:", btn)
+            btn.clicked.connect(lambda _, k=key: self._pick_status_color(k))
             setattr(self, f"{key}_btn", btn)
+            self._refresh_status_color_button(key, label)
+            colors_layout.addRow(f"{label}:", btn)
 
-        # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply, self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        _style_dialog_button_box(buttons)
         apply_btn = buttons.button(QDialogButtonBox.Apply)
         if apply_btn is not None:
             apply_btn.clicked.connect(self._apply_changes)
-        layout.addWidget(buttons)
-        self.setMinimumWidth(max(420, self.sizeHint().width()))
+        root_layout.addWidget(buttons)
+        _fit_dialog_to_screen(
+            self,
+            preferred_width=860,
+            preferred_height=640,
+            min_width=620,
+            min_height=460,
+        )
+
+    def _refresh_status_color_button(self, key: str, label: str) -> None:
+        btn = getattr(self, f"{key}_btn", None)
+        if not isinstance(btn, QPushButton):
+            return
+        color = str(self.selected_colors.get(key, "") or "")
+        text_color = _swatch_text_color(color)
+        btn.setText(f"{label}  {color.upper()}")
+        btn.setStyleSheet(
+            f"background:{color}; color:{text_color}; border:1px solid {color}; font-weight:700; text-align:left; padding:6px 10px;"
+        )
+
+    def _pick_status_color(self, key: str) -> None:
+        active_theme = getattr(self.parent(), "_theme_name", DEFAULT_UI_THEME) if self.parent() is not None else DEFAULT_UI_THEME
+        active_dark = bool(getattr(self.parent(), "_dark_enabled", False)) if self.parent() is not None else False
+        palette = highlight_palette_for_theme(
+            active_theme,
+            dark_enabled=active_dark,
+            color_blind=bool(getattr(self.parent(), "color_blind_mode", False)) if self.parent() is not None else False,
+        )
+        defaults = {"below": palette.below, "limit": palette.limit, "above": palette.above}
+        chosen = QColorDialog.getColor(
+            QColor(self.selected_colors.get(key, defaults[key])),
+            self,
+            f"Pick {key} color",
+        )
+        if not chosen.isValid():
+            return
+        self.selected_colors[key] = chosen.name().lower()
+        label = {"below": "Below limit", "limit": "Near limit", "above": "Above limit"}[key]
+        self._refresh_status_color_button(key, label)
 
     def _apply_changes(self):
         s = self.parent().settings
         s.setValue("table/rowHeight", self.row_height_spin.value())
         s.setValue("table/firstColumnWidth", self.first_col_width_spin.value())
         s.setValue("table/fontSize", self.font_spin.value())
+        s.setValue("table/colorMode", str(self.color_mode_combo.currentData() or "text_glow"))
         for idx, chk in self.col_checks.items():
             s.setValue(f"table/col{idx}", chk.isChecked())
         for key in ("below","limit","above"):
@@ -933,18 +2918,19 @@ class TableSettingsDialog(QDialog):
 # --- General Settings Dialog ---
 class GeneralSettingsDialog(QDialog):
     """Configure default site, date, samples & clock refresh."""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_tab: Optional[str] = None):
         super().__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("General Settings")
         self._original_dark_mode = (
-            parent.settings.value("general/darkMode", False, type=bool)
+            parent.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
             if parent and hasattr(parent, "settings")
-            else False
+            else DEFAULT_DARK_MODE
         )
         root_layout = QVBoxLayout(self)
-        tabs = QTabWidget(self)
-        tabs.setDocumentMode(True)
+        tabs = _configure_tab_widget(QTabWidget(self))
+        self.tabs = tabs
+        self._tab_indices: dict[str, int] = {}
         root_layout.addWidget(tabs)
 
         def _make_tab(title: str) -> QFormLayout:
@@ -954,13 +2940,16 @@ class GeneralSettingsDialog(QDialog):
             form.setContentsMargins(12, 12, 12, 12)
             form.setSpacing(10)
             tabs.addTab(page, title)
+            self._tab_indices[title.lower()] = tabs.count() - 1
             return form
 
         general_layout = _make_tab("General")
         cutout_layout = _make_tab("Cutout")
+        quick_targets_layout = _make_tab("Quick Targets")
+        seestar_layout = _make_tab("Seestar")
         ai_layout = _make_tab("AI")
         integrations_layout = _make_tab("Integrations")
-        plot_layout = _make_tab("Plot")
+        weather_layout = _make_tab("Weather")
 
         # Default Observatory
         self.site_combo = QComboBox(self)
@@ -1000,14 +2989,37 @@ class GeneralSettingsDialog(QDialog):
 
         self.dark_mode_chk = QCheckBox("Enable dark mode", self)
         self.dark_mode_chk.setChecked(
-            parent.settings.value("general/darkMode", False, type=bool)
+            parent.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
             if parent and hasattr(parent, "settings")
-            else False
+            else DEFAULT_DARK_MODE
         )
         self.dark_mode_chk.toggled.connect(self._preview_dark_mode)
         if parent and hasattr(parent, "darkModeChanged"):
             parent.darkModeChanged.connect(self._sync_dark_mode_checkbox)
         general_layout.addRow(self.dark_mode_chk)
+
+        self._accent_secondary_colors: dict[str, str] = {}
+        for key, _label in THEME_CHOICES:
+            normalized = normalize_theme_key(key)
+            if parent and hasattr(parent, "_load_accent_secondary_override"):
+                self._accent_secondary_colors[normalized] = str(parent._load_accent_secondary_override(normalized) or "")
+            else:
+                self._accent_secondary_colors[normalized] = ""
+        self._accent_secondary_color = self._accent_secondary_colors.get(init_theme, "")
+        accent_row = QWidget(self)
+        accent_layout = QHBoxLayout(accent_row)
+        accent_layout.setContentsMargins(0, 0, 0, 0)
+        accent_layout.setSpacing(8)
+        self.accent_secondary_btn = QPushButton(accent_row)
+        self.accent_secondary_btn.clicked.connect(self._pick_accent_secondary_color)
+        self.accent_secondary_reset_btn = QPushButton("Theme default", accent_row)
+        _set_button_variant(self.accent_secondary_reset_btn, "ghost")
+        self.accent_secondary_reset_btn.clicked.connect(self._reset_accent_secondary_color)
+        accent_layout.addWidget(self.accent_secondary_btn, 1)
+        accent_layout.addWidget(self.accent_secondary_reset_btn, 0)
+        general_layout.addRow("Pink accent:", accent_row)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_selection_changed)
+        self._refresh_accent_secondary_controls()
 
         # Cutout defaults
         self.cutout_view_combo = QComboBox(self)
@@ -1063,6 +3075,152 @@ class GeneralSettingsDialog(QDialog):
         cutout_layout.addRow("Cutout FOV:", self.cutout_fov_spin)
         cutout_layout.addRow("Cutout size:", self.cutout_size_spin)
 
+        quick_hdr = QLabel("Configure how the Quick Targets button builds and filters candidates.")
+        quick_hdr.setObjectName("SectionHint")
+        quick_hdr.setWordWrap(True)
+        quick_targets_layout.addRow(quick_hdr)
+
+        self.quick_targets_count_spin = QSpinBox(self)
+        self.quick_targets_count_spin.setRange(QUICK_TARGETS_MIN_COUNT, QUICK_TARGETS_MAX_COUNT)
+        self.quick_targets_count_spin.setValue(
+            max(
+                QUICK_TARGETS_MIN_COUNT,
+                min(
+                    QUICK_TARGETS_MAX_COUNT,
+                    parent.settings.value("general/quickTargetsCount", QUICK_TARGETS_DEFAULT_COUNT, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else QUICK_TARGETS_DEFAULT_COUNT,
+                ),
+            )
+        )
+        quick_targets_layout.addRow("Targets to add:", self.quick_targets_count_spin)
+
+        self.quick_targets_min_importance_spin = QDoubleSpinBox(self)
+        self.quick_targets_min_importance_spin.setRange(0.0, 10.0)
+        self.quick_targets_min_importance_spin.setDecimals(1)
+        self.quick_targets_min_importance_spin.setSingleStep(0.5)
+        self.quick_targets_min_importance_spin.setValue(
+            parent.settings.value("general/quickTargetsMinImportance", BHTOM_SUGGESTION_MIN_IMPORTANCE, type=float)
+            if parent and hasattr(parent, "settings")
+            else BHTOM_SUGGESTION_MIN_IMPORTANCE
+        )
+        quick_targets_layout.addRow("Min importance:", self.quick_targets_min_importance_spin)
+
+        self.quick_targets_use_score_filter_chk = QCheckBox("Respect current Score ≥ filter", self)
+        self.quick_targets_use_score_filter_chk.setChecked(
+            parent.settings.value("general/quickTargetsUseScoreFilter", True, type=bool)
+            if parent and hasattr(parent, "settings")
+            else True
+        )
+        quick_targets_layout.addRow(self.quick_targets_use_score_filter_chk)
+
+        self.quick_targets_use_moon_filter_chk = QCheckBox("Respect current Moon Sep ≥ filter", self)
+        self.quick_targets_use_moon_filter_chk.setChecked(
+            parent.settings.value("general/quickTargetsUseMoonFilter", True, type=bool)
+            if parent and hasattr(parent, "settings")
+            else True
+        )
+        quick_targets_layout.addRow(self.quick_targets_use_moon_filter_chk)
+
+        self.quick_targets_use_limiting_mag_chk = QCheckBox("Apply observatory limiting magnitude", self)
+        self.quick_targets_use_limiting_mag_chk.setChecked(
+            parent.settings.value("general/quickTargetsUseLimitingMag", True, type=bool)
+            if parent and hasattr(parent, "settings")
+            else True
+        )
+        self.quick_targets_use_limiting_mag_chk.setToolTip(
+            "If enabled, targets with known magnitude above the current observatory limit are skipped."
+        )
+        quick_targets_layout.addRow(self.quick_targets_use_limiting_mag_chk)
+
+        seestar_hdr = QLabel(
+            "Configure only the external Seestar ALP connection here. Session templates, target plan defaults and capture settings are configured from Seestar Session…",
+            self,
+        )
+        seestar_hdr.setObjectName("SectionHint")
+        seestar_hdr.setWordWrap(True)
+        seestar_layout.addRow(seestar_hdr)
+
+        self.seestar_alp_base_url_edit = QLineEdit(self)
+        self.seestar_alp_base_url_edit.setPlaceholderText(SEESTAR_ALP_DEFAULT_BASE_URL)
+        self.seestar_alp_base_url_edit.setText(
+            parent.settings.value("general/seestarAlpBaseUrl", SEESTAR_ALP_DEFAULT_BASE_URL, type=str)
+            if parent and hasattr(parent, "settings")
+            else SEESTAR_ALP_DEFAULT_BASE_URL
+        )
+        seestar_layout.addRow("ALP base URL:", self.seestar_alp_base_url_edit)
+
+        self.seestar_alp_device_spin = QSpinBox(self)
+        self.seestar_alp_device_spin.setRange(0, 16)
+        self.seestar_alp_device_spin.setValue(
+            max(
+                0,
+                int(
+                    parent.settings.value("general/seestarAlpDeviceNum", SEESTAR_ALP_DEFAULT_DEVICE_NUM, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else SEESTAR_ALP_DEFAULT_DEVICE_NUM
+                ),
+            )
+        )
+        seestar_layout.addRow("ALP device #:", self.seestar_alp_device_spin)
+
+        self.seestar_alp_client_id_spin = QSpinBox(self)
+        self.seestar_alp_client_id_spin.setRange(1, 999999)
+        self.seestar_alp_client_id_spin.setValue(
+            max(
+                1,
+                int(
+                    parent.settings.value("general/seestarAlpClientId", SEESTAR_ALP_DEFAULT_CLIENT_ID, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else SEESTAR_ALP_DEFAULT_CLIENT_ID
+                ),
+            )
+        )
+        seestar_layout.addRow("ALP client ID:", self.seestar_alp_client_id_spin)
+
+        self.seestar_alp_timeout_spin = QDoubleSpinBox(self)
+        self.seestar_alp_timeout_spin.setRange(1.0, 60.0)
+        self.seestar_alp_timeout_spin.setDecimals(1)
+        self.seestar_alp_timeout_spin.setSingleStep(0.5)
+        self.seestar_alp_timeout_spin.setSuffix(" s")
+        self.seestar_alp_timeout_spin.setValue(
+            max(
+                1.0,
+                float(
+                    parent.settings.value("general/seestarAlpTimeoutSec", SEESTAR_ALP_DEFAULT_TIMEOUT_S, type=float)
+                    if parent and hasattr(parent, "settings")
+                    else SEESTAR_ALP_DEFAULT_TIMEOUT_S
+                ),
+            )
+        )
+        seestar_layout.addRow("ALP timeout:", self.seestar_alp_timeout_spin)
+
+        seestar_btn_row = QWidget(self)
+        seestar_btn_layout = QHBoxLayout(seestar_btn_row)
+        seestar_btn_layout.setContentsMargins(0, 0, 0, 0)
+        seestar_btn_layout.setSpacing(8)
+
+        self.seestar_alp_test_btn = QPushButton("Test ALP connection", seestar_btn_row)
+        self.seestar_alp_test_btn.clicked.connect(self._test_seestar_alp_connection)
+        seestar_btn_layout.addWidget(self.seestar_alp_test_btn, 0)
+
+        self.seestar_alp_open_ui_btn = QPushButton("Open ALP Web UI", seestar_btn_row)
+        self.seestar_alp_open_ui_btn.clicked.connect(self._open_seestar_alp_web_ui)
+        seestar_btn_layout.addWidget(self.seestar_alp_open_ui_btn, 0)
+        seestar_btn_layout.addStretch(1)
+        seestar_layout.addRow("", seestar_btn_row)
+        self.seestar_alp_status_label = QLabel(
+            render_alp_backend_status_text(
+                None,
+                base_url=self.seestar_alp_base_url_edit.text().strip() or SEESTAR_ALP_DEFAULT_BASE_URL,
+                device_num=int(self.seestar_alp_device_spin.value()),
+            ),
+            self,
+        )
+        self.seestar_alp_status_label.setObjectName("SectionHint")
+        self.seestar_alp_status_label.setWordWrap(True)
+        seestar_layout.addRow("ALP status:", self.seestar_alp_status_label)
+
         # Local LLM defaults
         self.llm_url_edit = QLineEdit(self)
         self.llm_url_edit.setPlaceholderText(LLMConfig.DEFAULT_URL)
@@ -1078,12 +3236,112 @@ class GeneralSettingsDialog(QDialog):
             if parent and hasattr(parent, "settings")
             else LLMConfig.DEFAULT_MODEL
         )
+        self.llm_timeout_spin = QSpinBox(self)
+        self.llm_timeout_spin.setRange(15, 900)
+        self.llm_timeout_spin.setSingleStep(15)
+        self.llm_timeout_spin.setSuffix(" s")
+        self.llm_timeout_spin.setValue(
+            max(
+                15,
+                int(
+                    parent.settings.value("llm/timeoutSec", LLMConfig.DEFAULT_TIMEOUT_S, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else LLMConfig.DEFAULT_TIMEOUT_S
+                ),
+            )
+        )
+        self.llm_max_tokens_spin = QSpinBox(self)
+        self.llm_max_tokens_spin.setRange(32, 2048)
+        self.llm_max_tokens_spin.setSingleStep(32)
+        self.llm_max_tokens_spin.setSuffix(" tok")
+        self.llm_max_tokens_spin.setValue(
+            max(
+                32,
+                int(
+                    parent.settings.value("llm/maxTokens", LLMConfig.DEFAULT_MAX_TOKENS, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else LLMConfig.DEFAULT_MAX_TOKENS
+                ),
+            )
+        )
+        self.llm_chat_font_spin = QSpinBox(self)
+        self.llm_chat_font_spin.setRange(9, 24)
+        self.llm_chat_font_spin.setSingleStep(1)
+        self.llm_chat_font_spin.setSuffix(" pt")
+        self.llm_chat_font_spin.setValue(
+            max(
+                9,
+                int(
+                    parent.settings.value("llm/chatFontSizePt", LLMConfig.DEFAULT_CHAT_FONT_PT, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else LLMConfig.DEFAULT_CHAT_FONT_PT
+                ),
+            )
+        )
+        self.llm_chat_spacing_combo = QComboBox(self)
+        for key, label in AI_CHAT_SPACING_CHOICES:
+            self.llm_chat_spacing_combo.addItem(label, key)
+        init_chat_spacing = (
+            parent.settings.value("llm/chatSpacing", LLMConfig.DEFAULT_CHAT_SPACING, type=str)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_CHAT_SPACING
+        )
+        idx = self.llm_chat_spacing_combo.findData(str(init_chat_spacing))
+        if idx >= 0:
+            self.llm_chat_spacing_combo.setCurrentIndex(idx)
 
-        llm_hdr = QLabel("Local AI assistant (optional)")
+        self.llm_chat_tint_combo = QComboBox(self)
+        for key, label in AI_CHAT_TINT_CHOICES:
+            self.llm_chat_tint_combo.addItem(label, key)
+        init_chat_tint = (
+            parent.settings.value("llm/chatTintStrength", LLMConfig.DEFAULT_CHAT_TINT_STRENGTH, type=str)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_CHAT_TINT_STRENGTH
+        )
+        idx = self.llm_chat_tint_combo.findData(str(init_chat_tint))
+        if idx >= 0:
+            self.llm_chat_tint_combo.setCurrentIndex(idx)
+
+        self.llm_chat_width_combo = QComboBox(self)
+        for key, label in AI_CHAT_WIDTH_CHOICES:
+            self.llm_chat_width_combo.addItem(label, key)
+        init_chat_width = (
+            parent.settings.value("llm/chatMessageWidth", LLMConfig.DEFAULT_CHAT_WIDTH, type=str)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_CHAT_WIDTH
+        )
+        idx = self.llm_chat_width_combo.findData(str(init_chat_width))
+        if idx >= 0:
+            self.llm_chat_width_combo.setCurrentIndex(idx)
+
+        self.llm_status_error_clear_spin = QSpinBox(self)
+        self.llm_status_error_clear_spin.setRange(0, 60)
+        self.llm_status_error_clear_spin.setSingleStep(1)
+        self.llm_status_error_clear_spin.setSuffix(" s")
+        self.llm_status_error_clear_spin.setSpecialValueText("Off")
+        self.llm_status_error_clear_spin.setValue(
+            max(
+                0,
+                int(
+                    parent.settings.value("llm/statusErrorClearSec", LLMConfig.DEFAULT_STATUS_ERROR_CLEAR_S, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else LLMConfig.DEFAULT_STATUS_ERROR_CLEAR_S
+                ),
+            )
+        )
+
+        llm_hdr = QLabel("Local LLM assistant (optional)")
         llm_hdr.setObjectName("SectionHint")
         ai_layout.addRow(llm_hdr)
         ai_layout.addRow("LLM server URL:", self.llm_url_edit)
         ai_layout.addRow("LLM model:", self.llm_model_edit)
+        ai_layout.addRow("LLM timeout:", self.llm_timeout_spin)
+        ai_layout.addRow("LLM max tokens:", self.llm_max_tokens_spin)
+        ai_layout.addRow("AI chat font size:", self.llm_chat_font_spin)
+        ai_layout.addRow("Chat spacing:", self.llm_chat_spacing_combo)
+        ai_layout.addRow("Bubble tint strength:", self.llm_chat_tint_combo)
+        ai_layout.addRow("Message width:", self.llm_chat_width_combo)
+        ai_layout.addRow("Auto-clear AI warnings:", self.llm_status_error_clear_spin)
 
         # BHTOM credentials (optional, used for Suggest Targets)
         self.bhtom_api_edit = QLineEdit(self)
@@ -1134,32 +3392,198 @@ class GeneralSettingsDialog(QDialog):
         integrations_layout.addRow("TNS endpoint:", self.tns_endpoint_combo)
         integrations_layout.addRow("", self.tns_test_btn)
 
+        weather_hdr = QLabel("Weather workspace defaults")
+        weather_hdr.setObjectName("SectionHint")
+        weather_layout.addRow(weather_hdr)
+
+        self.weather_default_source_combo = QComboBox(self)
+        weather_sources = [
+            ("average", "Average (all live sources)"),
+            ("open_meteo", "Open-Meteo"),
+            ("metar", "Nearest METAR"),
+            ("custom", "Custom URL"),
+            ("meteoblue", "meteoblue"),
+            ("windy", "Windy"),
+            ("meteo_icm", "Meteo ICM"),
+        ]
+        for key, label in weather_sources:
+            self.weather_default_source_combo.addItem(label, key)
+        init_weather_source = (
+            parent.settings.value("weather/defaultConditionsSource", "average", type=str)
+            if parent and hasattr(parent, "settings")
+            else "average"
+        )
+        source_idx = self.weather_default_source_combo.findData(str(init_weather_source))
+        if source_idx >= 0:
+            self.weather_default_source_combo.setCurrentIndex(source_idx)
+        weather_layout.addRow("Default conditions source:", self.weather_default_source_combo)
+
+        self.weather_refresh_spin = QSpinBox(self)
+        self.weather_refresh_spin.setRange(30, 1800)
+        self.weather_refresh_spin.setSuffix(" s")
+        self.weather_refresh_spin.setValue(
+            max(
+                30,
+                min(
+                    1800,
+                    parent.settings.value("weather/autoRefreshSec", 120, type=int)
+                    if parent and hasattr(parent, "settings")
+                    else 120,
+                ),
+            )
+        )
+        weather_layout.addRow("Auto refresh:", self.weather_refresh_spin)
+
+        self.weather_wunderground_edit = QLineEdit(self)
+        self.weather_wunderground_edit.setPlaceholderText(
+            "https://www.wunderground.com/dashboard/pws/IBIAKW3 or station id"
+        )
+        self.weather_wunderground_edit.setText(
+            parent.settings.value("weather/wundergroundUrl", "", type=str)
+            if parent and hasattr(parent, "settings")
+            else ""
+        )
+        weather_layout.addRow("Wunderground station:", self.weather_wunderground_edit)
+
+        self.weather_weathercloud_edit = QLineEdit(self)
+        self.weather_weathercloud_edit.setPlaceholderText(
+            "https://app.weathercloud.net/... (station public page)"
+        )
+        self.weather_weathercloud_edit.setText(
+            parent.settings.value("weather/weathercloudUrl", "", type=str)
+            if parent and hasattr(parent, "settings")
+            else ""
+        )
+        weather_layout.addRow("WeatherCloud station:", self.weather_weathercloud_edit)
+
+        self.weather_local_links_edit = QTextEdit(self)
+        self.weather_local_links_edit.setPlaceholderText(
+            "Optional local sources (one per line): Label|https://example\nor just URL"
+        )
+        self.weather_local_links_edit.setMinimumHeight(74)
+        self.weather_local_links_edit.setMaximumHeight(120)
+        self.weather_local_links_edit.setPlainText(
+            parent.settings.value("weather/localConditionsLinks", "", type=str)
+            if parent and hasattr(parent, "settings")
+            else ""
+        )
+        weather_layout.addRow("Additional local links:", self.weather_local_links_edit)
+
+        self.weather_cloud_source_combo = QComboBox(self)
+        self.weather_cloud_source_combo.addItem("EarthEnv", "earthenv")
+        init_cloud_source = (
+            parent.settings.value("weather/cloudMapSource", "earthenv", type=str)
+            if parent and hasattr(parent, "settings")
+            else "earthenv"
+        )
+        cloud_source_idx = self.weather_cloud_source_combo.findData(str(init_cloud_source))
+        if cloud_source_idx >= 0:
+            self.weather_cloud_source_combo.setCurrentIndex(cloud_source_idx)
+        weather_layout.addRow("Cloud map source:", self.weather_cloud_source_combo)
+
+        self.weather_month_mode_combo = QComboBox(self)
+        self.weather_month_mode_combo.addItem("Session month", "session_month")
+        self.weather_month_mode_combo.addItem("Current month", "current_month")
+        init_month_mode = (
+            parent.settings.value("weather/cloudMapMonthMode", "session_month", type=str)
+            if parent and hasattr(parent, "settings")
+            else "session_month"
+        )
+        month_mode_idx = self.weather_month_mode_combo.findData(str(init_month_mode))
+        if month_mode_idx >= 0:
+            self.weather_month_mode_combo.setCurrentIndex(month_mode_idx)
+        weather_layout.addRow("Cloud map month mode:", self.weather_month_mode_combo)
+
+        custom_hint = QLabel(
+            "Custom conditions URL is configured per observatory in Observatory Manager. "
+            "JSON contract: temp_c, wind_ms, cloud_pct, rh_pct (required), pressure_hpa/updated_utc/source_label (optional).",
+            self,
+        )
+        custom_hint.setObjectName("SectionHint")
+        custom_hint.setWordWrap(True)
+        weather_layout.addRow(custom_hint)
+
         # Polar-plot path options
         self.sun_path_chk  = QCheckBox("Plot Sun path",  self)
         self.moon_path_chk = QCheckBox("Plot Moon path", self)
         self.obj_path_chk  = QCheckBox("Plot object paths", self)
         self.color_blind_chk = QCheckBox("Color-blind friendly palette", self)
+        self.radar_sweep_chk = QCheckBox("Radar sweep animation", self)
 
         self.sun_path_chk.setChecked(parent.settings.value("general/showSunPath",  True, type=bool)) if parent and hasattr(parent, "settings") else True
         self.moon_path_chk.setChecked(parent.settings.value("general/showMoonPath", True, type=bool)) if parent and hasattr(parent, "settings") else True
         self.obj_path_chk.setChecked(parent.settings.value("general/showObjPath",  True, type=bool)) if parent and hasattr(parent, "settings") else True
         self.color_blind_chk.setChecked(parent.settings.value("general/colorBlindMode", False, type=bool)) if parent and hasattr(parent, "settings") else False
+        self.radar_sweep_chk.setChecked(
+            parent.settings.value("general/radarSweepAnimation", False, type=bool)
+            if parent and hasattr(parent, "settings")
+            else False
+        )
+        self.radar_sweep_chk.setToolTip(
+            "Optional cyberpunk sweep line in the sky radar. A rotating scan highlights nearby targets."
+        )
+        self.radar_speed_slider = QSlider(Qt.Horizontal, self)
+        self.radar_speed_slider.setRange(40, 260)
+        self.radar_speed_slider.setSingleStep(5)
+        self.radar_speed_slider.setPageStep(10)
+        self.radar_speed_slider.setValue(
+            max(
+                40,
+                min(
+                    260,
+                    int(
+                        parent.settings.value("general/radarSweepSpeed", 140, type=int)
+                        if parent and hasattr(parent, "settings")
+                        else 140
+                    ),
+                ),
+            )
+        )
+        self.radar_speed_value_label = QLabel(self)
+        self.radar_speed_value_label.setObjectName("SectionHint")
+        self.radar_speed_value_label.setMinimumWidth(56)
+        radar_speed_row = QWidget(self)
+        radar_speed_layout = QHBoxLayout(radar_speed_row)
+        radar_speed_layout.setContentsMargins(0, 0, 0, 0)
+        radar_speed_layout.setSpacing(8)
+        radar_speed_layout.addWidget(self.radar_speed_slider, 1)
+        radar_speed_layout.addWidget(self.radar_speed_value_label, 0)
+        self.radar_speed_label = QLabel("Radar sweep speed:", self)
+        self.radar_speed_label.setObjectName("SectionHint")
+        self.radar_speed_row = radar_speed_row
+        self.radar_sweep_chk.toggled.connect(self._update_radar_speed_controls)
+        self.radar_speed_slider.valueChanged.connect(self._update_radar_speed_controls)
 
-        plot_layout.addRow(self.sun_path_chk)
-        plot_layout.addRow(self.moon_path_chk)
-        plot_layout.addRow(self.obj_path_chk)
-        plot_layout.addRow(self.color_blind_chk)
+        plot_hdr = QLabel("Plot options")
+        plot_hdr.setObjectName("SectionHint")
+        general_layout.addRow(plot_hdr)
+        general_layout.addRow(self.sun_path_chk)
+        general_layout.addRow(self.moon_path_chk)
+        general_layout.addRow(self.obj_path_chk)
+        general_layout.addRow(self.color_blind_chk)
+        general_layout.addRow(self.radar_sweep_chk)
+        general_layout.addRow(self.radar_speed_label, self.radar_speed_row)
+        self._update_radar_speed_controls()
 
         # OK / Cancel
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply, self)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
+        _style_dialog_button_box(btns)
         apply_btn = btns.button(QDialogButtonBox.Apply)
         if apply_btn is not None:
             apply_btn.clicked.connect(self._apply_changes)
         root_layout.addWidget(btns)
-        self.setMinimumSize(560, 460)
-        self.resize(640, 520)
+        _fit_dialog_to_screen(
+            self,
+            preferred_width=1240,
+            preferred_height=820,
+            min_width=920,
+            min_height=620,
+        )
+        initial_key = str(initial_tab or "").strip().lower()
+        if initial_key in self._tab_indices:
+            self.tabs.setCurrentIndex(self._tab_indices[initial_key])
 
     @Slot(bool)
     def _preview_dark_mode(self, checked: bool):
@@ -1172,6 +3596,51 @@ class GeneralSettingsDialog(QDialog):
         blocker = QSignalBlocker(self.dark_mode_chk)
         self.dark_mode_chk.setChecked(enabled)
         del blocker
+
+    def _effective_accent_secondary_color(self) -> str:
+        if self._accent_secondary_color:
+            return self._accent_secondary_color
+        theme_key = normalize_theme_key(self.theme_combo.currentData())
+        tokens = resolve_theme_tokens(
+            theme_key,
+            dark_enabled=self.dark_mode_chk.isChecked(),
+            ui_font_size=int(self.ui_font_spin.value()),
+        )
+        return str(tokens.get("accent_secondary", "#ff4fd8"))
+
+    def _refresh_accent_secondary_controls(self) -> None:
+        color = self._effective_accent_secondary_color()
+        text_color = _swatch_text_color(color)
+        label = color.upper() if self._accent_secondary_color else f"Theme ({color.upper()})"
+        self.accent_secondary_btn.setText(label)
+        self.accent_secondary_btn.setStyleSheet(
+            f"background:{color}; color:{text_color}; border:1px solid {color}; font-weight:700;"
+        )
+        self.accent_secondary_reset_btn.setEnabled(bool(self._accent_secondary_color))
+
+    def _pick_accent_secondary_color(self) -> None:
+        chosen = QColorDialog.getColor(QColor(self._effective_accent_secondary_color()), self, "Pick pink accent")
+        if not chosen.isValid():
+            return
+        self._accent_secondary_color = chosen.name().lower()
+        self._accent_secondary_colors[normalize_theme_key(self.theme_combo.currentData())] = self._accent_secondary_color
+        self._refresh_accent_secondary_controls()
+
+    def _reset_accent_secondary_color(self) -> None:
+        self._accent_secondary_color = ""
+        self._accent_secondary_colors[normalize_theme_key(self.theme_combo.currentData())] = ""
+        self._refresh_accent_secondary_controls()
+
+    def _on_theme_selection_changed(self, _index: int) -> None:
+        theme_key = normalize_theme_key(self.theme_combo.currentData())
+        self._accent_secondary_color = self._accent_secondary_colors.get(theme_key, "")
+        self._refresh_accent_secondary_controls()
+
+    def _update_radar_speed_controls(self, *_args) -> None:
+        visible = self.radar_sweep_chk.isChecked()
+        self.radar_speed_label.setVisible(visible)
+        self.radar_speed_row.setVisible(visible)
+        self.radar_speed_value_label.setText(f"{self.radar_speed_slider.value() / 100.0:.2f}x")
 
     def _apply_changes(self):
         s = self.parent().settings
@@ -1188,25 +3657,76 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("general/defaultSite", self.site_combo.currentText())
         s.setValue("general/timeSamples", self.ts_spin.value())
         s.setValue("general/uiFontSize", self.ui_font_spin.value())
-        s.setValue("general/uiTheme", self.theme_combo.currentData())
+        selected_theme = normalize_theme_key(self.theme_combo.currentData())
+        s.setValue("general/uiTheme", selected_theme)
+        for theme_key, color in self._accent_secondary_colors.items():
+            if parent := self.parent():
+                if hasattr(parent, "_save_accent_secondary_override"):
+                    parent._save_accent_secondary_override(theme_key, color)
+                    continue
+            per_theme_key = f"general/accentSecondaryColorByTheme/{normalize_theme_key(theme_key)}"
+            normalized_color = _normalized_css_color(color)
+            if normalized_color:
+                s.setValue(per_theme_key, normalized_color)
+            else:
+                s.remove(per_theme_key)
+        s.remove("general/accentSecondaryColor")
         s.setValue("general/darkMode", self.dark_mode_chk.isChecked())
         s.setValue("general/showSunPath",  self.sun_path_chk.isChecked())
         s.setValue("general/showMoonPath", self.moon_path_chk.isChecked())
         s.setValue("general/showObjPath",  self.obj_path_chk.isChecked())
         s.setValue("general/colorBlindMode", self.color_blind_chk.isChecked())
+        s.setValue("general/radarSweepAnimation", self.radar_sweep_chk.isChecked())
+        s.setValue("general/radarSweepSpeed", int(self.radar_speed_slider.value()))
         s.setValue("general/cutoutView", _normalize_cutout_view_key(self.cutout_view_combo.currentData()))
         s.setValue("general/cutoutSurvey", _normalize_cutout_survey_key(self.cutout_survey_combo.currentData()))
         s.setValue("general/cutoutFovArcmin", _sanitize_cutout_fov_arcmin(self.cutout_fov_spin.value()))
         s.setValue("general/cutoutSizePx", _sanitize_cutout_size_px(self.cutout_size_spin.value()))
+        s.setValue(
+            "general/quickTargetsCount",
+            max(QUICK_TARGETS_MIN_COUNT, min(QUICK_TARGETS_MAX_COUNT, self.quick_targets_count_spin.value())),
+        )
+        s.setValue(
+            "general/quickTargetsMinImportance",
+            max(0.0, float(self.quick_targets_min_importance_spin.value())),
+        )
+        s.setValue("general/quickTargetsUseScoreFilter", self.quick_targets_use_score_filter_chk.isChecked())
+        s.setValue("general/quickTargetsUseMoonFilter", self.quick_targets_use_moon_filter_chk.isChecked())
+        s.setValue("general/quickTargetsUseLimitingMag", self.quick_targets_use_limiting_mag_chk.isChecked())
+        s.setValue("general/seestarAlpBaseUrl", self.seestar_alp_base_url_edit.text().strip() or SEESTAR_ALP_DEFAULT_BASE_URL)
+        s.setValue("general/seestarAlpDeviceNum", max(0, int(self.seestar_alp_device_spin.value())))
+        s.setValue("general/seestarAlpClientId", max(1, int(self.seestar_alp_client_id_spin.value())))
+        s.setValue("general/seestarAlpTimeoutSec", max(1.0, float(self.seestar_alp_timeout_spin.value())))
         llm_url = self.llm_url_edit.text().strip() or LLMConfig.DEFAULT_URL
         llm_model = self.llm_model_edit.text().strip() or LLMConfig.DEFAULT_MODEL
+        llm_timeout = max(15, int(self.llm_timeout_spin.value()))
+        llm_max_tokens = max(32, int(self.llm_max_tokens_spin.value()))
+        llm_chat_font_pt = max(9, int(self.llm_chat_font_spin.value()))
+        llm_chat_spacing = str(self.llm_chat_spacing_combo.currentData() or LLMConfig.DEFAULT_CHAT_SPACING)
+        llm_chat_tint = str(self.llm_chat_tint_combo.currentData() or LLMConfig.DEFAULT_CHAT_TINT_STRENGTH)
+        llm_chat_width = str(self.llm_chat_width_combo.currentData() or LLMConfig.DEFAULT_CHAT_WIDTH)
+        llm_status_error_clear_s = max(0, int(self.llm_status_error_clear_spin.value()))
         s.setValue("llm/serverUrl", llm_url)
         s.setValue("llm/model", llm_model)
+        s.setValue("llm/timeoutSec", llm_timeout)
+        s.setValue("llm/maxTokens", llm_max_tokens)
+        s.setValue("llm/chatFontSizePt", llm_chat_font_pt)
+        s.setValue("llm/chatSpacing", llm_chat_spacing)
+        s.setValue("llm/chatTintStrength", llm_chat_tint)
+        s.setValue("llm/chatMessageWidth", llm_chat_width)
+        s.setValue("llm/statusErrorClearSec", llm_status_error_clear_s)
         s.setValue("general/bhtomApiToken", self.bhtom_api_edit.text().strip())
         s.setValue("general/tnsApiKey", self.tns_api_edit.text().strip())
         s.setValue("general/tnsBotId", self.tns_bot_id_edit.text().strip())
         s.setValue("general/tnsBotName", self.tns_bot_name_edit.text().strip())
         s.setValue("general/tnsEndpoint", _normalize_tns_endpoint_key(self.tns_endpoint_combo.currentData()))
+        s.setValue("weather/defaultConditionsSource", str(self.weather_default_source_combo.currentData() or "average"))
+        s.setValue("weather/autoRefreshSec", max(30, min(1800, int(self.weather_refresh_spin.value()))))
+        s.setValue("weather/wundergroundUrl", self.weather_wunderground_edit.text().strip())
+        s.setValue("weather/weathercloudUrl", self.weather_weathercloud_edit.text().strip())
+        s.setValue("weather/localConditionsLinks", self.weather_local_links_edit.toPlainText().strip())
+        s.setValue("weather/cloudMapSource", str(self.weather_cloud_source_combo.currentData() or "earthenv"))
+        s.setValue("weather/cloudMapMonthMode", str(self.weather_month_mode_combo.currentData() or "session_month"))
         self.parent()._apply_general_settings()
         if rerun_plan:
             self.parent()._run_plan()
@@ -1215,6 +3735,44 @@ class GeneralSettingsDialog(QDialog):
     def accept(self):
         self._apply_changes()
         super().accept()
+
+    def _test_seestar_alp_connection(self) -> None:
+        try:
+            config = SeestarAlpConfig(
+                base_url=self.seestar_alp_base_url_edit.text().strip() or SEESTAR_ALP_DEFAULT_BASE_URL,
+                device_num=max(0, int(self.seestar_alp_device_spin.value())),
+                client_id=max(1, int(self.seestar_alp_client_id_spin.value())),
+                timeout_s=max(1.0, float(self.seestar_alp_timeout_spin.value())),
+            )
+            result = SeestarAlpClient(config).test_connection()
+        except Exception as exc:
+            self.seestar_alp_status_label.setText(
+                render_alp_backend_status_text(
+                    None,
+                    base_url=self.seestar_alp_base_url_edit.text().strip() or SEESTAR_ALP_DEFAULT_BASE_URL,
+                    device_num=max(0, int(self.seestar_alp_device_spin.value())),
+                    last_error=str(exc),
+                )
+            )
+            QMessageBox.warning(self, "Seestar ALP", str(exc))
+            return
+        self.seestar_alp_status_label.setText(render_alp_backend_status_text(result))
+        QMessageBox.information(
+            self,
+            "Seestar ALP",
+            self.seestar_alp_status_label.text(),
+        )
+
+    def _open_seestar_alp_web_ui(self) -> None:
+        url = build_alp_web_ui_url(
+            self.seestar_alp_base_url_edit.text().strip() or SEESTAR_ALP_DEFAULT_BASE_URL
+        )
+        qurl = QUrl(url)
+        if not qurl.isValid():
+            QMessageBox.warning(self, "Seestar ALP", f"Invalid URL:\n{url}")
+            return
+        if not QDesktopServices.openUrl(qurl):
+            QMessageBox.warning(self, "Seestar ALP", f"Unable to open URL:\n{url}")
 
     def reject(self):
         parent = self.parent()
@@ -1315,6 +3873,5078 @@ class GeneralSettingsDialog(QDialog):
             QApplication.restoreOverrideCursor()
 
 
+class SeestarSessionPlanDialog(QDialog):
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self._planner = parent
+        self._settings = parent.settings
+        self._builtin_session_templates = builtin_seestar_session_templates()
+        self._user_session_templates = self._load_user_session_templates()
+        self._current_settings_template = self._load_current_settings_template()
+        self._target_plan_rows: list[dict[str, object]] = []
+
+        self.setWindowTitle("Seestar Session Settings")
+        self.setModal(True)
+        screen = parent.screen() if isinstance(parent, QWidget) else QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            start_rect = available.adjusted(2, 2, -2, -2)
+            self.setGeometry(start_rect)
+            self.resize(start_rect.size())
+            self.setMinimumSize(min(1240, start_rect.width()), min(760, start_rect.height()))
+        else:
+            self.resize(1560, 920)
+            self.setMinimumSize(1240, 760)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(6)
+
+        current_alp_url = str(
+            self._settings.value("general/seestarAlpBaseUrl", SEESTAR_ALP_DEFAULT_BASE_URL, type=str)
+            or SEESTAR_ALP_DEFAULT_BASE_URL
+        ).strip()
+        session_hint = QLabel(
+            f"ALP: {current_alp_url.rstrip('/')}  |  "
+            "Session settings are here; base URL, device and timeout stay in General Settings.",
+            self,
+        )
+        session_hint.setObjectName("SectionHint")
+        session_hint.setWordWrap(True)
+        root.addWidget(session_hint)
+
+        body_splitter = QSplitter(Qt.Vertical, self)
+        body_splitter.setChildrenCollapsible(False)
+        root.addWidget(body_splitter, 1)
+
+        settings_scroll = QScrollArea(body_splitter)
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        settings_panel = QWidget(settings_scroll)
+        settings_layout = QVBoxLayout(settings_panel)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(6)
+
+        def _make_card(parent: QWidget, title: str, hint: str = "") -> tuple[QFrame, QVBoxLayout]:
+            card = QFrame(parent)
+            card.setObjectName("InfoCard")
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(6)
+            title_lbl = QLabel(title, card)
+            title_lbl.setObjectName("SectionTitle")
+            layout.addWidget(title_lbl)
+            if hint:
+                hint_lbl = QLabel(hint, card)
+                hint_lbl.setObjectName("SectionHint")
+                hint_lbl.setWordWrap(True)
+                layout.addWidget(hint_lbl)
+            return card, layout
+
+        def _make_field_row(
+            parent: QWidget,
+            pairs: list[tuple[str, QWidget]],
+            *,
+            stretch_last: bool = True,
+            label_width: int = 84,
+        ) -> QWidget:
+            row = QWidget(parent)
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            for idx, (label_text, widget) in enumerate(pairs):
+                lbl = QLabel(label_text, row)
+                lbl.setMinimumWidth(label_width)
+                layout.addWidget(lbl, 0)
+                layout.addWidget(widget, 1 if stretch_last or idx < len(pairs) - 1 else 0)
+            layout.addStretch(1)
+            return row
+
+        tabs = _configure_tab_widget(QTabWidget(settings_panel))
+        settings_layout.addWidget(tabs, 1)
+        self._session_tabs = tabs
+
+        defaults_tab = QWidget(tabs)
+        defaults_tab_layout = QVBoxLayout(defaults_tab)
+        defaults_tab_layout.setContentsMargins(6, 6, 6, 6)
+        defaults_tab_layout.setSpacing(8)
+
+        self.seestar_method_combo = QComboBox(self)
+        self.seestar_method_combo.addItem("App handoff", SEESTAR_METHOD_GUIDED)
+        self.seestar_method_combo.addItem("ALP service", SEESTAR_METHOD_ALP)
+        init_method = str(
+            self._settings.value("general/seestarMethod", SEESTAR_METHOD_GUIDED, type=str) or SEESTAR_METHOD_GUIDED
+        ).strip().lower()
+        method_idx = self.seestar_method_combo.findData(init_method or SEESTAR_METHOD_GUIDED)
+        if method_idx >= 0:
+            self.seestar_method_combo.setCurrentIndex(method_idx)
+
+        self.seestar_session_template_combo = QComboBox(self)
+        self._populate_session_template_combo()
+        template_row = QWidget(self)
+        template_row_l = QHBoxLayout(template_row)
+        template_row_l.setContentsMargins(0, 0, 0, 0)
+        template_row_l.setSpacing(8)
+        template_row_l.addWidget(self.seestar_session_template_combo, 1)
+        self.seestar_session_template_save_btn = QPushButton("Save As…", template_row)
+        self.seestar_session_template_save_btn.clicked.connect(self._save_session_template)
+        template_row_l.addWidget(self.seestar_session_template_save_btn, 0)
+        self.seestar_session_template_delete_btn = QPushButton("Delete", template_row)
+        self.seestar_session_template_delete_btn.clicked.connect(self._delete_session_template)
+        template_row_l.addWidget(self.seestar_session_template_delete_btn, 0)
+
+        self.seestar_session_repeat_spin = QSpinBox(self)
+        self.seestar_session_repeat_spin.setRange(1, 50)
+
+        self.seestar_session_minutes_spin = QSpinBox(self)
+        self.seestar_session_minutes_spin.setRange(1, 240)
+        self.seestar_session_minutes_spin.setSingleStep(5)
+        self.seestar_session_minutes_spin.setSuffix(" min")
+
+        self.seestar_session_gap_spin = QSpinBox(self)
+        self.seestar_session_gap_spin.setRange(0, 3600)
+        self.seestar_session_gap_spin.setSingleStep(5)
+        self.seestar_session_gap_spin.setSuffix(" s")
+
+        self.seestar_alp_gain_spin = QSpinBox(self)
+        self.seestar_alp_gain_spin.setRange(0, 500)
+
+        self.seestar_alp_panel_overlap_spin = QSpinBox(self)
+        self.seestar_alp_panel_overlap_spin.setRange(0, 95)
+        self.seestar_alp_panel_overlap_spin.setSuffix(" %")
+        self.seestar_alp_panel_overlap_spin.hide()
+
+        self.seestar_alp_use_autofocus_chk = QCheckBox("Capture-job AF", self)
+        self.seestar_alp_use_autofocus_chk.setToolTip(
+            "Passes is_use_autofocus into each ALP capture target item. "
+            "Can duplicate Schedule AF if both are enabled."
+        )
+
+        self.seestar_alp_num_tries_spin = QSpinBox(self)
+        self.seestar_alp_num_tries_spin.setRange(1, 10)
+
+        self.seestar_alp_retry_wait_spin = QSpinBox(self)
+        self.seestar_alp_retry_wait_spin.setRange(0, 3600)
+        self.seestar_alp_retry_wait_spin.setSingleStep(5)
+        self.seestar_alp_retry_wait_spin.setSuffix(" s")
+
+        self.seestar_alp_stack_exposure_spin = QSpinBox(self)
+        self.seestar_alp_stack_exposure_spin.setRange(0, 600000)
+        self.seestar_alp_stack_exposure_spin.setSingleStep(500)
+        self.seestar_alp_stack_exposure_spin.setSuffix(" ms")
+        self.seestar_alp_stack_exposure_spin.setSpecialValueText("Use ALP default")
+
+        self.seestar_alp_lp_filter_combo = QComboBox(self)
+        self.seestar_alp_lp_filter_combo.addItem("Auto", SEESTAR_ALP_LP_FILTER_AUTO)
+        self.seestar_alp_lp_filter_combo.addItem("Force OFF", SEESTAR_ALP_LP_FILTER_OFF)
+        self.seestar_alp_lp_filter_combo.addItem("Force ON", SEESTAR_ALP_LP_FILTER_ON)
+
+        defaults_card, defaults_card_l = _make_card(defaults_tab, "Session")
+        defaults_card_l.addWidget(_make_field_row(defaults_card, [("Backend", self.seestar_method_combo)], label_width=72))
+        defaults_card_l.addWidget(_make_field_row(defaults_card, [("Template", template_row)], label_width=72))
+        self.seestar_defaults_summary_label = QLabel(defaults_card)
+        self.seestar_defaults_summary_label.setObjectName("SectionHint")
+        self.seestar_defaults_summary_label.setWordWrap(True)
+        defaults_card_l.addWidget(self.seestar_defaults_summary_label)
+        defaults_tab_layout.addWidget(defaults_card)
+
+        defaults_row = QWidget(defaults_tab)
+        defaults_row_l = QHBoxLayout(defaults_row)
+        defaults_row_l.setContentsMargins(0, 0, 0, 0)
+        defaults_row_l.setSpacing(8)
+
+        run_defaults_card, run_defaults_card_l = _make_card(defaults_row, "Runs")
+        run_defaults_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        run_defaults_card_l.addWidget(
+            _make_field_row(
+                run_defaults_card,
+                [
+                    ("Runs", self.seestar_session_repeat_spin),
+                    ("Min/run", self.seestar_session_minutes_spin),
+                    ("Gap", self.seestar_session_gap_spin),
+                ],
+                label_width=60,
+            )
+        )
+        defaults_row_l.addWidget(run_defaults_card, 1)
+
+        capture_defaults_card, capture_defaults_card_l = _make_card(defaults_row, "Capture")
+        capture_defaults_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        capture_defaults_card_l.addWidget(
+            _make_field_row(
+                capture_defaults_card,
+                [
+                    ("Exposure", self.seestar_alp_stack_exposure_spin),
+                    ("LP", self.seestar_alp_lp_filter_combo),
+                ],
+                label_width=64,
+            )
+        )
+        capture_defaults_card_l.addWidget(
+            _make_field_row(
+                capture_defaults_card,
+                [
+                    ("Gain", self.seestar_alp_gain_spin),
+                    ("Retries", self.seestar_alp_num_tries_spin),
+                    ("Wait", self.seestar_alp_retry_wait_spin),
+                ],
+                label_width=64,
+                stretch_last=False,
+            )
+        )
+        capture_defaults_card_l.addWidget(
+            _make_field_row(
+                capture_defaults_card,
+                [("Focus", self.seestar_alp_use_autofocus_chk)],
+                label_width=64,
+                stretch_last=False,
+            )
+        )
+        defaults_row_l.addWidget(capture_defaults_card, 1)
+        defaults_tab_layout.addWidget(defaults_row)
+
+        defaults_tab_layout.addStretch(1)
+        tabs.addTab(defaults_tab, "Session")
+
+        checklist_tab = QWidget(tabs)
+        checklist_tab_layout = QVBoxLayout(checklist_tab)
+        checklist_tab_layout.setContentsMargins(6, 6, 6, 6)
+        checklist_tab_layout.setSpacing(8)
+
+        checklist_splitter = QSplitter(Qt.Horizontal, checklist_tab)
+        checklist_splitter.setChildrenCollapsible(False)
+        checklist_tab_layout.addWidget(checklist_splitter, 1)
+
+        notes_card, notes_card_l = _make_card(
+            checklist_splitter,
+            "Session Notes",
+            "Shown later in the ALP dialog before upload or start.",
+        )
+
+        self.seestar_session_require_checklist_chk = QCheckBox(
+            "Require checklist before push/start",
+            notes_card,
+        )
+        notes_card_l.addWidget(self.seestar_session_require_checklist_chk)
+
+        notes_label = QLabel("Notes", notes_card)
+        notes_label.setObjectName("SectionHint")
+        notes_card_l.addWidget(notes_label)
+
+        self.seestar_session_notes_edit = QTextEdit(notes_card)
+        self.seestar_session_notes_edit.setMinimumHeight(130)
+        self.seestar_session_notes_edit.setPlaceholderText("Notes shown in the ALP dialog")
+        notes_card_l.addWidget(self.seestar_session_notes_edit, 1)
+        checklist_splitter.addWidget(notes_card)
+
+        checklist_card, checklist_card_l = _make_card(
+            checklist_splitter,
+            "Science Checklist",
+            "One item per line. Only shown when confirmation is required.",
+        )
+
+        checklist_label = QLabel("Checklist", checklist_card)
+        checklist_label.setObjectName("SectionHint")
+        checklist_card_l.addWidget(checklist_label)
+
+        self.seestar_session_checklist_edit = QTextEdit(checklist_card)
+        self.seestar_session_checklist_edit.setMinimumHeight(130)
+        self.seestar_session_checklist_edit.setPlaceholderText("One checklist item per line")
+        checklist_card_l.addWidget(self.seestar_session_checklist_edit, 1)
+        checklist_splitter.addWidget(checklist_card)
+        checklist_splitter.setStretchFactor(0, 1)
+        checklist_splitter.setStretchFactor(1, 1)
+
+        tabs.addTab(checklist_tab, "Notes")
+
+        automation_tab = QWidget(tabs)
+        automation_tab_layout = QVBoxLayout(automation_tab)
+        automation_tab_layout.setContentsMargins(6, 6, 6, 6)
+        automation_tab_layout.setSpacing(8)
+
+        automation_row = QWidget(automation_tab)
+        automation_row_l = QHBoxLayout(automation_row)
+        automation_row_l.setContentsMargins(0, 0, 0, 0)
+        automation_row_l.setSpacing(8)
+
+        automation_left_card, automation_left_card_l = _make_card(automation_row, "Timing And Startup")
+        automation_left_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        automation_left_form_widget = QWidget(automation_left_card)
+        automation_left_form = QFormLayout(automation_left_form_widget)
+        automation_left_form.setContentsMargins(0, 0, 0, 0)
+        automation_left_form.setSpacing(6)
+        automation_left_card_l.addWidget(automation_left_form_widget)
+
+        self.seestar_alp_honor_queue_times_chk = QCheckBox("Use planned start times", automation_left_card)
+
+        self.seestar_alp_wait_until_edit = QLineEdit(automation_left_card)
+        self.seestar_alp_wait_until_edit.setPlaceholderText("HH:MM (optional)")
+
+        self.seestar_alp_startup_enabled_chk = QCheckBox("Run startup first", automation_left_card)
+
+        startup_row = QWidget(automation_left_card)
+        startup_row_l = QHBoxLayout(startup_row)
+        startup_row_l.setContentsMargins(0, 0, 0, 0)
+        startup_row_l.setSpacing(8)
+        startup_row_l.addWidget(self.seestar_alp_startup_enabled_chk, 0)
+        self.seestar_alp_startup_polar_align_chk = QCheckBox("Polar align / 3PPA", startup_row)
+        startup_row_l.addWidget(self.seestar_alp_startup_polar_align_chk, 0)
+        self.seestar_alp_startup_autofocus_chk = QCheckBox("Startup autofocus", startup_row)
+        startup_row_l.addWidget(self.seestar_alp_startup_autofocus_chk, 0)
+        self.seestar_alp_startup_dark_frames_chk = QCheckBox("Dark frames", startup_row)
+        startup_row_l.addWidget(self.seestar_alp_startup_dark_frames_chk, 0)
+        startup_row_l.addStretch(1)
+
+        self.seestar_alp_capture_flats_chk = QCheckBox("Blind flats before session", automation_left_card)
+        self.seestar_alp_capture_flats_chk.setToolTip(
+            "Only sends start_create_calib_frame to ALP. It does not measure ADU or tune flat exposure."
+        )
+
+        self.seestar_alp_flats_wait_spin = QSpinBox(automation_left_card)
+        self.seestar_alp_flats_wait_spin.setRange(0, 3600)
+        self.seestar_alp_flats_wait_spin.setSingleStep(10)
+        self.seestar_alp_flats_wait_spin.setSuffix(" s")
+        self.seestar_alp_flats_wait_spin.setToolTip(
+            "Wait time after the blind ALP flat trigger. Use this only if you understand the flat routine timing."
+        )
+
+        timing_row = QWidget(automation_left_card)
+        timing_row_l = QHBoxLayout(timing_row)
+        timing_row_l.setContentsMargins(0, 0, 0, 0)
+        timing_row_l.setSpacing(8)
+        timing_row_l.addWidget(self.seestar_alp_honor_queue_times_chk, 0)
+        timing_row_l.addWidget(QLabel("Not before", timing_row), 0)
+        timing_row_l.addWidget(self.seestar_alp_wait_until_edit, 0)
+        timing_row_l.addStretch(1)
+
+        flats_row = QWidget(automation_left_card)
+        flats_row_l = QHBoxLayout(flats_row)
+        flats_row_l.setContentsMargins(0, 0, 0, 0)
+        flats_row_l.setSpacing(8)
+        flats_row_l.addWidget(self.seestar_alp_capture_flats_chk, 0)
+        flats_row_l.addWidget(QLabel("Wait", flats_row), 0)
+        flats_row_l.addWidget(self.seestar_alp_flats_wait_spin, 0)
+        flats_row_l.addStretch(1)
+
+        automation_left_form.addRow("Timing", timing_row)
+        automation_left_form.addRow("Startup", startup_row)
+        automation_left_form.addRow("Flats", flats_row)
+        automation_row_l.addWidget(automation_left_card, 1)
+
+        automation_right_card, automation_right_card_l = _make_card(automation_row, "Focus And Finish")
+        automation_right_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        automation_right_form_widget = QWidget(automation_right_card)
+        automation_right_form = QFormLayout(automation_right_form_widget)
+        automation_right_form.setContentsMargins(0, 0, 0, 0)
+        automation_right_form.setSpacing(6)
+        automation_right_card_l.addWidget(automation_right_form_widget)
+
+        focus_row = QWidget(automation_right_card)
+        focus_row_l = QHBoxLayout(focus_row)
+        focus_row_l.setContentsMargins(0, 0, 0, 0)
+        focus_row_l.setSpacing(8)
+        self.seestar_alp_schedule_af_mode_combo = QComboBox(focus_row)
+        self.seestar_alp_schedule_af_mode_combo.addItem("Off", SEESTAR_ALP_AF_MODE_OFF)
+        self.seestar_alp_schedule_af_mode_combo.addItem("Before each run", SEESTAR_ALP_AF_MODE_PER_RUN)
+        self.seestar_alp_schedule_af_mode_combo.addItem("Once per target", SEESTAR_ALP_AF_MODE_PER_TARGET)
+        focus_row_l.addWidget(self.seestar_alp_schedule_af_mode_combo, 0)
+        self.seestar_alp_schedule_af_try_spin = QSpinBox(focus_row)
+        self.seestar_alp_schedule_af_try_spin.setRange(1, 10)
+        focus_row_l.addWidget(QLabel("Rounds", focus_row), 0)
+        focus_row_l.addWidget(self.seestar_alp_schedule_af_try_spin, 0)
+        focus_row_l.addStretch(1)
+
+        dew_row = QWidget(automation_right_card)
+        dew_row_l = QHBoxLayout(dew_row)
+        dew_row_l.setContentsMargins(0, 0, 0, 0)
+        dew_row_l.setSpacing(8)
+        self.seestar_alp_dew_heater_chk = QCheckBox("Set dew heater", dew_row)
+        dew_row_l.addWidget(self.seestar_alp_dew_heater_chk, 0)
+        self.seestar_alp_dew_heater_spin = QSpinBox(dew_row)
+        self.seestar_alp_dew_heater_spin.setRange(0, 100)
+        self.seestar_alp_dew_heater_spin.setSuffix(" %")
+        dew_row_l.addWidget(self.seestar_alp_dew_heater_spin, 0)
+        dew_row_l.addStretch(1)
+
+        end_row = QWidget(automation_right_card)
+        end_row_l = QHBoxLayout(end_row)
+        end_row_l.setContentsMargins(0, 0, 0, 0)
+        end_row_l.setSpacing(8)
+        self.seestar_alp_park_after_chk = QCheckBox("Park after session", end_row)
+        end_row_l.addWidget(self.seestar_alp_park_after_chk, 0)
+        self.seestar_alp_shutdown_after_chk = QCheckBox("Shutdown after session", end_row)
+        end_row_l.addWidget(self.seestar_alp_shutdown_after_chk, 0)
+        end_row_l.addStretch(1)
+        automation_right_form.addRow("Schedule AF", focus_row)
+        automation_right_form.addRow("Dew heater", dew_row)
+        automation_right_form.addRow("Finish", end_row)
+        automation_row_l.addWidget(automation_right_card, 1)
+
+        automation_tab_layout.addWidget(automation_row, 0)
+        automation_tab_layout.addStretch(1)
+        tabs.addTab(automation_tab, "Automation")
+
+        targets_panel = QWidget(body_splitter)
+        targets_panel.setMinimumHeight(180)
+        targets_layout = QVBoxLayout(targets_panel)
+        targets_layout.setContentsMargins(0, 0, 0, 0)
+        targets_layout.setSpacing(8)
+
+        target_actions = QWidget(targets_panel)
+        target_actions_l = QHBoxLayout(target_actions)
+        target_actions_l.setContentsMargins(0, 0, 0, 0)
+        target_actions_l.setSpacing(8)
+        targets_hdr = QLabel(
+            "Target Plan. Current Targets order; checked box = use defaults above.",
+            target_actions,
+        )
+        targets_hdr.setObjectName("SectionHint")
+        targets_hdr.setWordWrap(True)
+        target_actions_l.addWidget(targets_hdr, 1)
+        self.seestar_targets_enable_all_btn = QPushButton("Enable All", target_actions)
+        self.seestar_targets_enable_all_btn.clicked.connect(lambda: self._set_all_target_rows_enabled(True))
+        target_actions_l.addWidget(self.seestar_targets_enable_all_btn, 0)
+        self.seestar_targets_disable_all_btn = QPushButton("Disable All", target_actions)
+        self.seestar_targets_disable_all_btn.clicked.connect(lambda: self._set_all_target_rows_enabled(False))
+        target_actions_l.addWidget(self.seestar_targets_disable_all_btn, 0)
+        self.seestar_targets_defaults_btn = QPushButton("Defaults For All", target_actions)
+        self.seestar_targets_defaults_btn.clicked.connect(self._reset_all_target_row_defaults)
+        target_actions_l.addWidget(self.seestar_targets_defaults_btn, 0)
+        target_actions_l.addStretch(1)
+        targets_layout.addWidget(target_actions)
+
+        self.seestar_targets_table = QTableWidget(targets_panel)
+        self.seestar_targets_table.setColumnCount(12)
+        self.seestar_targets_table.setHorizontalHeaderLabels(
+            [
+                "On",
+                "#",
+                "Target",
+                "RA",
+                "Dec",
+                "Type",
+                "Runs",
+                "Run min",
+                "Gap",
+                "Exp ms",
+                "LP",
+                "Focus",
+            ]
+        )
+        self.seestar_targets_table.verticalHeader().setVisible(False)
+        self.seestar_targets_table.setAlternatingRowColors(True)
+        self.seestar_targets_table.setSelectionMode(QTableView.NoSelection)
+        self.seestar_targets_table.setEditTriggers(QTableView.NoEditTriggers)
+        header = self.seestar_targets_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        for column in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
+        targets_layout.addWidget(self.seestar_targets_table, 1)
+        self._populate_targets_table()
+        settings_scroll.setWidget(settings_panel)
+        body_splitter.addWidget(settings_scroll)
+        body_splitter.addWidget(targets_panel)
+        self._body_splitter = body_splitter
+        self._settings_scroll = settings_scroll
+        self._settings_panel = settings_panel
+        self._targets_panel = targets_panel
+        body_splitter.setStretchFactor(0, 0)
+        body_splitter.setStretchFactor(1, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        _style_dialog_button_box(buttons)
+        root.addWidget(buttons)
+
+        self.seestar_session_template_combo.currentIndexChanged.connect(self._on_session_template_changed)
+        self.seestar_session_repeat_spin.valueChanged.connect(self._refresh_target_override_defaults)
+        self.seestar_session_minutes_spin.valueChanged.connect(self._refresh_target_override_defaults)
+        self.seestar_session_gap_spin.valueChanged.connect(self._refresh_target_override_defaults)
+        self.seestar_alp_stack_exposure_spin.valueChanged.connect(self._refresh_target_override_defaults)
+        self.seestar_alp_lp_filter_combo.currentIndexChanged.connect(self._refresh_target_override_defaults)
+        self.seestar_alp_use_autofocus_chk.toggled.connect(self._refresh_target_override_defaults)
+        self.seestar_alp_schedule_af_mode_combo.currentIndexChanged.connect(self._refresh_target_override_defaults)
+        self.seestar_alp_startup_enabled_chk.toggled.connect(self._update_automation_fields_enabled)
+        self.seestar_alp_capture_flats_chk.toggled.connect(self._update_automation_fields_enabled)
+        self.seestar_alp_schedule_af_mode_combo.currentIndexChanged.connect(self._update_automation_fields_enabled)
+        self.seestar_alp_dew_heater_chk.toggled.connect(self._update_automation_fields_enabled)
+        self.seestar_alp_shutdown_after_chk.toggled.connect(self._update_automation_fields_enabled)
+        self._session_tabs.currentChanged.connect(lambda _: QTimer.singleShot(0, self._adjust_session_splitter_sizes))
+
+        self._apply_template_to_fields(self._current_settings_template)
+        self._select_session_template(
+            self._settings.value(
+                "general/seestarSessionTemplateKey",
+                "",
+                type=str,
+            )
+        )
+        self._on_session_template_changed()
+        self._update_automation_fields_enabled()
+        self._refresh_target_override_defaults()
+        QTimer.singleShot(0, self._adjust_session_splitter_sizes)
+
+    def _load_user_session_templates(self) -> dict[str, SeestarSessionTemplate]:
+        raw_templates = self._settings.value("general/seestarSessionUserTemplates", "", type=str)
+        templates = load_user_seestar_session_templates(raw_templates)
+        if templates or str(raw_templates or "").strip():
+            return templates
+        legacy_raw = self._settings.value("general/seestarCampaignUserPresets", "", type=str)
+        migrated = load_user_seestar_session_templates(legacy_raw)
+        if migrated:
+            self._settings.setValue(
+                "general/seestarSessionUserTemplates",
+                dump_user_seestar_session_templates(migrated),
+            )
+        return migrated
+
+    def _load_current_settings_template(self) -> SeestarSessionTemplate:
+        checklist_text = self._settings.value(
+            "general/seestarSessionChecklistText",
+            "",
+            type=str,
+        )
+        legacy_schedule_autofocus = self._settings.value(
+            "general/seestarAlpScheduleAutofocusBeforeEachTarget",
+            SEESTAR_ALP_DEFAULT_SCHEDULE_AUTOFOCUS,
+            type=bool,
+        )
+        schedule_autofocus_mode = normalize_seestar_alp_schedule_autofocus_mode(
+            self._settings.value(
+                "general/seestarAlpScheduleAutofocusMode",
+                SEESTAR_ALP_DEFAULT_SCHEDULE_AUTOFOCUS_MODE,
+                type=str,
+            ),
+            legacy_enabled=bool(legacy_schedule_autofocus),
+        )
+        return SeestarSessionTemplate(
+            key="",
+            name="",
+            scope=SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET,
+            repeat_count=max(
+                1,
+                int(
+                    self._settings.value(
+                        "general/seestarSessionRepeatCount",
+                        1,
+                        type=int,
+                    )
+                ),
+            ),
+            minutes_per_run=max(
+                1,
+                int(
+                    self._settings.value(
+                        "general/seestarSessionMinutesPerRun",
+                        SEESTAR_DEFAULT_BLOCK_MINUTES,
+                        type=int,
+                    )
+                ),
+            ),
+            gap_seconds=max(
+                0,
+                int(
+                    self._settings.value(
+                        "general/seestarSessionGapSeconds",
+                        0,
+                        type=int,
+                    )
+                ),
+            ),
+            require_science_checklist=self._settings.value(
+                "general/seestarSessionRequireChecklist",
+                False,
+                type=bool,
+            ),
+            science_checklist_items=[
+                line.strip()
+                for line in str(checklist_text or "").splitlines()
+                if line.strip()
+            ],
+            template_notes=str(self._settings.value("general/seestarSessionTemplateNotes", "", type=str) or "").strip(),
+            lp_filter_mode=str(
+                self._settings.value("general/seestarAlpLpFilterMode", SEESTAR_ALP_LP_FILTER_AUTO, type=str)
+                or SEESTAR_ALP_LP_FILTER_AUTO
+            ).strip().lower(),
+            gain=max(0, int(self._settings.value("general/seestarAlpGain", SEESTAR_ALP_DEFAULT_GAIN, type=int))),
+            panel_overlap_percent=max(
+                0,
+                int(
+                    self._settings.value(
+                        "general/seestarAlpPanelOverlapPercent",
+                        SEESTAR_ALP_DEFAULT_PANEL_OVERLAP_PERCENT,
+                        type=int,
+                    )
+                ),
+            ),
+            use_autofocus=self._settings.value("general/seestarAlpUseAutofocus", SEESTAR_ALP_DEFAULT_USE_AUTOFOCUS, type=bool),
+            num_tries=max(1, int(self._settings.value("general/seestarAlpNumTries", SEESTAR_ALP_DEFAULT_NUM_TRIES, type=int))),
+            retry_wait_s=max(0, int(self._settings.value("general/seestarAlpRetryWaitSec", SEESTAR_ALP_DEFAULT_RETRY_WAIT_S, type=int))),
+            target_integration_override_min=0,
+            stack_exposure_ms=max(0, int(self._settings.value("general/seestarAlpStackExposureMs", SEESTAR_ALP_DEFAULT_STACK_EXPOSURE_MS, type=int))),
+            honor_queue_times=self._settings.value("general/seestarAlpHonorQueueTimes", SEESTAR_ALP_DEFAULT_HONOR_QUEUE_TIMES, type=bool),
+            wait_until_local_time=str(
+                self._settings.value(
+                    "general/seestarAlpWaitUntilLocalTime",
+                    SEESTAR_ALP_DEFAULT_WAIT_UNTIL_LOCAL_TIME,
+                    type=str,
+                )
+                or ""
+            ).strip(),
+            startup_enabled=self._settings.value("general/seestarAlpStartupEnabled", SEESTAR_ALP_DEFAULT_STARTUP_SEQUENCE, type=bool),
+            startup_polar_align=self._settings.value("general/seestarAlpStartupPolarAlign", SEESTAR_ALP_DEFAULT_STARTUP_POLAR_ALIGN, type=bool),
+            startup_auto_focus=self._settings.value("general/seestarAlpStartupAutoFocus", SEESTAR_ALP_DEFAULT_STARTUP_AUTO_FOCUS, type=bool),
+            startup_dark_frames=self._settings.value("general/seestarAlpStartupDarkFrames", SEESTAR_ALP_DEFAULT_STARTUP_DARK_FRAMES, type=bool),
+            capture_flats_before_session=self._settings.value("general/seestarAlpCaptureFlatsBeforeSession", SEESTAR_ALP_DEFAULT_CAPTURE_FLATS, type=bool),
+            flats_wait_s=max(0, int(self._settings.value("general/seestarAlpFlatsWaitSec", SEESTAR_ALP_DEFAULT_FLATS_WAIT_S, type=int))),
+            schedule_autofocus_mode=schedule_autofocus_mode,
+            schedule_autofocus_before_each_target=(schedule_autofocus_mode == SEESTAR_ALP_AF_MODE_PER_RUN),
+            schedule_autofocus_try_count=max(
+                1,
+                int(self._settings.value("general/seestarAlpScheduleAutofocusTryCount", SEESTAR_ALP_DEFAULT_AUTOFOCUS_TRY_COUNT, type=int)),
+            ),
+            dew_heater_value=int(self._settings.value("general/seestarAlpDewHeaterValue", SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE, type=int)),
+            park_after_session=self._settings.value("general/seestarAlpParkAfterSession", SEESTAR_ALP_DEFAULT_PARK_AFTER_SESSION, type=bool),
+            shutdown_after_session=self._settings.value("general/seestarAlpShutdownAfterSession", SEESTAR_ALP_DEFAULT_SHUTDOWN_AFTER_SESSION, type=bool),
+        )
+
+    def _populate_session_template_combo(self) -> None:
+        blocker = QSignalBlocker(self.seestar_session_template_combo)
+        self.seestar_session_template_combo.clear()
+        self.seestar_session_template_combo.addItem("Current settings", "")
+        for key, template in self._builtin_session_templates.items():
+            self.seestar_session_template_combo.addItem(f"Built-in: {template.name}", f"builtin:{key}")
+        for key in sorted(self._user_session_templates.keys()):
+            template = self._user_session_templates[key]
+            self.seestar_session_template_combo.addItem(f"User: {template.name}", f"user:{key}")
+        del blocker
+
+    def _current_science_checklist_items(self) -> list[str]:
+        return [line.strip() for line in self.seestar_session_checklist_edit.toPlainText().splitlines() if line.strip()]
+
+    def _current_template_name_for_selection(self) -> str:
+        data = str(self.seestar_session_template_combo.currentData() or "")
+        if data.startswith("builtin:"):
+            template = self._builtin_session_templates.get(data.split(":", 1)[1])
+            return str(getattr(template, "name", "") or "").strip()
+        if data.startswith("user:"):
+            template = self._user_session_templates.get(data.split(":", 1)[1])
+            return str(getattr(template, "name", "") or "").strip()
+        return ""
+
+    def _current_template_scope_for_selection(self) -> str:
+        data = str(self.seestar_session_template_combo.currentData() or "")
+        if data.startswith("builtin:"):
+            template = self._builtin_session_templates.get(data.split(":", 1)[1])
+            scope = str(getattr(template, "scope", SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET) or "").strip()
+            return scope or SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET
+        if data.startswith("user:"):
+            template = self._user_session_templates.get(data.split(":", 1)[1])
+            scope = str(getattr(template, "scope", SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET) or "").strip()
+            return scope or SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET
+        return SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET
+
+    def _current_template_from_fields(
+        self,
+        *,
+        key: str = "",
+        name_override: str = "",
+        scope_override: str = "",
+    ) -> SeestarSessionTemplate:
+        name = str(name_override or self._current_template_name_for_selection() or "").strip()
+        scope = str(scope_override or self._current_template_scope_for_selection() or SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET).strip()
+        schedule_autofocus_mode = normalize_seestar_alp_schedule_autofocus_mode(
+            self.seestar_alp_schedule_af_mode_combo.currentData(),
+        )
+        return SeestarSessionTemplate(
+            key=_normalize_catalog_token(key or name).replace(" ", "_") or "template",
+            name=name,
+            scope=scope or SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET,
+            repeat_count=max(1, int(self.seestar_session_repeat_spin.value())),
+            minutes_per_run=max(1, int(self.seestar_session_minutes_spin.value())),
+            gap_seconds=max(0, int(self.seestar_session_gap_spin.value())),
+            require_science_checklist=self.seestar_session_require_checklist_chk.isChecked(),
+            science_checklist_items=self._current_science_checklist_items(),
+            template_notes=self.seestar_session_notes_edit.toPlainText().strip(),
+            lp_filter_mode=str(self.seestar_alp_lp_filter_combo.currentData() or SEESTAR_ALP_LP_FILTER_AUTO),
+            gain=max(0, int(self.seestar_alp_gain_spin.value())),
+            panel_overlap_percent=max(0, int(self.seestar_alp_panel_overlap_spin.value())),
+            use_autofocus=self.seestar_alp_use_autofocus_chk.isChecked(),
+            num_tries=max(1, int(self.seestar_alp_num_tries_spin.value())),
+            retry_wait_s=max(0, int(self.seestar_alp_retry_wait_spin.value())),
+            target_integration_override_min=0,
+            stack_exposure_ms=max(0, int(self.seestar_alp_stack_exposure_spin.value())),
+            honor_queue_times=self.seestar_alp_honor_queue_times_chk.isChecked(),
+            wait_until_local_time=self.seestar_alp_wait_until_edit.text().strip(),
+            startup_enabled=self.seestar_alp_startup_enabled_chk.isChecked(),
+            startup_polar_align=self.seestar_alp_startup_polar_align_chk.isChecked(),
+            startup_auto_focus=self.seestar_alp_startup_autofocus_chk.isChecked(),
+            startup_dark_frames=self.seestar_alp_startup_dark_frames_chk.isChecked(),
+            capture_flats_before_session=self.seestar_alp_capture_flats_chk.isChecked(),
+            flats_wait_s=max(0, int(self.seestar_alp_flats_wait_spin.value())),
+            schedule_autofocus_mode=schedule_autofocus_mode,
+            schedule_autofocus_before_each_target=(schedule_autofocus_mode == SEESTAR_ALP_AF_MODE_PER_RUN),
+            schedule_autofocus_try_count=max(1, int(self.seestar_alp_schedule_af_try_spin.value())),
+            dew_heater_value=(
+                max(0, int(self.seestar_alp_dew_heater_spin.value()))
+                if self.seestar_alp_dew_heater_chk.isChecked()
+                else SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE
+            ),
+            park_after_session=self.seestar_alp_park_after_chk.isChecked(),
+            shutdown_after_session=self.seestar_alp_shutdown_after_chk.isChecked(),
+        )
+
+    def _apply_template_to_fields(self, template: SeestarSessionTemplate) -> None:
+        self.seestar_session_repeat_spin.setValue(max(1, int(template.repeat_count)))
+        self.seestar_session_minutes_spin.setValue(max(1, int(template.minutes_per_run)))
+        self.seestar_session_gap_spin.setValue(max(0, int(template.gap_seconds)))
+        self.seestar_session_require_checklist_chk.setChecked(bool(template.require_science_checklist))
+        self.seestar_session_notes_edit.setPlainText(str(template.template_notes or ""))
+        self.seestar_session_checklist_edit.setPlainText("\n".join(template.science_checklist_items))
+        lp_idx = self.seestar_alp_lp_filter_combo.findData(str(template.lp_filter_mode or SEESTAR_ALP_LP_FILTER_AUTO))
+        if lp_idx >= 0:
+            self.seestar_alp_lp_filter_combo.setCurrentIndex(lp_idx)
+        self.seestar_alp_gain_spin.setValue(max(0, int(template.gain)))
+        self.seestar_alp_panel_overlap_spin.setValue(max(0, int(template.panel_overlap_percent)))
+        self.seestar_alp_use_autofocus_chk.setChecked(bool(template.use_autofocus))
+        self.seestar_alp_num_tries_spin.setValue(max(1, int(template.num_tries)))
+        self.seestar_alp_retry_wait_spin.setValue(max(0, int(template.retry_wait_s)))
+        self.seestar_alp_stack_exposure_spin.setValue(max(0, int(template.stack_exposure_ms)))
+        self.seestar_alp_honor_queue_times_chk.setChecked(bool(template.honor_queue_times))
+        self.seestar_alp_wait_until_edit.setText(str(template.wait_until_local_time or ""))
+        self.seestar_alp_startup_enabled_chk.setChecked(bool(template.startup_enabled))
+        self.seestar_alp_startup_polar_align_chk.setChecked(bool(template.startup_polar_align))
+        self.seestar_alp_startup_autofocus_chk.setChecked(bool(template.startup_auto_focus))
+        self.seestar_alp_startup_dark_frames_chk.setChecked(bool(template.startup_dark_frames))
+        self.seestar_alp_capture_flats_chk.setChecked(bool(template.capture_flats_before_session))
+        self.seestar_alp_flats_wait_spin.setValue(max(0, int(template.flats_wait_s)))
+        schedule_af_mode = normalize_seestar_alp_schedule_autofocus_mode(
+            getattr(template, "schedule_autofocus_mode", ""),
+            legacy_enabled=bool(getattr(template, "schedule_autofocus_before_each_target", False)),
+        )
+        schedule_af_idx = self.seestar_alp_schedule_af_mode_combo.findData(schedule_af_mode)
+        if schedule_af_idx < 0:
+            schedule_af_idx = 0
+        self.seestar_alp_schedule_af_mode_combo.setCurrentIndex(schedule_af_idx)
+        self.seestar_alp_schedule_af_try_spin.setValue(max(1, int(template.schedule_autofocus_try_count)))
+        self.seestar_alp_dew_heater_chk.setChecked(int(template.dew_heater_value) >= 0)
+        self.seestar_alp_dew_heater_spin.setValue(max(0, int(template.dew_heater_value) if int(template.dew_heater_value) >= 0 else 10))
+        self.seestar_alp_park_after_chk.setChecked(bool(template.park_after_session))
+        self.seestar_alp_shutdown_after_chk.setChecked(bool(template.shutdown_after_session))
+        self._update_automation_fields_enabled()
+        self._update_template_state()
+        self._refresh_target_override_defaults()
+
+    def _update_template_state(self) -> None:
+        scope = self._current_template_scope_for_selection()
+        if scope == SEESTAR_TEMPLATE_SCOPE_SINGLE_TARGET:
+            self._seestar_template_scope_text = "Single target."
+        else:
+            self._seestar_template_scope_text = "Multi-target."
+        self.seestar_session_template_delete_btn.setEnabled(
+            str(self.seestar_session_template_combo.currentData() or "").startswith("user:")
+        )
+        self._refresh_target_override_defaults()
+        QTimer.singleShot(0, self._adjust_session_splitter_sizes)
+
+    def _update_automation_fields_enabled(self) -> None:
+        startup_enabled = self.seestar_alp_startup_enabled_chk.isChecked()
+        self.seestar_alp_startup_polar_align_chk.setEnabled(startup_enabled)
+        self.seestar_alp_startup_autofocus_chk.setEnabled(startup_enabled)
+        self.seestar_alp_startup_dark_frames_chk.setEnabled(startup_enabled)
+
+        flats_enabled = self.seestar_alp_capture_flats_chk.isChecked()
+        self.seestar_alp_flats_wait_spin.setEnabled(flats_enabled)
+
+        schedule_af_enabled = (
+            str(self.seestar_alp_schedule_af_mode_combo.currentData() or SEESTAR_ALP_AF_MODE_OFF)
+            != SEESTAR_ALP_AF_MODE_OFF
+        )
+        self.seestar_alp_schedule_af_try_spin.setEnabled(schedule_af_enabled)
+
+        dew_enabled = self.seestar_alp_dew_heater_chk.isChecked()
+        self.seestar_alp_dew_heater_spin.setEnabled(dew_enabled)
+
+        shutdown_enabled = self.seestar_alp_shutdown_after_chk.isChecked()
+        if shutdown_enabled:
+            self.seestar_alp_park_after_chk.setChecked(True)
+        self.seestar_alp_park_after_chk.setEnabled(not shutdown_enabled)
+
+    def _select_session_template(self, preset_key: str) -> None:
+        normalized = str(preset_key or "").strip()
+        if normalized and not normalized.startswith(("builtin:", "user:")):
+            if normalized in self._builtin_session_templates:
+                normalized = f"builtin:{normalized}"
+            elif normalized in self._user_session_templates:
+                normalized = f"user:{normalized}"
+            else:
+                normalized = ""
+        idx = self.seestar_session_template_combo.findData(normalized)
+        if idx < 0:
+            idx = 0
+        blocker = QSignalBlocker(self.seestar_session_template_combo)
+        self.seestar_session_template_combo.setCurrentIndex(idx)
+        del blocker
+
+    def _on_session_template_changed(self) -> None:
+        data = str(self.seestar_session_template_combo.currentData() or "")
+        if data.startswith("builtin:"):
+            template = self._builtin_session_templates.get(data.split(":", 1)[1])
+        elif data.startswith("user:"):
+            template = self._user_session_templates.get(data.split(":", 1)[1])
+        else:
+            template = self._current_settings_template
+        if template is not None:
+            self._apply_template_to_fields(template)
+
+    def _save_session_template(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Save Seestar Session Template",
+            "Template name:",
+            text=self._current_template_name_for_selection() or "Session template",
+        )
+        if not ok:
+            return
+        template_name = str(name or "").strip()
+        if not template_name:
+            QMessageBox.warning(self, "Seestar Template", "Template name cannot be empty.")
+            return
+        key = _normalize_catalog_token(template_name).replace(" ", "_") or "template"
+        template = self._current_template_from_fields(
+            key=key,
+            name_override=template_name,
+            scope_override=self._current_template_scope_for_selection(),
+        )
+        self._user_session_templates[key] = template
+        self._populate_session_template_combo()
+        idx = self.seestar_session_template_combo.findData(f"user:{key}")
+        if idx >= 0:
+            self.seestar_session_template_combo.setCurrentIndex(idx)
+        QMessageBox.information(self, "Seestar Template", f"Saved template '{template_name}'.")
+
+    def _delete_session_template(self) -> None:
+        data = str(self.seestar_session_template_combo.currentData() or "")
+        if not data.startswith("user:"):
+            QMessageBox.information(self, "Seestar Template", "Only user templates can be deleted.")
+            return
+        key = data.split(":", 1)[1]
+        template = self._user_session_templates.get(key)
+        if template is None:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Seestar Template",
+            f"Delete template '{template.name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._user_session_templates.pop(key, None)
+        self._populate_session_template_combo()
+        self.seestar_session_template_combo.setCurrentIndex(0)
+        self._update_template_state()
+
+    def _set_combo_data(self, combo: QComboBox, value: object) -> None:
+        idx = combo.findData(value)
+        if idx < 0:
+            idx = 0
+        combo.setCurrentIndex(idx)
+
+    def _make_override_spin_cell(
+        self,
+        *,
+        minimum: int,
+        maximum: int,
+        default_provider: Callable[[], int],
+        suffix: str = "",
+        single_step: int | None = None,
+        min_width: int = 92,
+    ) -> dict[str, object]:
+        cell = QWidget(self.seestar_targets_table)
+        layout = QHBoxLayout(cell)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+
+        use_default_chk = QCheckBox(cell)
+        use_default_chk.setChecked(True)
+        use_default_chk.setToolTip("Checked = use the Plan default for this column")
+        layout.addWidget(use_default_chk, 0)
+
+        editor = QSpinBox(cell)
+        editor.setRange(minimum, maximum)
+        editor.setSingleStep(single_step if single_step is not None else (5 if maximum > 100 else 1))
+        if suffix:
+            editor.setSuffix(suffix)
+        editor.setMinimumWidth(min_width)
+        editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(editor, 1)
+
+        def _refresh() -> None:
+            default_value = max(minimum, min(maximum, int(default_provider())))
+            if use_default_chk.isChecked():
+                blocked = editor.blockSignals(True)
+                editor.setValue(default_value)
+                editor.blockSignals(blocked)
+                editor.setEnabled(False)
+                editor.setToolTip(f"Using Plan default: {default_value}{suffix}")
+            else:
+                editor.setEnabled(True)
+                editor.setToolTip("Row override")
+
+        def _on_toggle(checked: bool) -> None:
+            if checked:
+                editor.setProperty("_override_value", int(editor.value()))
+            else:
+                stored = editor.property("_override_value")
+                if stored is not None:
+                    blocked = editor.blockSignals(True)
+                    editor.setValue(max(minimum, min(maximum, int(stored))))
+                    editor.blockSignals(blocked)
+            _refresh()
+
+        def _on_value_changed(value: int) -> None:
+            if not use_default_chk.isChecked():
+                editor.setProperty("_override_value", int(value))
+
+        use_default_chk.toggled.connect(_on_toggle)
+        editor.valueChanged.connect(_on_value_changed)
+        _refresh()
+        return {
+            "widget": cell,
+            "default": use_default_chk,
+            "editor": editor,
+            "refresh": _refresh,
+            "value": lambda: None if use_default_chk.isChecked() else int(editor.value()),
+        }
+
+    def _make_override_combo_cell(
+        self,
+        items: list[tuple[str, object]],
+        *,
+        default_provider: Callable[[], object],
+        min_width: int = 96,
+    ) -> dict[str, object]:
+        cell = QWidget(self.seestar_targets_table)
+        layout = QHBoxLayout(cell)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+
+        use_default_chk = QCheckBox(cell)
+        use_default_chk.setChecked(True)
+        use_default_chk.setToolTip("Checked = use the Plan default for this column")
+        layout.addWidget(use_default_chk, 0)
+
+        combo = QComboBox(cell)
+        combo.setMinimumWidth(min_width)
+        combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for label, data in items:
+            combo.addItem(label, data)
+        layout.addWidget(combo, 1)
+
+        def _refresh() -> None:
+            if use_default_chk.isChecked():
+                blocked = combo.blockSignals(True)
+                self._set_combo_data(combo, default_provider())
+                combo.blockSignals(blocked)
+                combo.setEnabled(False)
+                combo.setToolTip("Using Plan default")
+            else:
+                combo.setEnabled(True)
+                combo.setToolTip("Row override")
+
+        def _on_toggle(checked: bool) -> None:
+            if checked:
+                combo.setProperty("_override_data", combo.currentData())
+            else:
+                stored = combo.property("_override_data")
+                if stored is not None:
+                    blocked = combo.blockSignals(True)
+                    self._set_combo_data(combo, stored)
+                    combo.blockSignals(blocked)
+            _refresh()
+
+        def _on_index_changed(_: int) -> None:
+            if not use_default_chk.isChecked():
+                combo.setProperty("_override_data", combo.currentData())
+
+        use_default_chk.toggled.connect(_on_toggle)
+        combo.currentIndexChanged.connect(_on_index_changed)
+        _refresh()
+        return {
+            "widget": cell,
+            "default": use_default_chk,
+            "editor": combo,
+            "refresh": _refresh,
+            "value": lambda: None if use_default_chk.isChecked() else combo.currentData(),
+        }
+
+    def _refresh_target_override_defaults(self) -> None:
+        for row_state in self._target_plan_rows:
+            for key in ("repeat", "minutes", "gap", "exposure", "lp", "af"):
+                cell = row_state.get(key)
+                if isinstance(cell, dict):
+                    refresh = cell.get("refresh")
+                    if callable(refresh):
+                        refresh()
+            self._update_target_row_enabled_state(row_state)
+        if hasattr(self, "seestar_defaults_summary_label"):
+            lp_label = self.seestar_alp_lp_filter_combo.currentText() if hasattr(self, "seestar_alp_lp_filter_combo") else "Auto"
+            af_label = "on" if getattr(self, "seestar_alp_use_autofocus_chk", None) and self.seestar_alp_use_autofocus_chk.isChecked() else "off"
+            schedule_af_label = seestar_alp_schedule_autofocus_mode_label(
+                self.seestar_alp_schedule_af_mode_combo.currentData()
+                if hasattr(self, "seestar_alp_schedule_af_mode_combo")
+                else SEESTAR_ALP_AF_MODE_OFF,
+                short=True,
+            )
+            scope_text = str(getattr(self, "_seestar_template_scope_text", "Multi-target.") or "Multi-target.").strip()
+            self.seestar_defaults_summary_label.setText(
+                f"{scope_text} Defaults: "
+                f"{int(self.seestar_session_repeat_spin.value())} x "
+                f"{int(self.seestar_session_minutes_spin.value())} min, "
+                f"gap {int(self.seestar_session_gap_spin.value())} s, "
+                f"LP {lp_label}, exp {int(self.seestar_alp_stack_exposure_spin.value()) or 'ALP default'}, "
+                f"capture-job AF {af_label}, scheduled AF {schedule_af_label}."
+            )
+        QTimer.singleShot(0, self._adjust_session_splitter_sizes)
+
+    def _adjust_session_splitter_sizes(self) -> None:
+        splitter = getattr(self, "_body_splitter", None)
+        settings_panel = getattr(self, "_settings_panel", None)
+        targets_panel = getattr(self, "_targets_panel", None)
+        if splitter is None or settings_panel is None or targets_panel is None:
+            return
+        body_total = splitter.height()
+        if body_total <= 0:
+            return
+
+        current_tab = self._session_tabs.currentWidget() if hasattr(self, "_session_tabs") else None
+        tab_height = current_tab.sizeHint().height() if current_tab is not None else settings_panel.sizeHint().height()
+        tabs_height = self._session_tabs.tabBar().sizeHint().height() if hasattr(self, "_session_tabs") else 0
+        top_desired = max(300, tab_height + tabs_height + 28)
+
+        row_count = self.seestar_targets_table.rowCount() if hasattr(self, "seestar_targets_table") else 0
+        current_tab_name = self._session_tabs.tabText(self._session_tabs.currentIndex()) if hasattr(self, "_session_tabs") else ""
+        max_visible_rows = 6 if current_tab_name == "Session" else 4
+        visible_rows = min(max(row_count, 1), max_visible_rows)
+        header_height = self.seestar_targets_table.horizontalHeader().height() if hasattr(self, "seestar_targets_table") else 28
+        row_height = (
+            self.seestar_targets_table.rowHeight(0)
+            if hasattr(self, "seestar_targets_table") and row_count > 0
+            else max(30, self.fontMetrics().height() + 10)
+        )
+        bottom_base = 170 if current_tab_name == "Session" else 125
+        bottom_desired = bottom_base + header_height + (visible_rows * row_height)
+        bottom_desired = max(220, min(bottom_desired, 420))
+
+        if top_desired + bottom_desired > body_total:
+            bottom_desired = max(220, min(bottom_desired, body_total - 260))
+            top_desired = max(260, body_total - bottom_desired)
+        else:
+            top_desired = min(top_desired, body_total - 220)
+
+        splitter.setSizes([top_desired, max(220, body_total - top_desired)])
+
+    def _set_all_target_rows_enabled(self, enabled: bool) -> None:
+        for row_state in self._target_plan_rows:
+            checkbox = row_state.get("enabled")
+            if hasattr(checkbox, "setChecked"):
+                checkbox.setChecked(bool(enabled))
+
+    def _reset_all_target_row_defaults(self) -> None:
+        for row_state in self._target_plan_rows:
+            for key in ("repeat", "minutes", "gap", "exposure", "lp", "af"):
+                cell = row_state.get(key)
+                if not isinstance(cell, dict):
+                    continue
+                default_chk = cell.get("default")
+                if hasattr(default_chk, "setChecked"):
+                    default_chk.setChecked(True)
+        self._refresh_target_override_defaults()
+
+    def _update_target_row_enabled_state(self, row_state: dict[str, object]) -> None:
+        enabled = bool(row_state.get("enabled") and row_state["enabled"].isChecked())
+        for key in ("repeat", "minutes", "gap", "exposure", "lp", "af"):
+            cell = row_state.get(key)
+            if not isinstance(cell, dict):
+                continue
+            default_chk = cell.get("default")
+            editor = cell.get("editor")
+            if hasattr(default_chk, "setEnabled"):
+                default_chk.setEnabled(enabled)
+            if hasattr(editor, "setEnabled"):
+                if enabled:
+                    refresh = cell.get("refresh")
+                    if callable(refresh):
+                        refresh()
+                else:
+                    editor.setEnabled(False)
+
+    def _format_target_ra(self, ra_deg: float) -> str:
+        try:
+            coord = SkyCoord(ra=float(ra_deg) * u.deg, dec=0.0 * u.deg)
+            return coord.ra.to_string(unit=u.hour, sep=":", precision=0, pad=True)
+        except Exception:
+            return f"{float(ra_deg):.4f}"
+
+    def _format_target_dec(self, dec_deg: float) -> str:
+        try:
+            coord = SkyCoord(ra=0.0 * u.deg, dec=float(dec_deg) * u.deg)
+            return coord.dec.to_string(unit=u.deg, sep=":", precision=0, pad=True, alwayssign=True)
+        except Exception:
+            return f"{float(dec_deg):+.4f}"
+
+    def _populate_targets_table(self) -> None:
+        self.seestar_targets_table.setRowCount(0)
+        self._target_plan_rows = []
+        self.seestar_targets_table.setWordWrap(False)
+        self.seestar_targets_table.verticalHeader().setDefaultSectionSize(42)
+        for row, target in enumerate(self._planner.targets):
+            self.seestar_targets_table.insertRow(row)
+
+            enabled_chk = QCheckBox(self.seestar_targets_table)
+            enabled_chk.setChecked(True)
+            enabled_wrap = QWidget(self.seestar_targets_table)
+            enabled_layout = QHBoxLayout(enabled_wrap)
+            enabled_layout.setContentsMargins(4, 0, 4, 0)
+            enabled_layout.setAlignment(Qt.AlignCenter)
+            enabled_layout.addWidget(enabled_chk)
+            self.seestar_targets_table.setCellWidget(row, 0, enabled_wrap)
+
+            order_item = QTableWidgetItem(str(row + 1))
+            order_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.seestar_targets_table.setItem(row, 1, order_item)
+
+            for column, value in (
+                (2, str(target.name or "")),
+                (3, self._format_target_ra(float(target.ra))),
+                (4, self._format_target_dec(float(target.dec))),
+                (5, str(target.object_type or "")),
+            ):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                item.setToolTip(value)
+                self.seestar_targets_table.setItem(row, column, item)
+
+            repeat_cell = self._make_override_spin_cell(
+                minimum=1,
+                maximum=50,
+                default_provider=lambda: int(self.seestar_session_repeat_spin.value()),
+                min_width=74,
+            )
+            minutes_cell = self._make_override_spin_cell(
+                minimum=1,
+                maximum=240,
+                default_provider=lambda: int(self.seestar_session_minutes_spin.value()),
+                suffix=" min",
+                single_step=5,
+                min_width=88,
+            )
+            gap_cell = self._make_override_spin_cell(
+                minimum=0,
+                maximum=3600,
+                default_provider=lambda: int(self.seestar_session_gap_spin.value()),
+                suffix=" s",
+                single_step=5,
+                min_width=82,
+            )
+            exposure_cell = self._make_override_spin_cell(
+                minimum=0,
+                maximum=600000,
+                default_provider=lambda: int(self.seestar_alp_stack_exposure_spin.value()),
+                suffix=" ms",
+                single_step=500,
+                min_width=108,
+            )
+            lp_cell = self._make_override_combo_cell(
+                [
+                    ("Auto", SEESTAR_ALP_LP_FILTER_AUTO),
+                    ("OFF", SEESTAR_ALP_LP_FILTER_OFF),
+                    ("ON", SEESTAR_ALP_LP_FILTER_ON),
+                ],
+                default_provider=lambda: str(self.seestar_alp_lp_filter_combo.currentData() or SEESTAR_ALP_LP_FILTER_AUTO),
+                min_width=92,
+            )
+            af_cell = self._make_override_combo_cell(
+                [
+                    ("On", True),
+                    ("Off", False),
+                ],
+                default_provider=lambda: bool(self.seestar_alp_use_autofocus_chk.isChecked()),
+                min_width=78,
+            )
+
+            self.seestar_targets_table.setCellWidget(row, 6, repeat_cell["widget"])
+            self.seestar_targets_table.setCellWidget(row, 7, minutes_cell["widget"])
+            self.seestar_targets_table.setCellWidget(row, 8, gap_cell["widget"])
+            self.seestar_targets_table.setCellWidget(row, 9, exposure_cell["widget"])
+            self.seestar_targets_table.setCellWidget(row, 10, lp_cell["widget"])
+            self.seestar_targets_table.setCellWidget(row, 11, af_cell["widget"])
+
+            row_state = {
+                "target": target,
+                "enabled": enabled_chk,
+                "repeat": repeat_cell,
+                "minutes": minutes_cell,
+                "gap": gap_cell,
+                "exposure": exposure_cell,
+                "lp": lp_cell,
+                "af": af_cell,
+            }
+            enabled_chk.toggled.connect(lambda _checked, state=row_state: self._update_target_row_enabled_state(state))
+            self._target_plan_rows.append(row_state)
+            self._update_target_row_enabled_state(row_state)
+
+        self.seestar_targets_table.setColumnWidth(0, 54)
+        self.seestar_targets_table.setColumnWidth(1, 40)
+        self.seestar_targets_table.setColumnWidth(3, 100)
+        self.seestar_targets_table.setColumnWidth(4, 112)
+        self.seestar_targets_table.setColumnWidth(5, 74)
+        self.seestar_targets_table.setColumnWidth(6, 98)
+        self.seestar_targets_table.setColumnWidth(7, 114)
+        self.seestar_targets_table.setColumnWidth(8, 100)
+        self.seestar_targets_table.setColumnWidth(9, 132)
+        self.seestar_targets_table.setColumnWidth(10, 102)
+        self.seestar_targets_table.setColumnWidth(11, 92)
+        self.seestar_targets_table.setMinimumHeight(max(220, min(420, 42 + 30 * max(1, len(self._target_plan_rows)))))
+        self._refresh_target_override_defaults()
+
+    def session_template(self) -> SeestarSessionTemplate:
+        data = str(self.seestar_session_template_combo.currentData() or "")
+        name = self._current_template_name_for_selection() if data else ""
+        scope = self._current_template_scope_for_selection()
+        return self._current_template_from_fields(name_override=name, scope_override=scope)
+
+    def method(self) -> str:
+        return str(self.seestar_method_combo.currentData() or SEESTAR_METHOD_GUIDED).strip().lower()
+
+    def alp_config(self) -> SeestarAlpConfig:
+        template = self.session_template()
+        schedule_autofocus_mode = normalize_seestar_alp_schedule_autofocus_mode(
+            getattr(template, "schedule_autofocus_mode", ""),
+            legacy_enabled=bool(getattr(template, "schedule_autofocus_before_each_target", False)),
+        )
+        return SeestarAlpConfig(
+            base_url=str(
+                self._settings.value("general/seestarAlpBaseUrl", SEESTAR_ALP_DEFAULT_BASE_URL, type=str)
+                or SEESTAR_ALP_DEFAULT_BASE_URL
+            ).strip(),
+            device_num=max(
+                0,
+                int(
+                    self._settings.value(
+                        "general/seestarAlpDeviceNum",
+                        SEESTAR_ALP_DEFAULT_DEVICE_NUM,
+                        type=int,
+                    )
+                ),
+            ),
+            client_id=max(
+                1,
+                int(
+                    self._settings.value(
+                        "general/seestarAlpClientId",
+                        SEESTAR_ALP_DEFAULT_CLIENT_ID,
+                        type=int,
+                    )
+                ),
+            ),
+            timeout_s=max(
+                1.0,
+                float(
+                    self._settings.value(
+                        "general/seestarAlpTimeoutSec",
+                        SEESTAR_ALP_DEFAULT_TIMEOUT_S,
+                        type=float,
+                    )
+                ),
+            ),
+            gain=max(0, int(template.gain)),
+            panel_overlap_percent=max(0, int(template.panel_overlap_percent)),
+            use_autofocus=bool(template.use_autofocus),
+            num_tries=max(1, int(template.num_tries)),
+            retry_wait_s=max(0, int(template.retry_wait_s)),
+            target_integration_override_min=max(0, int(template.target_integration_override_min)),
+            stack_exposure_ms=max(0, int(template.stack_exposure_ms)),
+            lp_filter_mode=str(template.lp_filter_mode or SEESTAR_ALP_LP_FILTER_AUTO).strip().lower(),
+            honor_queue_times=bool(template.honor_queue_times),
+            wait_until_local_time=str(template.wait_until_local_time or "").strip(),
+            startup_enabled=bool(template.startup_enabled),
+            startup_polar_align=bool(template.startup_polar_align),
+            startup_auto_focus=bool(template.startup_auto_focus),
+            startup_dark_frames=bool(template.startup_dark_frames),
+            capture_flats_before_session=bool(template.capture_flats_before_session),
+            flats_wait_s=max(0, int(template.flats_wait_s)),
+            schedule_autofocus_mode=schedule_autofocus_mode,
+            schedule_autofocus_before_each_target=(schedule_autofocus_mode == SEESTAR_ALP_AF_MODE_PER_RUN),
+            schedule_autofocus_try_count=max(1, int(template.schedule_autofocus_try_count)),
+            dew_heater_value=int(template.dew_heater_value),
+            park_after_session=bool(template.park_after_session),
+            shutdown_after_session=bool(template.shutdown_after_session),
+        )
+
+    def session_items(self) -> list[SeestarTargetSessionItem]:
+        items: list[SeestarTargetSessionItem] = []
+        for row, row_state in enumerate(self._target_plan_rows, start=1):
+            target = row_state["target"]
+            metrics = self._planner.target_metrics.get(target.name)
+            window = self._planner.target_windows.get(target.name)
+            lp_value = row_state["lp"]["value"]()
+            af_value = row_state["af"]["value"]()
+            items.append(
+                SeestarTargetSessionItem(
+                    enabled=bool(row_state["enabled"].isChecked()),
+                    order=row,
+                    target_name=str(target.name or "").strip(),
+                    ra_deg=float(target.ra),
+                    dec_deg=float(target.dec),
+                    object_type=str(target.object_type or ""),
+                    notes=str(target.notes or "").strip(),
+                    score=float(getattr(metrics, "score", 0.0) or 0.0),
+                    hours_above_limit=float(getattr(metrics, "hours_above_limit", 0.0) or 0.0),
+                    max_altitude_deg=float(getattr(metrics, "max_altitude_deg", 0.0) or 0.0),
+                    window_start_local=window[0] if isinstance(window, tuple) and len(window) == 2 else None,
+                    window_end_local=window[1] if isinstance(window, tuple) and len(window) == 2 else None,
+                    repeat_count=row_state["repeat"]["value"](),
+                    segment_minutes=row_state["minutes"]["value"](),
+                    gap_seconds=row_state["gap"]["value"](),
+                    stack_exposure_ms=row_state["exposure"]["value"](),
+                    lp_filter_mode=str(lp_value).strip().lower() or None,
+                    autofocus=af_value if isinstance(af_value, bool) else None,
+                )
+            )
+        return items
+
+    def _apply_changes(self) -> None:
+        s = self._settings
+        selected_template_key = str(self.seestar_session_template_combo.currentData() or "")
+        current_template = self._current_template_from_fields()
+        s.setValue("general/seestarMethod", self.method())
+        s.setValue("general/seestarSessionTemplateKey", selected_template_key)
+        s.setValue("general/seestarSessionUserTemplates", dump_user_seestar_session_templates(self._user_session_templates))
+        if not selected_template_key:
+            s.setValue("general/seestarSessionRepeatCount", max(1, int(self.seestar_session_repeat_spin.value())))
+            s.setValue("general/seestarSessionMinutesPerRun", max(1, int(self.seestar_session_minutes_spin.value())))
+            s.setValue("general/seestarSessionGapSeconds", max(0, int(self.seestar_session_gap_spin.value())))
+            s.setValue("general/seestarSessionRequireChecklist", self.seestar_session_require_checklist_chk.isChecked())
+            s.setValue("general/seestarSessionChecklistText", self.seestar_session_checklist_edit.toPlainText().strip())
+            s.setValue("general/seestarSessionTemplateNotes", self.seestar_session_notes_edit.toPlainText().strip())
+            s.setValue("general/seestarAlpGain", max(0, int(self.seestar_alp_gain_spin.value())))
+            s.setValue("general/seestarAlpPanelOverlapPercent", max(0, int(self.seestar_alp_panel_overlap_spin.value())))
+            s.setValue("general/seestarAlpUseAutofocus", self.seestar_alp_use_autofocus_chk.isChecked())
+            s.setValue("general/seestarAlpNumTries", max(1, int(self.seestar_alp_num_tries_spin.value())))
+            s.setValue("general/seestarAlpRetryWaitSec", max(0, int(self.seestar_alp_retry_wait_spin.value())))
+            s.setValue("general/seestarAlpStackExposureMs", max(0, int(self.seestar_alp_stack_exposure_spin.value())))
+            s.setValue("general/seestarAlpLpFilterMode", str(self.seestar_alp_lp_filter_combo.currentData() or SEESTAR_ALP_LP_FILTER_AUTO).strip().lower())
+            s.setValue("general/seestarAlpHonorQueueTimes", self.seestar_alp_honor_queue_times_chk.isChecked())
+            s.setValue("general/seestarAlpWaitUntilLocalTime", self.seestar_alp_wait_until_edit.text().strip())
+            s.setValue("general/seestarAlpStartupEnabled", self.seestar_alp_startup_enabled_chk.isChecked())
+            s.setValue("general/seestarAlpStartupPolarAlign", self.seestar_alp_startup_polar_align_chk.isChecked())
+            s.setValue("general/seestarAlpStartupAutoFocus", self.seestar_alp_startup_autofocus_chk.isChecked())
+            s.setValue("general/seestarAlpStartupDarkFrames", self.seestar_alp_startup_dark_frames_chk.isChecked())
+            s.setValue("general/seestarAlpCaptureFlatsBeforeSession", self.seestar_alp_capture_flats_chk.isChecked())
+            s.setValue("general/seestarAlpFlatsWaitSec", max(0, int(self.seestar_alp_flats_wait_spin.value())))
+            schedule_autofocus_mode = normalize_seestar_alp_schedule_autofocus_mode(
+                self.seestar_alp_schedule_af_mode_combo.currentData(),
+            )
+            s.setValue("general/seestarAlpScheduleAutofocusMode", schedule_autofocus_mode)
+            s.setValue(
+                "general/seestarAlpScheduleAutofocusBeforeEachTarget",
+                schedule_autofocus_mode == SEESTAR_ALP_AF_MODE_PER_RUN,
+            )
+            s.setValue("general/seestarAlpScheduleAutofocusTryCount", max(1, int(self.seestar_alp_schedule_af_try_spin.value())))
+            s.setValue(
+                "general/seestarAlpDewHeaterValue",
+                max(0, int(self.seestar_alp_dew_heater_spin.value()))
+                if self.seestar_alp_dew_heater_chk.isChecked()
+                else SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE,
+            )
+            s.setValue("general/seestarAlpParkAfterSession", self.seestar_alp_park_after_chk.isChecked())
+            s.setValue("general/seestarAlpShutdownAfterSession", self.seestar_alp_shutdown_after_chk.isChecked())
+            self._current_settings_template = current_template
+
+    def accept(self) -> None:
+        enabled_items = [item for item in self.session_items() if item.enabled]
+        if not enabled_items:
+            QMessageBox.warning(self, "Seestar Session", "Enable at least one target in the session table.")
+            return
+        template = self.session_template()
+        if str(template.scope or SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET) == SEESTAR_TEMPLATE_SCOPE_SINGLE_TARGET and len(enabled_items) != 1:
+            QMessageBox.warning(
+                self,
+                "Seestar Session",
+                "The selected template is single-target. Enable exactly one target in the session table.",
+            )
+            return
+        self._apply_changes()
+        super().accept()
+
+
+class WeatherLiveWorker(QThread):
+    """Background weather loader with per-provider cache and incremental payload updates."""
+
+    progress = Signal(str, int, int)
+    partial = Signal(dict)
+    completed = Signal(dict)
+
+    _CACHE_LOCK = threading.Lock()
+    _CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+
+    TTL_CONDITIONS_S = 120.0
+    TTL_FORECAST_S = 600.0
+    TTL_CLIMATOLOGY_S = 24.0 * 3600.0
+
+    MONTH_NAMES = (
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    )
+
+    def __init__(
+        self,
+        *,
+        lat: float,
+        lon: float,
+        elev: float,
+        custom_conditions_url: str = "",
+        cloud_map_source: str = "earthenv",
+        cloud_map_month: int = 1,
+        force_refresh: bool = False,
+        include_cloud_map: bool = True,
+        include_satellite: bool = True,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.lat = float(lat)
+        self.lon = float(lon)
+        self.elev = float(elev)
+        self.custom_conditions_url = str(custom_conditions_url or "").strip()
+        self.cloud_map_source = str(cloud_map_source or "earthenv").strip().lower()
+        self.cloud_map_month = max(1, min(12, int(cloud_map_month)))
+        self.force_refresh = bool(force_refresh)
+        self.include_cloud_map = bool(include_cloud_map)
+        self.include_satellite = bool(include_satellite)
+
+    @staticmethod
+    def _http_get_text(url: str, timeout_s: float = 20.0) -> str:
+        req = Request(
+            str(url),
+            headers={
+                "User-Agent": "Mozilla/5.0 (AstroPlanner Weather)",
+                "Accept": "application/json,text/html,*/*",
+            },
+        )
+        with urlopen(req, timeout=float(timeout_s)) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _http_get_json(url: str, timeout_s: float = 20.0) -> object:
+        text = WeatherLiveWorker._http_get_text(url, timeout_s=timeout_s)
+        return json.loads(text)
+
+    @staticmethod
+    def _http_post_json(url: str, payload: dict[str, object], timeout_s: float = 30.0) -> object:
+        data = json.dumps(payload).encode("utf-8")
+        req = Request(
+            str(url),
+            data=data,
+            headers={
+                "User-Agent": "Mozilla/5.0 (AstroPlanner Weather)",
+                "Content-Type": "application/json",
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        with urlopen(req, timeout=float(timeout_s)) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        return json.loads(text)
+
+    @staticmethod
+    def _http_get_bytes(url: str, timeout_s: float = 30.0) -> bytes:
+        req = Request(
+            str(url),
+            headers={
+                "User-Agent": "Mozilla/5.0 (AstroPlanner Weather)",
+                "Accept": "image/*,*/*",
+            },
+        )
+        with urlopen(req, timeout=float(timeout_s)) as resp:
+            return bytes(resp.read())
+
+    @staticmethod
+    def _to_float_list(values: object) -> list[float]:
+        out: list[float] = []
+        if not isinstance(values, list):
+            return out
+        for value in values:
+            fv = _safe_float(value)
+            if fv is None or not math.isfinite(fv):
+                continue
+            out.append(float(fv))
+        return out
+
+    @staticmethod
+    def _k_to_c(value_k: Optional[float]) -> Optional[float]:
+        if value_k is None:
+            return None
+        return float(value_k) - 273.15
+
+    @staticmethod
+    def _avg(values: list[float]) -> Optional[float]:
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    @staticmethod
+    def _first(values: list[float]) -> Optional[float]:
+        return float(values[0]) if values else None
+
+    @staticmethod
+    def _extract_chart_series_by_name(payload: object) -> dict[str, list[float]]:
+        if not isinstance(payload, dict):
+            return {}
+        series = payload.get("series")
+        if not isinstance(series, list):
+            return {}
+        out: dict[str, list[float]] = {}
+        for item in series:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip().lower()
+            data = WeatherLiveWorker._to_float_list(item.get("data"))
+            if name and data:
+                out[name] = data
+        return out
+
+    @staticmethod
+    def _cache_get(cache_key: str, ttl_s: float) -> Optional[dict[str, object]]:
+        now = perf_counter()
+        with WeatherLiveWorker._CACHE_LOCK:
+            bucket = WeatherLiveWorker._CACHE.get(str(cache_key))
+        if not isinstance(bucket, tuple) or len(bucket) != 2:
+            return None
+        stamp, payload = bucket
+        if now - float(stamp) > float(ttl_s):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return copy.deepcopy(payload)
+
+    @staticmethod
+    def _cache_set(cache_key: str, payload: dict[str, object]) -> None:
+        with WeatherLiveWorker._CACHE_LOCK:
+            WeatherLiveWorker._CACHE[str(cache_key)] = (perf_counter(), copy.deepcopy(payload))
+
+    def _run_cached(
+        self,
+        *,
+        cache_key: str,
+        ttl_s: float,
+        fetcher: Callable[[], dict[str, object]],
+    ) -> tuple[dict[str, object], bool]:
+        if not self.force_refresh:
+            cached = self._cache_get(cache_key, ttl_s)
+            if cached is not None:
+                return cached, True
+        payload = fetcher()
+        self._cache_set(cache_key, payload)
+        return copy.deepcopy(payload), False
+
+    @staticmethod
+    def _iso_to_timestamp(value: object, *, utc_offset_seconds: int = 0) -> Optional[int]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if parsed.tzinfo is None:
+            raw = int(parsed.replace(tzinfo=timezone.utc).timestamp())
+            return int(raw - int(utc_offset_seconds))
+        return int(parsed.timestamp())
+
+    @staticmethod
+    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        r = 6371.0
+        p1 = math.radians(float(lat1))
+        p2 = math.radians(float(lat2))
+        dp = p2 - p1
+        dl = math.radians(float(lon2) - float(lon1))
+        a = math.sin(dp / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
+        return 2.0 * r * math.asin(max(0.0, min(1.0, math.sqrt(a))))
+
+    @staticmethod
+    def _estimate_rh_from_temp_dew(temp_c: Optional[float], dew_c: Optional[float]) -> Optional[float]:
+        if temp_c is None or dew_c is None:
+            return None
+        try:
+            t = float(temp_c)
+            d = float(dew_c)
+            if not math.isfinite(t) or not math.isfinite(d):
+                return None
+            # Magnus approximation.
+            gamma_t = (17.625 * t) / (243.04 + t)
+            gamma_d = (17.625 * d) / (243.04 + d)
+            rh = 100.0 * math.exp(gamma_d - gamma_t)
+            return max(0.0, min(100.0, float(rh)))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _metar_cover_to_cloud_pct(cover: object) -> Optional[float]:
+        text = str(cover or "").strip().upper()
+        if not text:
+            return None
+        mapping = {
+            "CLR": 0.0,
+            "SKC": 0.0,
+            "NCD": 0.0,
+            "FEW": 15.0,
+            "SCT": 40.0,
+            "BKN": 75.0,
+            "OVC": 100.0,
+            "VV": 100.0,
+        }
+        for key, value in mapping.items():
+            if text.startswith(key):
+                return float(value)
+        return None
+
+    @staticmethod
+    def _earthenv_month_name(month_idx: int) -> str:
+        idx = max(1, min(12, int(month_idx))) - 1
+        return WeatherLiveWorker.MONTH_NAMES[idx]
+
+    @staticmethod
+    def _latlon_to_world_px(lat: float, lon: float, zoom: int) -> tuple[float, float]:
+        z = max(0, int(zoom))
+        n = float(2 ** z)
+        lon_norm = ((float(lon) + 180.0) / 360.0) * n
+        lat_clip = max(-85.05112878, min(85.05112878, float(lat)))
+        lat_rad = math.radians(lat_clip)
+        y_norm = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) * 0.5 * n
+        return lon_norm * 256.0, y_norm * 256.0
+
+    @staticmethod
+    def _earthenv_tile_url(mapid: str, token: str, z: int, x: int, y: int) -> str:
+        mapid_txt = str(mapid or "").strip().strip("/")
+        if token:
+            return f"https://earthengine.googleapis.com/map/{mapid_txt}/{z}/{x}/{y}?token={quote(str(token))}"
+        return f"https://earthengine.googleapis.com/v1alpha/{mapid_txt}/tiles/{z}/{x}/{y}"
+
+    @staticmethod
+    def _estimate_value_from_palette(
+        rgb: tuple[int, int, int],
+        palette: list[tuple[int, int, int]],
+        vmin: float,
+        vmax: float,
+    ) -> Optional[float]:
+        if len(palette) < 2:
+            return None
+        r, g, b = [float(c) for c in rgb]
+        best_dist = float("inf")
+        best_norm = 0.0
+        n_segments = len(palette) - 1
+        for idx in range(n_segments):
+            p0 = np.array(palette[idx], dtype=float)
+            p1 = np.array(palette[idx + 1], dtype=float)
+            v = p1 - p0
+            denom = float(np.dot(v, v))
+            if denom <= 1e-9:
+                t = 0.0
+            else:
+                t = float(np.dot(np.array([r, g, b]) - p0, v) / denom)
+                t = max(0.0, min(1.0, t))
+            p = p0 + t * v
+            dist = float(np.sum((np.array([r, g, b]) - p) ** 2))
+            if dist < best_dist:
+                best_dist = dist
+                best_norm = (float(idx) + float(t)) / float(n_segments)
+        return float(vmin + best_norm * (vmax - vmin))
+
+    def _sample_earthenv_point_precise(self, month_name: str) -> Optional[float]:
+        """Try to sample EarthEnv cloud value from source data endpoint (not palette)."""
+        sample_url = f"https://dev-dot-earthenv-dot-map-of-life.appspot.com/sample/cloud/{self.lon:.6f}/{self.lat:.6f}"
+        payload = self._http_get_json(sample_url, timeout_s=20.0)
+        if not isinstance(payload, dict):
+            return None
+
+        month_key = str(month_name or "").strip().lower()
+        lookup_keys = {
+            month_key,
+            month_key[:3],
+            f"{self.cloud_map_month:02d}",
+            str(self.cloud_map_month),
+        }
+        lookup_keys = {key for key in lookup_keys if key}
+
+        def _to_pct(value: object) -> Optional[float]:
+            fv = _safe_float(value)
+            if fv is None or not math.isfinite(fv):
+                return None
+            if fv > 100.0:
+                fv = fv / 100.0
+            return max(0.0, min(100.0, float(fv)))
+
+        # Expected from app code: {layer_id: [{value: ...}]}
+        for key, value in payload.items():
+            key_txt = str(key).strip().lower()
+            if not any(token in key_txt for token in lookup_keys):
+                continue
+            if isinstance(value, list) and value:
+                first = value[0]
+                if isinstance(first, dict):
+                    for candidate_key in ("value", "val", "cloud", "cloud_pct", "mean"):
+                        pct = _to_pct(first.get(candidate_key))
+                        if pct is not None:
+                            return pct
+                pct = _to_pct(first)
+                if pct is not None:
+                    return pct
+            if isinstance(value, dict):
+                for candidate_key in ("value", "val", "cloud", "cloud_pct", "mean"):
+                    pct = _to_pct(value.get(candidate_key))
+                    if pct is not None:
+                        return pct
+            pct = _to_pct(value)
+            if pct is not None:
+                return pct
+
+        # Fallback: if endpoint returns a single scalar-like payload.
+        for candidate_key in ("value", "cloud_pct", "cloud", "mean"):
+            if candidate_key in payload:
+                pct = _to_pct(payload.get(candidate_key))
+                if pct is not None:
+                    return pct
+        return None
+
+    def _fetch_open_meteo(self) -> dict[str, object]:
+        lat_txt = f"{self.lat:.5f}"
+        lon_txt = f"{self.lon:.5f}"
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat_txt}&longitude={lon_txt}"
+            "&hourly=temperature_2m,relative_humidity_2m,cloud_cover,surface_pressure,wind_speed_10m"
+            "&current=temperature_2m,relative_humidity_2m,cloud_cover,surface_pressure,wind_speed_10m"
+            "&forecast_days=3&timezone=auto"
+        )
+        payload = self._http_get_json(url, timeout_s=20.0)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Open-Meteo returned an unexpected payload.")
+
+        current = payload.get("current") if isinstance(payload.get("current"), dict) else {}
+        hourly = payload.get("hourly") if isinstance(payload.get("hourly"), dict) else {}
+        utc_offset = int(_safe_int(payload.get("utc_offset_seconds")) or 0)
+        times_raw = hourly.get("time") if isinstance(hourly.get("time"), list) else []
+        ts: list[int] = []
+        for item in times_raw:
+            t = self._iso_to_timestamp(item, utc_offset_seconds=utc_offset)
+            if t is not None:
+                ts.append(int(t))
+
+        series = {
+            "timestamps": ts[:96],
+            "temp_c": self._to_float_list(hourly.get("temperature_2m"))[:96],
+            "wind_ms": self._to_float_list(hourly.get("wind_speed_10m"))[:96],
+            "cloud_pct": self._to_float_list(hourly.get("cloud_cover"))[:96],
+            "rh_pct": self._to_float_list(hourly.get("relative_humidity_2m"))[:96],
+            "pressure_hpa": self._to_float_list(hourly.get("surface_pressure"))[:96],
+        }
+
+        updated_ts = self._iso_to_timestamp(current.get("time"), utc_offset_seconds=utc_offset)
+        updated_utc = (
+            datetime.fromtimestamp(int(updated_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if updated_ts is not None
+            else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        )
+
+        provider = {
+            "label": "Open-Meteo",
+            "source_label": "Open-Meteo",
+            "temp_c": _safe_float(current.get("temperature_2m")),
+            "wind_ms": _safe_float(current.get("wind_speed_10m")),
+            "cloud_pct": _safe_float(current.get("cloud_cover")),
+            "rh_pct": _safe_float(current.get("relative_humidity_2m")),
+            "pressure_hpa": _safe_float(current.get("surface_pressure")),
+            "status": "ok",
+            "updated_utc": updated_utc,
+            "note": "Public no-key API (forecast + near-real-time conditions).",
+            "categories": ["conditions", "forecast"],
+        }
+        return {"provider": provider, "series": series}
+
+    def _fetch_meteo_icm(self) -> dict[str, object]:
+        available = self._http_get_json("https://devmgramapi.meteo.pl/meteorograms/available", timeout_s=20.0)
+        date_ts: Optional[int] = None
+        if isinstance(available, dict):
+            gfs = available.get("gfs")
+            if isinstance(gfs, list) and gfs:
+                date_ts = _safe_int(gfs[-1])
+        if date_ts is None:
+            raise RuntimeError("Meteo ICM: missing available run timestamp.")
+
+        icm_payload = self._http_post_json(
+            "https://devmgramapi.meteo.pl/meteorograms/gfs",
+            {"date": int(date_ts), "point": {"lat": self.lat, "lon": self.lon}},
+            timeout_s=30.0,
+        )
+        if not isinstance(icm_payload, dict):
+            raise RuntimeError("Meteo ICM: unexpected payload.")
+        icm_data = icm_payload.get("data")
+        if not isinstance(icm_data, dict):
+            raise RuntimeError("Meteo ICM: missing data block.")
+
+        temp_block = icm_data.get("airtmp_point") if isinstance(icm_data.get("airtmp_point"), dict) else {}
+        wind_block = (
+            icm_data.get("wind10_sd_true_prev_point")
+            if isinstance(icm_data.get("wind10_sd_true_prev_point"), dict)
+            else {}
+        )
+        cloud_block = icm_data.get("cldtot_aver") if isinstance(icm_data.get("cldtot_aver"), dict) else {}
+        rh_block = icm_data.get("realhum_aver") if isinstance(icm_data.get("realhum_aver"), dict) else {}
+
+        temp_series = self._to_float_list(temp_block.get("data"))
+        wind_series = self._to_float_list(wind_block.get("data"))
+        cloud_raw = self._to_float_list(cloud_block.get("data"))
+        rh_series = self._to_float_list(rh_block.get("data"))
+        cloud_series: list[float] = []
+        if cloud_raw:
+            scale = 100.0 if max(cloud_raw) <= 1.5 else 1.0
+            cloud_series = [max(0.0, min(100.0, v * scale)) for v in cloud_raw]
+
+        first_ts = _safe_int(temp_block.get("first_timestamp"))
+        interval_s = _safe_int(temp_block.get("interval"))
+        ts: list[int] = []
+        if first_ts is not None and interval_s is not None and interval_s > 0:
+            ts = [int(first_ts + idx * interval_s) for idx in range(len(temp_series))]
+
+        series = {
+            "timestamps": ts[:96],
+            "temp_c": temp_series[:96],
+            "wind_ms": wind_series[:96],
+            "cloud_pct": cloud_series[:96],
+            "rh_pct": rh_series[:96],
+            "pressure_hpa": [],
+        }
+        provider = {
+            "label": "Meteo ICM",
+            "source_label": "Meteo ICM",
+            "temp_c": self._first(temp_series),
+            "wind_ms": self._first(wind_series),
+            "cloud_pct": self._first(cloud_series),
+            "rh_pct": self._first(rh_series),
+            "pressure_hpa": None,
+            "status": "ok",
+            "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "note": "GFS meteorogram point endpoint.",
+            "categories": ["forecast"],
+        }
+        return {"provider": provider, "series": series}
+
+    def _fetch_windy(self) -> dict[str, object]:
+        lat_txt = f"{self.lat:.5f}"
+        lon_txt = f"{self.lon:.5f}"
+        windy_point_url = (
+            f"https://node.windy.com/forecast/point/ecmwf/v2.9/{lat_txt}/{lon_txt}"
+            "?includeNow=true&source=hp"
+        )
+        windy_point = self._http_get_json(windy_point_url, timeout_s=20.0)
+        if not isinstance(windy_point, dict):
+            raise RuntimeError("Windy: unexpected payload shape.")
+        windy_data = windy_point.get("data")
+        if not isinstance(windy_data, dict):
+            raise RuntimeError("Windy: missing point data block.")
+
+        temp_k = self._to_float_list(windy_data.get("temp"))
+        temp_series = [float(v) for v in (self._k_to_c(t) for t in temp_k) if v is not None]
+        wind_series = self._to_float_list(windy_data.get("wind"))
+        rh_series = self._to_float_list(windy_data.get("rh"))
+        ts_ms = self._to_float_list(windy_data.get("ts"))
+        ts = [int(round(v / 1000.0)) for v in ts_ms]
+        now = windy_point.get("now") if isinstance(windy_point.get("now"), dict) else {}
+
+        provider = {
+            "label": "Windy (ECMWF)",
+            "source_label": "Windy",
+            "temp_c": self._k_to_c(_safe_float(now.get("temp"))) or self._first(temp_series),
+            "wind_ms": _safe_float(now.get("wind")) or self._first(wind_series),
+            "cloud_pct": None,
+            "rh_pct": self._first(rh_series),
+            "pressure_hpa": None,
+            "status": "ok",
+            "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "note": "Live point forecast via Windy ECMWF endpoint.",
+            "categories": ["forecast", "conditions"],
+        }
+        series = {
+            "timestamps": ts[:96],
+            "temp_c": temp_series[:96],
+            "wind_ms": wind_series[:96],
+            "cloud_pct": [],
+            "rh_pct": rh_series[:96],
+            "pressure_hpa": [],
+        }
+        return {"provider": provider, "series": series}
+
+    def _fetch_meteoblue(self) -> dict[str, object]:
+        lat_txt = f"{self.lat:.5f}"
+        lon_txt = f"{self.lon:.5f}"
+        mblue_point_url = (
+            f"https://node.windy.com/forecast/point/mblue/v2.9/{lat_txt}/{lon_txt}"
+            "?includeNow=true&source=hp"
+        )
+        mblue_point = self._http_get_json(mblue_point_url, timeout_s=20.0)
+        if not isinstance(mblue_point, dict):
+            raise RuntimeError("meteoblue: unexpected point payload.")
+        mblue_data = mblue_point.get("data")
+        if not isinstance(mblue_data, dict):
+            raise RuntimeError("meteoblue: missing point data.")
+
+        temp_k = self._to_float_list(mblue_data.get("temp"))
+        temp_series = [float(v) for v in (self._k_to_c(t) for t in temp_k) if v is not None]
+        wind_series = self._to_float_list(mblue_data.get("wind"))
+        rh_series = self._to_float_list(mblue_data.get("rh"))
+        ts_ms = self._to_float_list(mblue_data.get("ts"))
+        ts = [int(round(v / 1000.0)) for v in ts_ms]
+
+        met_url = f"https://node.windy.com/forecast/meteogram/mblue/v1.2/{lat_txt}/{lon_txt}?step=3"
+        met_payload = self._http_get_json(met_url, timeout_s=20.0)
+        met_data = met_payload.get("data") if isinstance(met_payload, dict) else None
+        cloud_series: list[float] = []
+        if isinstance(met_data, dict):
+            keys = [key for key in met_data.keys() if str(key).startswith("cloud-")]
+            layers: list[list[float]] = []
+            for key in keys:
+                values = self._to_float_list(met_data.get(key))
+                if values:
+                    layers.append(values)
+            if layers:
+                n = min(len(layer) for layer in layers)
+                for idx in range(n):
+                    sample = [layer[idx] for layer in layers if idx < len(layer)]
+                    v = self._avg(sample)
+                    cloud_series.append(0.0 if v is None else max(0.0, min(100.0, float(v))))
+
+        now = mblue_point.get("now") if isinstance(mblue_point.get("now"), dict) else {}
+        provider = {
+            "label": "meteoblue",
+            "source_label": "meteoblue",
+            "temp_c": self._k_to_c(_safe_float(now.get("temp"))) or self._first(temp_series),
+            "wind_ms": _safe_float(now.get("wind")) or self._first(wind_series),
+            "cloud_pct": self._first(cloud_series),
+            "rh_pct": self._first(rh_series),
+            "pressure_hpa": None,
+            "status": "ok",
+            "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "note": "Live mblue model via Windy endpoints.",
+            "categories": ["forecast", "conditions"],
+        }
+        series = {
+            "timestamps": ts[:96],
+            "temp_c": temp_series[:96],
+            "wind_ms": wind_series[:96],
+            "cloud_pct": cloud_series[:96],
+            "rh_pct": rh_series[:96],
+            "pressure_hpa": [],
+        }
+        return {"provider": provider, "series": series}
+
+    def _fetch_metar(self) -> dict[str, object]:
+        station: Optional[dict[str, object]] = None
+        for delta in (0.7, 1.2, 2.5, 5.0, 8.0):
+            bbox = (
+                f"{self.lat - delta:.4f},{self.lon - delta:.4f},"
+                f"{self.lat + delta:.4f},{self.lon + delta:.4f}"
+            )
+            url = f"https://aviationweather.gov/api/data/stationinfo?bbox={bbox}&format=json"
+            response = self._http_get_json(url, timeout_s=20.0)
+            if not isinstance(response, list) or not response:
+                continue
+            rows = [row for row in response if isinstance(row, dict)]
+            if not rows:
+                continue
+            rows.sort(
+                key=lambda row: self._haversine_km(
+                    self.lat,
+                    self.lon,
+                    _safe_float(row.get("lat")) or 0.0,
+                    _safe_float(row.get("lon")) or 0.0,
+                )
+            )
+            station = rows[0]
+            break
+        if not isinstance(station, dict):
+            raise RuntimeError("No nearby METAR station found.")
+
+        station_id = str(station.get("icaoId") or station.get("id") or "").strip().upper()
+        if not station_id:
+            raise RuntimeError("METAR station id is missing.")
+        metar_url = f"https://aviationweather.gov/api/data/metar?ids={quote(station_id)}&format=json&hours=12"
+        metar_payload = self._http_get_json(metar_url, timeout_s=20.0)
+        if not isinstance(metar_payload, list) or not metar_payload:
+            raise RuntimeError(f"No METAR observations for {station_id}.")
+        rows = [row for row in metar_payload if isinstance(row, dict)]
+        if not rows:
+            raise RuntimeError(f"METAR payload for {station_id} is empty.")
+
+        latest = rows[0]
+        temp = _safe_float(latest.get("temp"))
+        dew = _safe_float(latest.get("dewp"))
+        rh = self._estimate_rh_from_temp_dew(temp, dew)
+        cloud = self._metar_cover_to_cloud_pct(latest.get("cover"))
+        if cloud is None and isinstance(latest.get("clouds"), list):
+            buckets = []
+            for cloud_row in latest.get("clouds"):
+                if not isinstance(cloud_row, dict):
+                    continue
+                cv = self._metar_cover_to_cloud_pct(cloud_row.get("cover"))
+                if cv is not None:
+                    buckets.append(float(cv))
+            cloud = max(buckets) if buckets else None
+
+        trend_rows = list(reversed(rows[:24]))
+        ts: list[int] = []
+        temp_series: list[float] = []
+        wind_series: list[float] = []
+        cloud_series: list[float] = []
+        rh_series: list[float] = []
+        pressure_series: list[float] = []
+        for row in trend_rows:
+            obs_ts = _safe_int(row.get("obsTime"))
+            if obs_ts is None:
+                continue
+            ts.append(int(obs_ts))
+            tv = _safe_float(row.get("temp"))
+            wv = _safe_float(row.get("wspd"))
+            pv = _safe_float(row.get("altim"))
+            cv = self._metar_cover_to_cloud_pct(row.get("cover"))
+            dv = _safe_float(row.get("dewp"))
+            rv = self._estimate_rh_from_temp_dew(tv, dv)
+            temp_series.append(float(tv) if tv is not None else float("nan"))
+            wind_series.append(float(wv) if wv is not None else float("nan"))
+            cloud_series.append(float(cv) if cv is not None else float("nan"))
+            rh_series.append(float(rv) if rv is not None else float("nan"))
+            pressure_series.append(float(pv) if pv is not None else float("nan"))
+
+        updated_raw = latest.get("reportTime") or latest.get("receiptTime")
+        updated_ts = self._iso_to_timestamp(updated_raw)
+        updated_utc = (
+            datetime.fromtimestamp(int(updated_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if updated_ts is not None
+            else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        )
+        dist_km = self._haversine_km(
+            self.lat,
+            self.lon,
+            _safe_float(station.get("lat")) or self.lat,
+            _safe_float(station.get("lon")) or self.lon,
+        )
+        label = str(station.get("site") or station_id).strip()
+        provider = {
+            "label": f"METAR ({station_id})",
+            "source_label": "METAR",
+            "temp_c": temp,
+            "wind_ms": _safe_float(latest.get("wspd")),
+            "cloud_pct": cloud,
+            "rh_pct": rh,
+            "pressure_hpa": _safe_float(latest.get("altim")),
+            "status": "ok",
+            "updated_utc": updated_utc,
+            "note": f"Nearest station: {label} ({dist_km:.1f} km).",
+            "categories": ["conditions"],
+        }
+        series = {
+            "timestamps": ts,
+            "temp_c": temp_series,
+            "wind_ms": wind_series,
+            "cloud_pct": cloud_series,
+            "rh_pct": rh_series,
+            "pressure_hpa": pressure_series,
+        }
+        return {"provider": provider, "series": series}
+
+    @staticmethod
+    def _parse_custom_payload(payload: object, fallback_label: str) -> tuple[dict[str, object], dict[str, object]]:
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            payload = payload[0]
+        if not isinstance(payload, dict):
+            raise RuntimeError("Custom URL must return a JSON object.")
+
+        current = payload.get("current") if isinstance(payload.get("current"), dict) else payload
+        if not isinstance(current, dict):
+            raise RuntimeError("Custom JSON current block is invalid.")
+
+        temp = _safe_float(current.get("temp_c"))
+        wind = _safe_float(current.get("wind_ms"))
+        cloud = _safe_float(current.get("cloud_pct"))
+        rh = _safe_float(current.get("rh_pct"))
+        if any(value is None for value in (temp, wind, cloud, rh)):
+            raise RuntimeError(
+                "Custom JSON must include temp_c, wind_ms, cloud_pct and rh_pct in current/top-level object."
+            )
+        pressure = _safe_float(current.get("pressure_hpa"))
+        updated_utc = str(current.get("updated_utc") or payload.get("updated_utc") or "").strip()
+        if not updated_utc:
+            updated_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        label = str(current.get("source_label") or payload.get("source_label") or fallback_label).strip()
+        provider = {
+            "label": label or fallback_label,
+            "source_label": label or fallback_label,
+            "temp_c": float(temp),
+            "wind_ms": float(wind),
+            "cloud_pct": float(cloud),
+            "rh_pct": float(rh),
+            "pressure_hpa": pressure,
+            "status": "ok",
+            "updated_utc": updated_utc,
+            "note": "Custom station endpoint.",
+            "categories": ["conditions"],
+        }
+
+        series_payload = payload.get("series") if isinstance(payload.get("series"), dict) else {}
+        ts = WeatherLiveWorker._to_float_list(series_payload.get("timestamps"))
+        series = {
+            "timestamps": [int(v) for v in ts],
+            "temp_c": WeatherLiveWorker._to_float_list(series_payload.get("temp_c")),
+            "wind_ms": WeatherLiveWorker._to_float_list(series_payload.get("wind_ms")),
+            "cloud_pct": WeatherLiveWorker._to_float_list(series_payload.get("cloud_pct")),
+            "rh_pct": WeatherLiveWorker._to_float_list(series_payload.get("rh_pct")),
+            "pressure_hpa": WeatherLiveWorker._to_float_list(series_payload.get("pressure_hpa")),
+        }
+        return provider, series
+
+    def _fetch_custom_conditions(self) -> dict[str, object]:
+        if not self.custom_conditions_url:
+            return {
+                "provider": {
+                    "label": "Custom URL",
+                    "source_label": "Custom URL",
+                    "temp_c": None,
+                    "wind_ms": None,
+                    "cloud_pct": None,
+                    "rh_pct": None,
+                    "pressure_hpa": None,
+                    "status": "disabled",
+                    "updated_utc": "-",
+                    "note": "Custom URL is not configured for the current observatory.",
+                    "categories": ["conditions"],
+                },
+                "series": {
+                    "timestamps": [],
+                    "temp_c": [],
+                    "wind_ms": [],
+                    "cloud_pct": [],
+                    "rh_pct": [],
+                    "pressure_hpa": [],
+                },
+            }
+        payload = self._http_get_json(self.custom_conditions_url, timeout_s=20.0)
+        provider, series = self._parse_custom_payload(payload, "Custom URL")
+        return {"provider": provider, "series": series}
+
+    def _fetch_annual_cloud_climatology(self) -> dict[str, object]:
+        lat_txt = f"{self.lat:.5f}"
+        lon_txt = f"{self.lon:.5f}"
+        elev_txt = f"{self.elev:.0f}"
+        week_url = f"https://www.meteoblue.com/en/weather/week?lat={lat_txt}&lon={lon_txt}&asl={elev_txt}"
+        week_html = self._http_get_text(week_url, timeout_s=20.0)
+        match_climate = re.search(
+            r'href="(/en/weather/historyclimate/climatemodelled/[^"]+)"',
+            week_html,
+            flags=re.IGNORECASE,
+        )
+        if not match_climate:
+            raise RuntimeError("Unable to resolve meteoblue climate URL.")
+        climate_url = urljoin("https://www.meteoblue.com", match_climate.group(1))
+        climate_html = self._http_get_text(climate_url, timeout_s=20.0)
+        match_cloud_chart = re.search(
+            r'data-url="([^"]*climate_model/cloud_coverage[^"]+)"',
+            climate_html,
+            flags=re.IGNORECASE,
+        )
+        if not match_cloud_chart:
+            raise RuntimeError("meteoblue cloud climatology endpoint not found.")
+        cloud_chart_url = html_module.unescape(match_cloud_chart.group(1))
+        if cloud_chart_url.startswith("//"):
+            cloud_chart_url = f"https:{cloud_chart_url}"
+        cloud_chart_payload = self._http_get_json(cloud_chart_url, timeout_s=25.0)
+        cloud_series = self._extract_chart_series_by_name(cloud_chart_payload)
+        sunny = cloud_series.get("sunny", [])
+        partly = cloud_series.get("partly cloudy", [])
+        overcast = cloud_series.get("overcast", [])
+        n_months = min(len(sunny), len(partly), len(overcast))
+        if n_months <= 0:
+            raise RuntimeError("Cloud climatology series missing.")
+        weighted_num = 0.0
+        weighted_den = 0.0
+        for idx in range(n_months):
+            s = max(0.0, float(sunny[idx]))
+            p = max(0.0, float(partly[idx]))
+            o = max(0.0, float(overcast[idx]))
+            days = s + p + o
+            if days <= 0:
+                continue
+            cloud_pct = max(0.0, min(100.0, ((0.1 * s + 0.5 * p + 0.9 * o) / days) * 100.0))
+            weighted_num += cloud_pct * days
+            weighted_den += days
+        annual_cloud_pct = weighted_num / weighted_den if weighted_den > 0 else None
+        return {
+            "annual_cloud_pct": annual_cloud_pct,
+            "annual_cloud_note": "meteoblue climate (sunny/partly/overcast days weighted estimate).",
+        }
+
+    def _fetch_earthenv_cloud_map(self) -> dict[str, object]:
+        if Image is None or ImageDraw is None:
+            raise RuntimeError("Pillow is not available in the current environment.")
+        month_name = self._earthenv_month_name(self.cloud_map_month)
+        layer_url = f"https://dev-dot-earthenv-dot-map-of-life.appspot.com/map/cloud/{quote(month_name)}"
+        layer_payload = self._http_get_json(layer_url, timeout_s=25.0)
+        if not isinstance(layer_payload, dict):
+            raise RuntimeError("EarthEnv map endpoint returned unexpected payload.")
+        map_block = layer_payload.get("map") if isinstance(layer_payload.get("map"), dict) else {}
+        mapid = str(map_block.get("mapid") or "").strip()
+        token = str(map_block.get("token") or "").strip()
+        if not mapid:
+            raise RuntimeError("EarthEnv map id is missing.")
+
+        layer_block = layer_payload.get("layer") if isinstance(layer_payload.get("layer"), dict) else {}
+        viz = layer_block.get("viz_params") if isinstance(layer_block.get("viz_params"), dict) else {}
+        vmin = _safe_float(viz.get("min"))
+        vmax = _safe_float(viz.get("max"))
+        palette_raw = str(viz.get("palette") or "").strip()
+        palette: list[tuple[int, int, int]] = []
+        if palette_raw:
+            for item in palette_raw.split(","):
+                txt = item.strip().lstrip("#")
+                if len(txt) != 6:
+                    continue
+                try:
+                    palette.append((int(txt[0:2], 16), int(txt[2:4], 16), int(txt[4:6], 16)))
+                except Exception:
+                    continue
+
+        width = 860
+        height = 380
+        zoom = 4
+        center_x, center_y = self._latlon_to_world_px(self.lat, self.lon, zoom)
+        left = int(round(center_x - width / 2))
+        top = int(round(center_y - height / 2))
+        tile_from_x = math.floor(left / 256)
+        tile_to_x = math.floor((left + width - 1) / 256)
+        tile_from_y = math.floor(top / 256)
+        tile_to_y = math.floor((top + height - 1) / 256)
+        n_tiles = 2 ** zoom
+
+        canvas = Image.new("RGB", (width, height), (12, 18, 26))
+        draw = ImageDraw.Draw(canvas)
+
+        for ty in range(tile_from_y, tile_to_y + 1):
+            if ty < 0 or ty >= n_tiles:
+                continue
+            for tx in range(tile_from_x, tile_to_x + 1):
+                tx_wrap = tx % n_tiles
+                tile_url = self._earthenv_tile_url(mapid, token, zoom, tx_wrap, ty)
+                try:
+                    tile_bytes = self._http_get_bytes(tile_url, timeout_s=20.0)
+                    tile_img = Image.open(io.BytesIO(tile_bytes)).convert("RGB")
+                except Exception:
+                    continue
+                px = tx * 256 - left
+                py = ty * 256 - top
+                canvas.paste(tile_img, (int(px), int(py)))
+
+        cx = int(round(width / 2.0))
+        cy = int(round(height / 2.0))
+        cross_color = (255, 72, 72)
+        draw.line((cx - 12, cy, cx + 12, cy), fill=cross_color, width=2)
+        draw.line((cx, cy - 12, cx, cy + 12), fill=cross_color, width=2)
+        draw.ellipse((cx - 18, cy - 18, cx + 18, cy + 18), outline=(245, 245, 245), width=2)
+
+        approx_pct: Optional[float] = None
+        precise_caption = ""
+        try:
+            approx_pct = self._sample_earthenv_point_precise(month_name)
+            if approx_pct is not None:
+                precise_caption = " Sampled from EarthEnv source data."
+        except Exception:
+            approx_pct = None
+        if approx_pct is None and palette and vmin is not None and vmax is not None:
+            center_rgb = canvas.getpixel((cx, cy))
+            approx_value = self._estimate_value_from_palette(center_rgb, palette, float(vmin), float(vmax))
+            if approx_value is not None:
+                approx_pct = float(approx_value) / 100.0 if float(vmax) >= 1000.0 else float(approx_value)
+                approx_pct = max(0.0, min(100.0, approx_pct))
+                precise_caption = " Estimated from rendered map palette."
+
+        out = io.BytesIO()
+        canvas.save(out, format="PNG")
+        caption = f"EarthEnv monthly cloud map: {month_name}."
+        if approx_pct is not None:
+            caption += f" Approx cloud at marker: {approx_pct:.1f}%."
+            caption += precise_caption
+        caption += " Marker = observatory coordinates."
+        return {
+            "source": "earthenv",
+            "month": int(self.cloud_map_month),
+            "month_name": month_name,
+            "image_bytes": out.getvalue(),
+            "caption": caption,
+            "approx_cloud_pct": approx_pct,
+            "url": "https://www.earthenv.org/cloud",
+        }
+
+    @staticmethod
+    def _satellite_area_for_coords(lat: float, lon: float) -> str:
+        la = float(lat)
+        lo = float(lon)
+        if 20.0 <= la <= 75.0 and -25.0 <= lo <= 45.0:
+            return "europe"
+        if -40.0 <= la <= 45.0 and -30.0 <= lo <= 60.0:
+            return "africa"
+        if 25.0 <= la <= 50.0 and -45.0 <= lo <= 40.0:
+            return "atlantic_ocean"
+        if 25.0 <= la <= 50.0 and -10.0 <= lo <= 45.0:
+            return "mediterranean"
+        return "global"
+
+    @staticmethod
+    def _bounded_bbox(lat: float, lon: float, half_span_deg: float) -> tuple[float, float, float, float]:
+        span = max(1.5, min(30.0, float(half_span_deg)))
+        min_lat = max(-85.0, float(lat) - span)
+        max_lat = min(85.0, float(lat) + span)
+        min_lon = float(lon) - span
+        max_lon = float(lon) + span
+        if min_lon < -180.0:
+            shift = -180.0 - min_lon
+            min_lon += shift
+            max_lon += shift
+        if max_lon > 180.0:
+            shift = max_lon - 180.0
+            min_lon -= shift
+            max_lon -= shift
+        min_lon = max(-180.0, min_lon)
+        max_lon = min(180.0, max_lon)
+        return min_lon, min_lat, max_lon, max_lat
+
+    @staticmethod
+    def _draw_center_marker(image_bytes: bytes) -> bytes:
+        if not image_bytes:
+            return b""
+        with Image.open(io.BytesIO(image_bytes)).convert("RGB") as img:
+            w, h = img.size
+            cx = int(round(w / 2.0))
+            cy = int(round(h / 2.0))
+            draw = ImageDraw.Draw(img)
+            draw.line((cx - 16, cy, cx + 16, cy), fill=(255, 72, 72), width=3)
+            draw.line((cx, cy - 16, cx, cy + 16), fill=(255, 72, 72), width=3)
+            draw.ellipse((cx - 24, cy - 24, cx + 24, cy + 24), outline=(245, 245, 245), width=2)
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=92)
+            return out.getvalue()
+
+    def _fetch_satellite(self) -> dict[str, object]:
+        # Primary source: NASA GIBS WMS true-color layers, centered on observatory coordinates.
+        # WMS 1.1.1 in EPSG:4326 expects bbox as minLon,minLat,maxLon,maxLat.
+        min_lon, min_lat, max_lon, max_lat = self._bounded_bbox(self.lat, self.lon, half_span_deg=10.0)
+        date_candidates = [datetime.now(timezone.utc).date() - timedelta(days=delta) for delta in (0, 1, 2)]
+        layer_candidates = (
+            "MODIS_Terra_CorrectedReflectance_TrueColor",
+            "MODIS_Aqua_CorrectedReflectance_TrueColor",
+            "VIIRS_SNPP_CorrectedReflectance_TrueColor",
+        )
+        last_error = "unknown"
+        for layer in layer_candidates:
+            for day in date_candidates:
+                sat_url = (
+                    "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
+                    "?SERVICE=WMS&REQUEST=GetMap&VERSION=1.1.1"
+                    f"&LAYERS={quote(layer)}&STYLES=&FORMAT=image/jpeg&TRANSPARENT=FALSE"
+                    "&SRS=EPSG:4326&WIDTH=960&HEIGHT=540"
+                    f"&BBOX={min_lon:.5f},{min_lat:.5f},{max_lon:.5f},{max_lat:.5f}"
+                    f"&TIME={day.isoformat()}"
+                )
+                try:
+                    raw = self._http_get_bytes(sat_url, timeout_s=30.0)
+                    sat_bytes = self._draw_center_marker(raw)
+                    if not sat_bytes:
+                        raise RuntimeError("Empty satellite payload.")
+                    return {
+                        "url": sat_url,
+                        "image_bytes": sat_bytes,
+                        "caption": (
+                            f"NASA GIBS {layer}, date {day.isoformat()} (UTC), centered on observatory."
+                            f" BBOX {min_lon:.2f},{min_lat:.2f},{max_lon:.2f},{max_lat:.2f}."
+                            " Marker = current observatory."
+                        ),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    last_error = str(exc)
+                    continue
+        raise RuntimeError(f"GIBS WMS request failed for all layers/dates: {last_error}")
+
+    def _fetch_satellite_met_no(self) -> dict[str, object]:
+        area = self._satellite_area_for_coords(self.lat, self.lon)
+        sat_url = f"https://api.met.no/weatherapi/geosatellite/1.4/?area={quote(area)}&type=infrared"
+        sat_bytes = self._http_get_bytes(sat_url, timeout_s=30.0)
+        if not sat_bytes:
+            raise RuntimeError("MET geosatellite endpoint returned empty payload.")
+        return {
+            "url": sat_url,
+            "image_bytes": sat_bytes,
+            "caption": (
+                f"MET Norway geosatellite (infrared), area={area}, latest frame."
+                " (Regional frame; not a centered site cutout.)"
+            ),
+        }
+
+    def _fetch_satellite_wetterzentrale(self) -> dict[str, object]:
+        sat_page_url = "https://www.wetterzentrale.de/en/reanalysis.php?map=1&model=sat&var=44"
+        sat_page = self._http_get_text(sat_page_url, timeout_s=15.0)
+        image_paths = re.findall(
+            r"/maps/archive/\d{4}/sat/[A-Za-z0-9._-]+\.jpg",
+            sat_page,
+            flags=re.IGNORECASE,
+        )
+        if not image_paths:
+            raise RuntimeError("No satellite image URL found on source page.")
+        sat_url = urljoin("https://www.wetterzentrale.de", image_paths[-1])
+        sat_bytes = self._http_get_bytes(sat_url, timeout_s=25.0)
+        return {
+            "url": sat_url,
+            "image_bytes": sat_bytes,
+            "caption": "wetterzentrale latest satellite frame.",
+        }
+
+    @staticmethod
+    def _conditions_source_keys(provider_rows: dict[str, dict[str, object]]) -> list[str]:
+        out: list[str] = []
+        for key, row in provider_rows.items():
+            if not isinstance(row, dict):
+                continue
+            categories = row.get("categories")
+            if isinstance(categories, list) and "conditions" in categories:
+                out.append(str(key))
+        return out
+
+    def _emit_partial(self, payload: dict[str, object]) -> None:
+        self.partial.emit(copy.deepcopy(payload))
+
+    def run(self):
+        payload: dict[str, object] = {
+            "providers": {},
+            "series": {},
+            "averages": {},
+            "annual_cloud_pct": None,
+            "annual_cloud_note": "-",
+            "cloud_map": (
+                {
+                    "source": self.cloud_map_source,
+                    "month": int(self.cloud_map_month),
+                    "month_name": self._earthenv_month_name(self.cloud_map_month),
+                    "image_bytes": b"",
+                    "caption": "Map is loading...",
+                    "approx_cloud_pct": None,
+                    "url": "https://www.earthenv.org/cloud",
+                }
+                if self.include_cloud_map
+                else None
+            ),
+            "satellite": (
+                {"url": "", "image_bytes": b"", "caption": "-"} if self.include_satellite else None
+            ),
+            "sections": {
+                "forecast": {"status": "loading", "message": "Loading forecast providers..."},
+                "conditions": {"status": "loading", "message": "Loading live conditions..."},
+                "climatology": {
+                    "status": "loading" if self.include_cloud_map else "idle",
+                    "message": "Loading cloud climatology..." if self.include_cloud_map else "Cloud map not refreshed.",
+                },
+                "satellite": {
+                    "status": "loading" if self.include_satellite else "idle",
+                    "message": "Loading satellite preview..." if self.include_satellite else "Satellite not refreshed.",
+                },
+            },
+            "errors": [],
+        }
+
+        providers: dict[str, dict[str, object]] = payload["providers"]  # type: ignore[assignment]
+        series_map: dict[str, dict[str, object]] = payload["series"]  # type: ignore[assignment]
+        errors: list[str] = payload["errors"]  # type: ignore[assignment]
+
+        total_steps = 7 + (1 if self.include_cloud_map else 0) + (1 if self.include_satellite else 0)
+        step = 0
+
+        def advance(status: str) -> None:
+            nonlocal step
+            step += 1
+            self.progress.emit(status, step, total_steps)
+
+        lat_txt = f"{self.lat:.5f}"
+        lon_txt = f"{self.lon:.5f}"
+        custom_hash = hashlib.md5(self.custom_conditions_url.encode("utf-8")).hexdigest()[:10] if self.custom_conditions_url else "-"
+
+        def update_provider(
+            key: str,
+            result: dict[str, object],
+            *,
+            cached: bool,
+            on_error_label: str,
+        ) -> None:
+            provider = result.get("provider") if isinstance(result.get("provider"), dict) else None
+            series = result.get("series") if isinstance(result.get("series"), dict) else None
+            if not isinstance(provider, dict):
+                raise RuntimeError(f"{on_error_label}: provider payload is invalid.")
+            note = str(provider.get("note") or "").strip()
+            if cached and note:
+                provider["note"] = f"{note} (cached)"
+            elif cached:
+                provider["note"] = "cached"
+            provider.setdefault("updated_utc", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+            providers[key] = provider
+            if isinstance(series, dict):
+                series_map[key] = series
+            self._emit_partial(payload)
+
+        try:
+            advance("Loading Open-Meteo...")
+            result, cached = self._run_cached(
+                cache_key=f"weather:open_meteo:{lat_txt}:{lon_txt}",
+                ttl_s=self.TTL_CONDITIONS_S,
+                fetcher=self._fetch_open_meteo,
+            )
+            update_provider("open_meteo", result, cached=cached, on_error_label="Open-Meteo")
+        except Exception as exc:  # noqa: BLE001
+            providers["open_meteo"] = {
+                "label": "Open-Meteo",
+                "source_label": "Open-Meteo",
+                "temp_c": None,
+                "wind_ms": None,
+                "cloud_pct": None,
+                "rh_pct": None,
+                "pressure_hpa": None,
+                "status": "error",
+                "updated_utc": "-",
+                "note": str(exc),
+                "categories": ["conditions", "forecast"],
+            }
+            errors.append(f"Open-Meteo: {exc}")
+            self._emit_partial(payload)
+
+        try:
+            advance("Loading Meteo ICM...")
+            result, cached = self._run_cached(
+                cache_key=f"weather:meteo_icm:{lat_txt}:{lon_txt}",
+                ttl_s=self.TTL_FORECAST_S,
+                fetcher=self._fetch_meteo_icm,
+            )
+            update_provider("meteo_icm", result, cached=cached, on_error_label="Meteo ICM")
+        except Exception as exc:  # noqa: BLE001
+            providers["meteo_icm"] = {
+                "label": "Meteo ICM",
+                "source_label": "Meteo ICM",
+                "temp_c": None,
+                "wind_ms": None,
+                "cloud_pct": None,
+                "rh_pct": None,
+                "pressure_hpa": None,
+                "status": "error",
+                "updated_utc": "-",
+                "note": str(exc),
+                "categories": ["forecast"],
+            }
+            errors.append(f"Meteo ICM: {exc}")
+            self._emit_partial(payload)
+
+        try:
+            advance("Loading Windy...")
+            result, cached = self._run_cached(
+                cache_key=f"weather:windy:{lat_txt}:{lon_txt}",
+                ttl_s=self.TTL_FORECAST_S,
+                fetcher=self._fetch_windy,
+            )
+            update_provider("windy", result, cached=cached, on_error_label="Windy")
+        except Exception as exc:  # noqa: BLE001
+            providers["windy"] = {
+                "label": "Windy",
+                "source_label": "Windy",
+                "temp_c": None,
+                "wind_ms": None,
+                "cloud_pct": None,
+                "rh_pct": None,
+                "pressure_hpa": None,
+                "status": "error",
+                "updated_utc": "-",
+                "note": str(exc),
+                "categories": ["forecast", "conditions"],
+            }
+            errors.append(f"Windy: {exc}")
+            self._emit_partial(payload)
+
+        try:
+            advance("Loading meteoblue...")
+            result, cached = self._run_cached(
+                cache_key=f"weather:meteoblue:{lat_txt}:{lon_txt}",
+                ttl_s=self.TTL_FORECAST_S,
+                fetcher=self._fetch_meteoblue,
+            )
+            update_provider("meteoblue", result, cached=cached, on_error_label="meteoblue")
+        except Exception as exc:  # noqa: BLE001
+            providers["meteoblue"] = {
+                "label": "meteoblue",
+                "source_label": "meteoblue",
+                "temp_c": None,
+                "wind_ms": None,
+                "cloud_pct": None,
+                "rh_pct": None,
+                "pressure_hpa": None,
+                "status": "error",
+                "updated_utc": "-",
+                "note": str(exc),
+                "categories": ["forecast", "conditions"],
+            }
+            errors.append(f"meteoblue: {exc}")
+            self._emit_partial(payload)
+
+        try:
+            advance("Loading nearest METAR...")
+            result, cached = self._run_cached(
+                cache_key=f"weather:metar:{lat_txt}:{lon_txt}",
+                ttl_s=self.TTL_CONDITIONS_S,
+                fetcher=self._fetch_metar,
+            )
+            update_provider("metar", result, cached=cached, on_error_label="METAR")
+        except Exception as exc:  # noqa: BLE001
+            providers["metar"] = {
+                "label": "METAR",
+                "source_label": "METAR",
+                "temp_c": None,
+                "wind_ms": None,
+                "cloud_pct": None,
+                "rh_pct": None,
+                "pressure_hpa": None,
+                "status": "error",
+                "updated_utc": "-",
+                "note": str(exc),
+                "categories": ["conditions"],
+            }
+            errors.append(f"METAR: {exc}")
+            self._emit_partial(payload)
+
+        try:
+            advance("Loading custom conditions...")
+            result, cached = self._run_cached(
+                cache_key=f"weather:custom:{custom_hash}",
+                ttl_s=self.TTL_CONDITIONS_S,
+                fetcher=self._fetch_custom_conditions,
+            )
+            update_provider("custom", result, cached=cached, on_error_label="Custom URL")
+        except Exception as exc:  # noqa: BLE001
+            providers["custom"] = {
+                "label": "Custom URL",
+                "source_label": "Custom URL",
+                "temp_c": None,
+                "wind_ms": None,
+                "cloud_pct": None,
+                "rh_pct": None,
+                "pressure_hpa": None,
+                "status": "error",
+                "updated_utc": "-",
+                "note": str(exc),
+                "categories": ["conditions"],
+            }
+            errors.append(f"Custom URL: {exc}")
+            self._emit_partial(payload)
+
+        try:
+            advance("Loading cloud climatology...")
+            cloud_payload, cached = self._run_cached(
+                cache_key=f"weather:climatology:{lat_txt}:{lon_txt}:{self.elev:.0f}",
+                ttl_s=self.TTL_CLIMATOLOGY_S,
+                fetcher=self._fetch_annual_cloud_climatology,
+            )
+            payload["annual_cloud_pct"] = _safe_float(cloud_payload.get("annual_cloud_pct"))
+            note = str(cloud_payload.get("annual_cloud_note") or "-").strip()
+            payload["annual_cloud_note"] = f"{note} (cached)" if cached and note else note
+            self._emit_partial(payload)
+        except Exception as exc:  # noqa: BLE001
+            payload["annual_cloud_pct"] = None
+            payload["annual_cloud_note"] = f"Unavailable: {exc}"
+            errors.append(f"Annual cloud climatology: {exc}")
+            self._emit_partial(payload)
+
+        if self.include_cloud_map:
+            try:
+                advance("Loading monthly cloud map...")
+                if self.cloud_map_source == "earthenv":
+                    map_payload, cached = self._run_cached(
+                        cache_key=f"weather:earthenv:{self.cloud_map_month}:{lat_txt}:{lon_txt}",
+                        ttl_s=self.TTL_CLIMATOLOGY_S,
+                        fetcher=self._fetch_earthenv_cloud_map,
+                    )
+                    if cached:
+                        caption = str(map_payload.get("caption") or "").strip()
+                        if caption:
+                            map_payload["caption"] = f"{caption} (cached)"
+                    payload["cloud_map"] = map_payload
+                else:
+                    payload["cloud_map"] = {
+                        "source": self.cloud_map_source,
+                        "month": int(self.cloud_map_month),
+                        "month_name": self._earthenv_month_name(self.cloud_map_month),
+                        "image_bytes": b"",
+                        "caption": "Cloud map source is not available in this build.",
+                        "approx_cloud_pct": None,
+                        "url": "https://www.earthenv.org/cloud",
+                    }
+                self._emit_partial(payload)
+            except Exception as exc:  # noqa: BLE001
+                payload["cloud_map"] = {
+                    "source": "earthenv",
+                    "month": int(self.cloud_map_month),
+                    "month_name": self._earthenv_month_name(self.cloud_map_month),
+                    "image_bytes": b"",
+                    "caption": f"EarthEnv map unavailable: {exc}",
+                    "approx_cloud_pct": None,
+                    "url": "https://www.earthenv.org/cloud",
+                }
+                errors.append(f"Cloud map: {exc}")
+                self._emit_partial(payload)
+
+        if self.include_satellite:
+            try:
+                advance("Loading satellite preview...")
+                sat_payload, cached = self._run_cached(
+                    cache_key=f"weather:satellite:gibs:{lat_txt}:{lon_txt}",
+                    ttl_s=self.TTL_CONDITIONS_S,
+                    fetcher=self._fetch_satellite,
+                )
+                if cached:
+                    caption = str(sat_payload.get("caption") or "").strip()
+                    sat_payload["caption"] = f"{caption} (cached)" if caption else "cached"
+                payload["satellite"] = sat_payload
+                self._emit_partial(payload)
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    sat_payload, cached = self._run_cached(
+                        cache_key=f"weather:satellite:met_no:{lat_txt}:{lon_txt}",
+                        ttl_s=self.TTL_CONDITIONS_S,
+                        fetcher=self._fetch_satellite_met_no,
+                    )
+                    if cached:
+                        caption = str(sat_payload.get("caption") or "").strip()
+                        sat_payload["caption"] = f"{caption} (cached)" if caption else "cached"
+                    sat_payload["caption"] = (
+                        f"{str(sat_payload.get('caption') or '').strip()} "
+                        f"(fallback after primary satellite error: {exc})"
+                    ).strip()
+                    payload["satellite"] = sat_payload
+                    self._emit_partial(payload)
+                except Exception as exc_fallback:
+                    try:
+                        sat_payload, cached = self._run_cached(
+                            cache_key="weather:satellite:wetterzentrale",
+                            ttl_s=self.TTL_CONDITIONS_S,
+                            fetcher=self._fetch_satellite_wetterzentrale,
+                        )
+                        if cached:
+                            caption = str(sat_payload.get("caption") or "").strip()
+                            sat_payload["caption"] = f"{caption} (cached)" if caption else "cached"
+                        sat_payload["caption"] = (
+                            f"{str(sat_payload.get('caption') or '').strip()} "
+                            f"(fallback after errors: primary={exc}; met.no={exc_fallback})"
+                        ).strip()
+                        payload["satellite"] = sat_payload
+                        self._emit_partial(payload)
+                    except Exception as exc_last:
+                        payload["satellite"] = {
+                            "url": "",
+                            "image_bytes": b"",
+                            "caption": (
+                                "Satellite preview unavailable: "
+                                f"primary={exc}; met.no={exc_fallback}; wetterzentrale={exc_last}"
+                            ),
+                        }
+                        errors.append(
+                            "Satellite preview failed: "
+                            f"primary={exc}; met.no={exc_fallback}; wetterzentrale={exc_last}"
+                        )
+                        self._emit_partial(payload)
+
+        advance("Computing source aggregates...")
+        condition_keys = self._conditions_source_keys(providers)
+        avg_payload: dict[str, dict[str, object]] = {}
+        for metric_key in ("temp_c", "wind_ms", "cloud_pct", "rh_pct", "pressure_hpa"):
+            values: list[float] = []
+            labels: list[str] = []
+            for key in condition_keys:
+                row = providers.get(key)
+                if not isinstance(row, dict):
+                    continue
+                status = str(row.get("status") or "").strip().lower()
+                if status not in {"ok", "partial"}:
+                    continue
+                value = _safe_float(row.get(metric_key))
+                if value is None or not math.isfinite(value):
+                    continue
+                values.append(float(value))
+                labels.append(str(row.get("label", key)))
+            avg_payload[metric_key] = {
+                "value": self._avg(values),
+                "count": len(values),
+                "sources": labels,
+            }
+        payload["averages"] = avg_payload
+
+        forecast_ok = 0
+        forecast_err = 0
+        conditions_ok = 0
+        conditions_err = 0
+        for row in providers.values():
+            if not isinstance(row, dict):
+                continue
+            categories = row.get("categories")
+            if not isinstance(categories, list):
+                continue
+            status = str(row.get("status") or "").strip().lower()
+            if "forecast" in categories:
+                if status in {"ok", "partial"}:
+                    forecast_ok += 1
+                elif status == "error":
+                    forecast_err += 1
+            if "conditions" in categories:
+                if status in {"ok", "partial"}:
+                    conditions_ok += 1
+                elif status == "error":
+                    conditions_err += 1
+
+        payload["sections"] = {
+            "forecast": {
+                "status": "ok" if forecast_ok > 0 and forecast_err == 0 else ("partial" if forecast_ok > 0 else "error"),
+                "message": f"Forecast providers ok: {forecast_ok}, errors: {forecast_err}.",
+            },
+            "conditions": {
+                "status": "ok"
+                if conditions_ok > 0 and conditions_err == 0
+                else ("partial" if conditions_ok > 0 else "error"),
+                "message": f"Conditions providers ok: {conditions_ok}, errors: {conditions_err}.",
+            },
+            "climatology": {
+                "status": (
+                    "ok" if _safe_float(payload.get("annual_cloud_pct")) is not None else "partial"
+                )
+                if self.include_cloud_map
+                else "idle",
+                "message": str(payload.get("annual_cloud_note") or "-")
+                if self.include_cloud_map
+                else "Cloud map not refreshed in this cycle.",
+            },
+            "satellite": {
+                "status": (
+                    "ok"
+                    if isinstance(payload.get("satellite"), dict)
+                    and payload.get("satellite", {}).get("image_bytes")
+                    else "partial"
+                )
+                if self.include_satellite
+                else "idle",
+                "message": (
+                    str(payload.get("satellite", {}).get("caption"))
+                    if isinstance(payload.get("satellite"), dict)
+                    else "-"
+                )
+                if self.include_satellite
+                else "Satellite not refreshed in this cycle.",
+            },
+        }
+
+        self._emit_partial(payload)
+        self.completed.emit(payload)
+
+
+class WeatherDialog(QDialog):
+    """Weather workspace with provider-based live data, cloud analysis and interactive meteograms."""
+
+    _AUTO_REFRESH_MIN_INTERVAL_S = 120.0
+    _MONTH_CHOICES = [(idx + 1, name) for idx, name in enumerate(WeatherLiveWorker.MONTH_NAMES)]
+    _FORECAST_SOURCE_CHOICES = [
+        ("open_meteo", "Open-Meteo"),
+        ("meteoblue", "meteoblue"),
+        ("windy", "Windy"),
+        ("meteo_icm", "Meteo ICM"),
+    ]
+    _CONDITION_SOURCE_CHOICES = [
+        ("average", "Average (all live sources)"),
+        ("open_meteo", "Open-Meteo"),
+        ("metar", "Nearest METAR"),
+        ("custom", "Custom URL"),
+        ("meteoblue", "meteoblue"),
+        ("windy", "Windy"),
+        ("meteo_icm", "Meteo ICM"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.setWindowTitle("Weather")
+        self.setModal(False)
+        self._theme_tokens = dict(_theme_tokens_from_widget(self))
+        self._theme_name = normalize_theme_key(
+            str(getattr(parent, "_theme_name", DEFAULT_UI_THEME) if parent is not None else DEFAULT_UI_THEME)
+        )
+        self._dark_enabled = bool(getattr(parent, "_dark_enabled", False))
+
+        self._site: Optional[Site] = None
+        self._obs_name = "-"
+        self._date = QDate.currentDate()
+        self._sun_alt_limit = -10.0
+        self._local_time_text = "-"
+        self._utc_time_text = "-"
+        self._sunrise_text = "-"
+        self._sunset_text = "-"
+        self._moonrise_text = "-"
+        self._moonset_text = "-"
+        self._moon_phase_pct = 0
+
+        self._weather_default_source = "average"
+        self._weather_auto_refresh_s = float(self._AUTO_REFRESH_MIN_INTERVAL_S)
+        self._weather_custom_url = ""
+        self._weather_wunderground_url = ""
+        self._weather_weathercloud_url = ""
+        self._weather_local_links_raw = ""
+        self._weather_cloud_source = "earthenv"
+        self._weather_cloud_month_mode = "session_month"
+
+        self._live_worker: Optional[WeatherLiveWorker] = None
+        self._live_payload: dict[str, object] = {}
+        self._last_live_context_key = ""
+        self._last_live_fetch_perf = 0.0
+        self.conditions_tab_widget: Optional[QWidget] = None
+
+        self._conditions_raw_pixmap = QPixmap()
+        self._meteogram_raw_pixmap = QPixmap()
+        self._cloud_map_raw_pixmap = QPixmap()
+        self._satellite_raw_pixmap = QPixmap()
+
+        self._resize_debounce = QTimer(self)
+        self._resize_debounce.setSingleShot(True)
+        self._resize_debounce.timeout.connect(self._rescale_preview_pixmaps)
+
+        self._conditions_poll_timer = QTimer(self)
+        self._conditions_poll_timer.setSingleShot(False)
+        self._conditions_poll_timer.timeout.connect(self._on_conditions_poll_timeout)
+        self._weather_plot_stacks: dict[str, QStackedLayout] = {}
+        self._weather_plot_placeholders: dict[str, QWidget] = {}
+        self._weather_plot_hosts: dict[str, QWidget] = {}
+        self._weather_plot_loaded: dict[str, bool] = {}
+        self._weather_image_stacks: dict[str, QStackedLayout] = {}
+        self._weather_image_placeholders: dict[str, QWidget] = {}
+        self._weather_image_hosts: dict[str, QWidget] = {}
+        self._weather_image_labels: dict[str, QLabel] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        context_row = QWidget(self)
+        context_l = QHBoxLayout(context_row)
+        context_l.setContentsMargins(0, 0, 0, 0)
+        context_l.setSpacing(8)
+        self.obs_label = QLabel("Obs: -", context_row)
+        self.coords_label = QLabel("Lat/Lon: -", context_row)
+        self.sun_limit_label = QLabel("Sun ≤ -", context_row)
+        for lbl in (self.obs_label, self.coords_label, self.sun_limit_label):
+            lbl.setObjectName("SectionHint")
+            context_l.addWidget(lbl)
+        context_l.addSpacing(10)
+        src_lbl = QLabel("Source:", context_row)
+        src_lbl.setObjectName("SectionHint")
+        context_l.addWidget(src_lbl, 0)
+
+        self.live_source_combo = QComboBox(context_row)
+        for key, label in self._CONDITION_SOURCE_CHOICES:
+            self.live_source_combo.addItem(label, key)
+        self.live_source_combo.setMinimumWidth(220)
+        self.live_source_combo.setMaximumWidth(280)
+        context_l.addWidget(self.live_source_combo, 0)
+
+        self.live_refresh_btn = QPushButton("Refresh", context_row)
+        self.live_refresh_btn.setMinimumHeight(30)
+        _set_button_variant(self.live_refresh_btn, "secondary")
+        _set_button_icon_kind(self.live_refresh_btn, "refresh")
+        context_l.addWidget(self.live_refresh_btn, 0)
+
+        self.live_progress = QProgressBar(context_row)
+        self.live_progress.setTextVisible(False)
+        self.live_progress.setMinimumWidth(72)
+        self.live_progress.setMaximumWidth(120)
+        self.live_progress.hide()
+        context_l.addWidget(self.live_progress, 0)
+
+        self.live_status_label = QLabel("Idle", context_row)
+        self.live_status_label.setObjectName("SectionHint")
+        self.live_status_label.setWordWrap(False)
+        self.live_status_label.setMaximumWidth(260)
+        context_l.addWidget(self.live_status_label, 0)
+        context_l.addStretch(1)
+        root.addWidget(context_row)
+
+        summary_row = QWidget(self)
+        summary_l = QHBoxLayout(summary_row)
+        summary_l.setContentsMargins(0, 0, 0, 0)
+        summary_l.setSpacing(6)
+
+        self.live_temp_label = QLabel("T -", summary_row)
+        self.live_wind_label = QLabel("W -", summary_row)
+        self.live_cloud_label = QLabel("C -", summary_row)
+        self.live_rh_label = QLabel("RH -", summary_row)
+        self.live_pressure_label = QLabel("P -", summary_row)
+        self.date_chip_label = QLabel("Date -", summary_row)
+        self.local_time_label = QLabel("L -", summary_row)
+        self.utc_time_label = QLabel("U -", summary_row)
+        self.sunrise_info_label = QLabel("Sun↑ -", summary_row)
+        self.sunset_info_label = QLabel("Sun↓ -", summary_row)
+        self.moonrise_info_label = QLabel("Moon↑ -", summary_row)
+        self.moonset_info_label = QLabel("Moon↓ -", summary_row)
+        self.moon_phase_info_bar = QProgressBar(summary_row)
+        self.moon_phase_info_bar.setRange(0, 100)
+        self.moon_phase_info_bar.setValue(0)
+        self.moon_phase_info_bar.setTextVisible(True)
+        self.moon_phase_info_bar.setAlignment(Qt.AlignCenter)
+        self.moon_phase_info_bar.setFormat("Phase %p%%")
+        self.moon_phase_info_bar.setProperty("weather_chip", True)
+        self.moon_phase_info_bar.setProperty("weather_phase_chip", True)
+        self.moon_phase_info_bar.setProperty("weather_chip_role", "lunar")
+        self.moon_phase_info_bar.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        summary_chips = (
+            (self.live_temp_label, "weather"),
+            (self.live_wind_label, "weather"),
+            (self.live_cloud_label, "weather"),
+            (self.live_rh_label, "weather"),
+            (self.live_pressure_label, "weather"),
+            (self.date_chip_label, "context"),
+            (self.local_time_label, "clock"),
+            (self.utc_time_label, "clock"),
+            (self.sunrise_info_label, "solar"),
+            (self.sunset_info_label, "solar"),
+            (self.moonrise_info_label, "lunar"),
+            (self.moonset_info_label, "lunar"),
+        )
+        for lbl, role in summary_chips:
+            lbl.setObjectName("SectionHint")
+            lbl.setProperty("weather_chip", True)
+            lbl.setProperty("weather_chip_role", role)
+            lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+            lbl.setTextFormat(Qt.RichText)
+            summary_l.addWidget(lbl, 0)
+        summary_l.addWidget(self.moon_phase_info_bar, 0)
+        summary_l.addStretch(1)
+        root.addWidget(summary_row)
+
+        self.tabs = _configure_tab_widget(QTabWidget(self))
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        root.addWidget(self.tabs, 1)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.live_source_combo.currentIndexChanged.connect(self._update_live_views)
+        self.live_source_combo.currentIndexChanged.connect(lambda _=0: self._sync_conditions_source_combo())
+        self.live_refresh_btn.clicked.connect(lambda: self._start_live_refresh(force=True))
+        _fit_dialog_to_screen(
+            self,
+            preferred_width=1380,
+            preferred_height=900,
+            min_width=1080,
+            min_height=720,
+        )
+        self._update_summary_chip_widths()
+
+    def _sync_theme_state_from_parent(self) -> None:
+        parent = self.parent()
+        self._theme_tokens = dict(_theme_tokens_from_widget(self))
+        self._theme_name = normalize_theme_key(
+            str(getattr(parent, "_theme_name", getattr(self, "_theme_name", DEFAULT_UI_THEME)) or DEFAULT_UI_THEME)
+        )
+        self._dark_enabled = bool(getattr(parent, "_dark_enabled", getattr(self, "_dark_enabled", False)))
+        self._refresh_theme_surfaces()
+
+    def _refresh_theme_surfaces(self) -> None:
+        plot_bg = str(getattr(self, "_theme_tokens", {}).get("plot_bg", "#121b29"))
+        for host in self._weather_plot_hosts.values():
+            if isinstance(host, QWidget):
+                host.setStyleSheet(f"background:{plot_bg};")
+        for host in self._weather_image_hosts.values():
+            if isinstance(host, QWidget):
+                host.setStyleSheet(f"background:{plot_bg};")
+        for placeholder in self._weather_plot_placeholders.values():
+            if isinstance(placeholder, QWidget):
+                placeholder.setStyleSheet(f"background:{plot_bg};")
+        for placeholder in self._weather_image_placeholders.values():
+            if isinstance(placeholder, QWidget):
+                placeholder.setStyleSheet(f"background:{plot_bg};")
+
+    def closeEvent(self, event):
+        self._conditions_poll_timer.stop()
+        self._stop_live_worker()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_debounce.start(120)
+
+    def set_context(
+        self,
+        *,
+        site: Optional[Site],
+        obs_name: str,
+        date: QDate,
+        sun_alt_limit: float,
+        local_time_text: str,
+        utc_time_text: str,
+        sunrise_text: str,
+        sunset_text: str,
+        moonrise_text: str,
+        moonset_text: str,
+        moon_phase_pct: int,
+        rebuild: bool = True,
+    ) -> None:
+        self._sync_theme_state_from_parent()
+        self._site = site
+        self._obs_name = str(obs_name or "-")
+        self._date = date if isinstance(date, QDate) and date.isValid() else QDate.currentDate()
+        self._sun_alt_limit = float(sun_alt_limit)
+        self._local_time_text = str(local_time_text or "-")
+        self._utc_time_text = str(utc_time_text or "-")
+        self._sunrise_text = str(sunrise_text or "-")
+        self._sunset_text = str(sunset_text or "-")
+        self._moonrise_text = str(moonrise_text or "-")
+        self._moonset_text = str(moonset_text or "-")
+        self._moon_phase_pct = max(0, min(100, int(moon_phase_pct)))
+        if rebuild:
+            self._reload_weather_settings()
+            self._rebuild()
+            return
+        self._apply_summary_labels()
+
+    def _reload_weather_settings(self) -> None:
+        parent = self.parent()
+        self._sync_theme_state_from_parent()
+        settings = getattr(parent, "settings", None)
+        if settings is None:
+            return
+        self._weather_default_source = str(
+            settings.value("weather/defaultConditionsSource", "average", type=str) or "average"
+        ).strip() or "average"
+        self._weather_auto_refresh_s = max(
+            30.0,
+            min(
+                1800.0,
+                float(
+                    settings.value(
+                        "weather/autoRefreshSec",
+                        self._AUTO_REFRESH_MIN_INTERVAL_S,
+                        type=int,
+                    )
+                ),
+            ),
+        )
+        site_custom_url = (
+            str(getattr(self._site, "custom_conditions_url", "") or "").strip()
+            if isinstance(self._site, Site)
+            else ""
+        )
+        self._weather_custom_url = site_custom_url
+        self._weather_wunderground_url = str(settings.value("weather/wundergroundUrl", "", type=str) or "").strip()
+        self._weather_weathercloud_url = str(settings.value("weather/weathercloudUrl", "", type=str) or "").strip()
+        self._weather_local_links_raw = str(settings.value("weather/localConditionsLinks", "", type=str) or "")
+        self._weather_cloud_source = str(settings.value("weather/cloudMapSource", "earthenv", type=str) or "earthenv").strip()
+        self._weather_cloud_month_mode = str(
+            settings.value("weather/cloudMapMonthMode", "session_month", type=str) or "session_month"
+        ).strip()
+        self._conditions_poll_timer.setInterval(int(max(30.0, self._weather_auto_refresh_s) * 1000))
+        idx = self.live_source_combo.findData(self._weather_default_source)
+        if idx >= 0:
+            blocker = QSignalBlocker(self.live_source_combo)
+            self.live_source_combo.setCurrentIndex(idx)
+            del blocker
+
+    def _site_coordinates(self) -> tuple[float, float, float]:
+        if isinstance(self._site, Site):
+            return float(self._site.latitude), float(self._site.longitude), float(self._site.elevation)
+        return 0.0, 0.0, 0.0
+
+    def _default_cloud_month(self) -> int:
+        mode = str(self._weather_cloud_month_mode or "session_month").strip().lower()
+        if mode == "current_month":
+            return int(QDate.currentDate().month())
+        return int(self._date.month())
+
+    def _selected_cloud_month(self) -> int:
+        if hasattr(self, "cloud_month_combo"):
+            month = _safe_int(self.cloud_month_combo.currentData())
+            if month is not None:
+                return max(1, min(12, int(month)))
+        return self._default_cloud_month()
+
+    @staticmethod
+    def _open_url(url: str, parent: Optional[QWidget] = None) -> None:
+        qurl = QUrl(str(url))
+        if not qurl.isValid():
+            QMessageBox.warning(parent, "Weather Link", f"Invalid URL: {url}")
+            return
+        if not QDesktopServices.openUrl(qurl):
+            QMessageBox.warning(parent, "Weather Link", f"Unable to open URL:\n{url}")
+
+    def _open_urls(self, urls: list[str]) -> None:
+        for url in urls:
+            self._open_url(url, self)
+
+    @staticmethod
+    def _normalize_optional_station_url(value: str, *, base_url: str = "") -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
+        if base_url:
+            return f"{base_url.rstrip('/')}/{quote(text)}"
+        return text
+
+    @staticmethod
+    def _label_from_url(url: str) -> str:
+        text = str(url or "").strip()
+        if not text:
+            return "Local Source"
+        clean = text.replace("https://", "").replace("http://", "")
+        domain = clean.split("/", 1)[0]
+        domain = domain.replace("www.", "").strip()
+        if not domain:
+            return "Local Source"
+        return domain[:40]
+
+    def _parse_local_conditions_links(self) -> list[tuple[str, str, str]]:
+        entries: list[tuple[str, str, str]] = []
+        lines = str(self._weather_local_links_raw or "").splitlines()
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            label = ""
+            url = ""
+            if "|" in line:
+                left, right = line.split("|", 1)
+                label = left.strip()
+                url = right.strip()
+            else:
+                url = line
+            if not url:
+                continue
+            if not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            if not label:
+                label = self._label_from_url(url)
+            entries.append((label, url, "Custom local weather source."))
+        return entries
+
+    @staticmethod
+    def _fmt_value(value: Optional[float], unit: str, precision: int = 1) -> str:
+        if value is None or not math.isfinite(float(value)):
+            return "-"
+        return f"{float(value):.{precision}f} {unit}".strip()
+
+    @staticmethod
+    def _short_provider_note(value: object, max_len: int = 66) -> str:
+        text = str(value or "").replace("\n", " ").strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1].rstrip() + "…"
+
+    def _source_urls(self) -> dict[str, list[tuple[str, str, str]]]:
+        lat, lon, elev = self._site_coordinates()
+        lat_txt = f"{lat:.5f}"
+        lon_txt = f"{lon:.5f}"
+        elev_txt = f"{elev:.0f}"
+        windy_center = f"{lat:.5f},{lon:.5f},8"
+        local_conditions_entries: list[tuple[str, str, str]] = []
+        wu_url = self._normalize_optional_station_url(
+            self._weather_wunderground_url,
+            base_url="https://www.wunderground.com/dashboard/pws",
+        )
+        if wu_url:
+            local_conditions_entries.append(
+                ("Wunderground PWS", wu_url, "Public local station page (configured in Settings).")
+            )
+        wc_url = self._normalize_optional_station_url(
+            self._weather_weathercloud_url,
+            base_url="https://app.weathercloud.net",
+        )
+        if wc_url:
+            local_conditions_entries.append(
+                ("WeatherCloud", wc_url, "Public local station page (configured in Settings).")
+            )
+        local_conditions_entries.extend(self._parse_local_conditions_links())
+        return {
+            "forecast": [
+                ("Meteo ICM", "https://www.meteo.pl/", "Forecast portal and meteorogram ecosystem."),
+                (
+                    "meteoblue",
+                    f"https://www.meteoblue.com/en/weather/week?lat={lat_txt}&lon={lon_txt}&asl={elev_txt}",
+                    "Model week forecast for current coordinates.",
+                ),
+                (
+                    "Windy",
+                    f"https://www.windy.com/{lat_txt}/{lon_txt}?{windy_center}",
+                    "Interactive multi-model forecast map.",
+                ),
+                ("wetterzentrale", "https://www.wetterzentrale.de/en/topkarten.php?model=gfs", "Synoptic model charts."),
+            ],
+            "conditions": local_conditions_entries + [
+                ("Open-Meteo", f"https://open-meteo.com/en/docs#latitude={lat_txt}&longitude={lon_txt}", "Public no-key API docs."),
+                ("AviationWeather METAR", "https://aviationweather.gov/data/api/", "Nearest METAR station feed."),
+                ("WeatherCloud Portal", "https://weathercloud.net/", "Station platform."),
+                ("Wunderground Portal", "https://www.wunderground.com/weatherstation/overview", "Station platform."),
+                ("Windy", f"https://www.windy.com/-Weather-radar-radar?radar,{lat_txt},{lon_txt},7", "Nowcast overlays."),
+            ],
+            "cloud": [
+                ("EarthEnv", "https://www.earthenv.org/cloud", "Monthly cloud frequency dataset."),
+                (
+                    "ECMWF OpenCharts",
+                    "https://charts.ecmwf.int/products/medium-clouds",
+                    "Operational cloud charts.",
+                ),
+                ("DWD RCC-CM", "https://www.dwd.de/EN/ourservices/rcccm/int/rcccm_int_cfc.html", "Cloud climatology service."),
+                ("CHELSA", "https://www.chelsa-climate.org/datasets/chelsa_monthly", "Monthly climate datasets."),
+            ],
+            "satellite": [
+                ("Windy satellite", f"https://www.windy.com/-Satellite-satellite?satellite,{lat_txt},{lon_txt},7", "Satellite layer."),
+                ("NASA GIBS WMS", "https://nasa-gibs.github.io/gibs-api-docs/gis-usage/", "Satellite map service used for centered site cutouts."),
+                ("MET geosatellite", "https://api.met.no/weatherapi/geosatellite/1.4/documentation", "Operational geostationary imagery API."),
+                ("NASA Worldview", "https://worldview.earthdata.nasa.gov/", "Satellite layers and browse UI."),
+                ("wetterzentrale", "https://www.wetterzentrale.de/en/reanalysis.php?map=1&model=sat&var=44", "Alternative reference source."),
+                ("meteoblue maps", f"https://www.meteoblue.com/en/weather/maps/index?lat={lat_txt}&lon={lon_txt}&asl={elev_txt}&map=satellite", "Satellite map view."),
+            ],
+        }
+
+    def _append_links(
+        self,
+        layout: QVBoxLayout,
+        entries: list[tuple[str, str, str]],
+        *,
+        max_cols: int = 5,
+        min_button_w: int = 96,
+        max_button_w: int = 156,
+    ) -> None:
+        if not entries:
+            return
+        urls: list[str] = []
+        box = QFrame(self)
+        box_l = QGridLayout(box)
+        box_l.setContentsMargins(0, 0, 0, 0)
+        box_l.setHorizontalSpacing(6)
+        box_l.setVerticalSpacing(6)
+        cols = max(1, int(max_cols))
+        for idx, (source_name, url, desc) in enumerate(entries):
+            urls.append(url)
+            btn = QPushButton(source_name, box)
+            btn.setProperty("weather_link", True)
+            btn.setToolTip(f"{desc}\n{url}")
+            btn.setMinimumHeight(24)
+            btn.setMaximumHeight(24)
+            btn.setMinimumWidth(max(70, int(min_button_w)))
+            btn.setMaximumWidth(max(90, int(max_button_w)))
+            _set_button_variant(btn, "ghost")
+            _set_button_icon_kind(btn, "link", 13)
+            btn.clicked.connect(lambda _checked=False, u=url: self._open_url(u, self))
+            row = idx // cols
+            col = idx % cols
+            box_l.addWidget(btn, row, col)
+        layout.addWidget(box, 0)
+        open_all_btn = QPushButton("Open all", self)
+        open_all_btn.setProperty("weather_link", True)
+        open_all_btn.setMinimumHeight(24)
+        open_all_btn.setMaximumHeight(24)
+        open_all_btn.setMinimumWidth(90)
+        _set_button_variant(open_all_btn, "secondary")
+        _set_button_icon_kind(open_all_btn, "open", 13)
+        open_all_btn.clicked.connect(lambda: self._open_urls(urls))
+        layout.addWidget(open_all_btn, 0, Qt.AlignLeft)
+
+    def _append_links_inline(
+        self,
+        layout: QHBoxLayout,
+        entries: list[tuple[str, str, str]],
+        *,
+        min_button_w: int = 88,
+        max_button_w: int = 132,
+        add_open_all: bool = True,
+    ) -> None:
+        if not entries:
+            return
+        urls: list[str] = []
+        for source_name, url, desc in entries:
+            urls.append(url)
+            btn = QPushButton(source_name, self)
+            btn.setProperty("weather_link", True)
+            btn.setToolTip(f"{desc}\n{url}")
+            btn.setMinimumHeight(24)
+            btn.setMaximumHeight(24)
+            btn.setMinimumWidth(max(70, int(min_button_w)))
+            btn.setMaximumWidth(max(90, int(max_button_w)))
+            _set_button_variant(btn, "ghost")
+            _set_button_icon_kind(btn, "link", 13)
+            btn.clicked.connect(lambda _checked=False, u=url: self._open_url(u, self))
+            layout.addWidget(btn, 0)
+        if add_open_all:
+            open_all_btn = QPushButton("Open all", self)
+            open_all_btn.setProperty("weather_link", True)
+            open_all_btn.setMinimumHeight(24)
+            open_all_btn.setMaximumHeight(24)
+            open_all_btn.setMinimumWidth(90)
+            _set_button_variant(open_all_btn, "secondary")
+            _set_button_icon_kind(open_all_btn, "open", 13)
+            open_all_btn.clicked.connect(lambda: self._open_urls(urls))
+            layout.addWidget(open_all_btn, 0)
+
+    def _build_weather_plot_placeholder(self, title: str, message: str) -> QWidget:
+        widget = QWidget(self)
+        widget.setAttribute(Qt.WA_StyledBackground, True)
+        widget.setStyleSheet(f"background:{_theme_color_from_widget(self, 'plot_bg', '#121b29')};")
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        card = QFrame(widget)
+        card.setObjectName("VisibilityLoadingCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(12)
+        title_label = QLabel(title, card)
+        title_label.setObjectName("SectionTitle")
+        title_label.setAlignment(Qt.AlignCenter)
+        skeleton = SkeletonShimmerWidget("plot", card)
+        skeleton.setMinimumHeight(230)
+        hint_label = QLabel(message, card)
+        hint_label.setObjectName("SectionHint")
+        hint_label.setAlignment(Qt.AlignCenter)
+        hint_label.setWordWrap(True)
+        hint_label.setMinimumWidth(320)
+        hint_label.setMaximumWidth(460)
+        hint_label.setMinimumHeight(42)
+        card_layout.addWidget(title_label, 0, Qt.AlignHCenter)
+        card_layout.addWidget(skeleton, 1)
+        card_layout.addWidget(hint_label, 0, Qt.AlignHCenter)
+        layout.addWidget(card, 0, Qt.AlignCenter)
+        layout.addStretch(1)
+        widget._loading_hint_label = hint_label  # type: ignore[attr-defined]
+        widget._loading_skeleton = skeleton  # type: ignore[attr-defined]
+        return widget
+
+    def _create_weather_plot_stack(
+        self,
+        parent: QWidget,
+        *,
+        kind: str,
+        title: str,
+        min_height: int,
+    ) -> tuple[QWidget, "QWebEngineView"]:
+        host = QWidget(parent)
+        host.setAttribute(Qt.WA_StyledBackground, True)
+        host.setStyleSheet(f"background:{_theme_color_from_widget(self, 'plot_bg', '#121b29')};")
+        host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        host.setMinimumHeight(min_height)
+        stack = QStackedLayout(host)
+        stack.setContentsMargins(0, 0, 0, 0)
+        placeholder = self._build_weather_plot_placeholder(title, "Loading weather plot…")
+        web_view = QWebEngineView(host)
+        web_view.setMinimumHeight(min_height)
+        web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        web_view.setProperty("weather_plot_kind", kind)
+        web_view.setStyleSheet(f"background:{_theme_color_from_widget(self, 'plot_bg', '#121b29')};")
+        web_view.loadFinished.connect(lambda ok, k=kind: self._on_weather_plot_load_finished(k, ok))
+        stack.addWidget(placeholder)
+        stack.addWidget(web_view)
+        stack.setCurrentWidget(placeholder)
+        self._weather_plot_stacks[kind] = stack
+        self._weather_plot_placeholders[kind] = placeholder
+        self._weather_plot_hosts[kind] = host
+        self._weather_plot_loaded[kind] = False
+        return host, web_view
+
+    def _create_weather_image_stack(
+        self,
+        parent: QWidget,
+        *,
+        kind: str,
+        title: str,
+        min_height: int,
+    ) -> tuple[QWidget, QLabel]:
+        host = QWidget(parent)
+        host.setAttribute(Qt.WA_StyledBackground, True)
+        host.setStyleSheet(f"background:{_theme_color_from_widget(self, 'plot_bg', '#121b29')};")
+        host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        host.setMinimumHeight(min_height)
+        stack = QStackedLayout(host)
+        stack.setContentsMargins(0, 0, 0, 0)
+        placeholder = self._build_weather_plot_placeholder(title, "Fetching preview…")
+        skeleton = getattr(placeholder, "_loading_skeleton", None)
+        if isinstance(skeleton, SkeletonShimmerWidget):
+            skeleton._variant = "image"
+            skeleton.update()
+        image_label = QLabel("", host)
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setWordWrap(True)
+        image_label.setMinimumHeight(min_height)
+        image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        image_label.setObjectName("CutoutImage")
+        stack.addWidget(placeholder)
+        stack.addWidget(image_label)
+        stack.setCurrentWidget(placeholder)
+        self._weather_image_stacks[kind] = stack
+        self._weather_image_placeholders[kind] = placeholder
+        self._weather_image_hosts[kind] = host
+        self._weather_image_labels[kind] = image_label
+        return host, image_label
+
+    def _set_weather_image_loading(self, kind: str, message: str, *, visible: bool = True) -> None:
+        stack = self._weather_image_stacks.get(kind)
+        placeholder = self._weather_image_placeholders.get(kind)
+        image_label = self._weather_image_labels.get(kind)
+        if stack is None or placeholder is None or image_label is None:
+            return
+        hint_label = getattr(placeholder, "_loading_hint_label", None)
+        if isinstance(hint_label, QLabel):
+            hint_label.setText(message)
+        if visible:
+            stack.setCurrentWidget(placeholder)
+        else:
+            stack.setCurrentWidget(image_label)
+
+    def _set_weather_plot_loading(self, kind: str, message: str, *, visible: bool = True) -> None:
+        stack = self._weather_plot_stacks.get(kind)
+        placeholder = self._weather_plot_placeholders.get(kind)
+        if stack is None or placeholder is None:
+            return
+        hint_label = getattr(placeholder, "_loading_hint_label", None)
+        if isinstance(hint_label, QLabel):
+            hint_label.setText(message)
+        if visible:
+            stack.setCurrentWidget(placeholder)
+        else:
+            widget = stack.widget(1)
+            if widget is not None:
+                stack.setCurrentWidget(widget)
+
+    @Slot(bool)
+    def _on_weather_plot_load_finished(self, kind: str, ok: bool) -> None:
+        self._weather_plot_loaded[kind] = bool(ok)
+        if ok:
+            self._set_weather_plot_loading(kind, "", visible=False)
+            return
+        self._set_weather_plot_loading(kind, "Unable to render interactive chart.", visible=True)
+
+    def _build_forecast_tab(self, entries: list[tuple[str, str, str]]) -> QWidget:
+        page = QWidget(self.tabs)
+        page_l = QVBoxLayout(page)
+        page_l.setContentsMargins(10, 10, 10, 10)
+        page_l.setSpacing(6)
+        intro = QLabel(
+            "Forecast: model-driven look ahead for the next hours/nights (different from live current conditions).",
+            page,
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("SectionHint")
+        page_l.addWidget(intro)
+        self.forecast_summary_label = QLabel("Forecast providers: -", page)
+        self.forecast_summary_label.setObjectName("SectionHint")
+        self.forecast_summary_label.setWordWrap(True)
+        page_l.addWidget(self.forecast_summary_label)
+
+        src_row = QWidget(page)
+        src_row_l = QHBoxLayout(src_row)
+        src_row_l.setContentsMargins(0, 0, 0, 0)
+        src_row_l.setSpacing(6)
+        src_lbl = QLabel("Forecast source:", src_row)
+        src_lbl.setObjectName("SectionHint")
+        src_row_l.addWidget(src_lbl, 0)
+        self.forecast_source_combo = QComboBox(src_row)
+        for key, label in self._FORECAST_SOURCE_CHOICES:
+            self.forecast_source_combo.addItem(label, key)
+        src_row_l.addWidget(self.forecast_source_combo, 0)
+        src_row_l.addStretch(1)
+        page_l.addWidget(src_row)
+
+        if _HAS_QTWEBENGINE and _HAS_PLOTLY and QWebEngineView is not None:
+            self.forecast_web = QWebEngineView(page)
+            self.forecast_web.setMinimumHeight(280)
+            self.forecast_web.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            page_l.addWidget(self.forecast_web, 1)
+        else:
+            self.forecast_web = None
+            self.forecast_image_label = QLabel("", page)
+            self.forecast_canvas = None
+            if _HAS_MPL_CANVAS and FigureCanvas is not None:
+                self.forecast_figure = Figure(figsize=(8.8, 3.8), dpi=120)
+                self.forecast_canvas = FigureCanvas(self.forecast_figure)
+                self.forecast_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.forecast_canvas.setMinimumHeight(280)
+                page_l.addWidget(self.forecast_canvas, 1)
+            else:
+                self.forecast_image_label.setAlignment(Qt.AlignCenter)
+                self.forecast_image_label.setWordWrap(True)
+                self.forecast_image_label.setMinimumHeight(280)
+                self.forecast_image_label.setObjectName("CutoutImage")
+                self.forecast_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.forecast_image_label.setText("No forecast data loaded yet.")
+                page_l.addWidget(self.forecast_image_label, 1)
+
+        self.forecast_provider_details = QLabel("-", page)
+        self.forecast_provider_details.setObjectName("SectionHint")
+        self.forecast_provider_details.setWordWrap(False)
+        self.forecast_provider_details.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.forecast_provider_details.setMaximumHeight(24)
+        page_l.addWidget(self.forecast_provider_details)
+
+        self.forecast_source_combo.currentIndexChanged.connect(self._update_live_views)
+        src_hint = QLabel("Sources:", page)
+        src_hint.setObjectName("SectionHint")
+        page_l.addWidget(src_hint)
+        self._append_links(page_l, entries, max_cols=5, min_button_w=90, max_button_w=146)
+        page_l.addStretch(1)
+        return page
+
+    def _build_conditions_tab(self, entries: list[tuple[str, str, str]]) -> QWidget:
+        page = QWidget(self.tabs)
+        page_l = QVBoxLayout(page)
+        page_l.setContentsMargins(10, 10, 10, 10)
+        page_l.setSpacing(6)
+        self.conditions_summary_label = QLabel("ok 0 · err 0", page)
+        self.conditions_summary_label.setObjectName("SectionHint")
+        self.conditions_summary_label.setWordWrap(False)
+
+        src_row = QWidget(page)
+        src_row_l = QHBoxLayout(src_row)
+        src_row_l.setContentsMargins(0, 0, 0, 0)
+        src_row_l.setSpacing(6)
+        src_row_l.addWidget(self.conditions_summary_label, 0)
+
+        self.conditions_updated_label = QLabel("UTC -", src_row)
+        self.conditions_updated_label.setObjectName("SectionHint")
+        src_row_l.addWidget(self.conditions_updated_label, 0)
+        src_lbl = QLabel("Source:", src_row)
+        src_lbl.setObjectName("SectionHint")
+        src_row_l.addWidget(src_lbl, 0)
+        self.conditions_source_combo = QComboBox(src_row)
+        self.conditions_source_combo.setMinimumWidth(240)
+        self.conditions_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for key, label in self._CONDITION_SOURCE_CHOICES:
+            self.conditions_source_combo.addItem(label, key)
+        src_row_l.addWidget(self.conditions_source_combo, 1)
+        self.conditions_polling_label = QLabel("Poll off", src_row)
+        self.conditions_polling_label.setObjectName("SectionHint")
+        src_row_l.addWidget(self.conditions_polling_label, 0)
+        self._append_links_inline(src_row_l, entries, min_button_w=82, max_button_w=122, add_open_all=True)
+        src_row_l.addStretch(1)
+        page_l.addWidget(src_row)
+        self.conditions_source_combo.currentIndexChanged.connect(self._on_conditions_source_combo_changed)
+        self._sync_conditions_source_combo()
+
+        if _HAS_QTWEBENGINE and _HAS_PLOTLY and QWebEngineView is not None:
+            host, web_view = self._create_weather_plot_stack(
+                page,
+                kind="conditions",
+                title="Conditions Trend",
+                min_height=280,
+            )
+            self.conditions_trend_web = web_view
+            page_l.addWidget(host, 1)
+        else:
+            self.conditions_trend_web = None
+            self.conditions_trend_image_label = QLabel("", page)
+            self.conditions_trend_canvas = None
+            if _HAS_MPL_CANVAS and FigureCanvas is not None:
+                self.conditions_trend_figure = Figure(figsize=(8.0, 3.8), dpi=120)
+                self.conditions_trend_canvas = FigureCanvas(self.conditions_trend_figure)
+                self.conditions_trend_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.conditions_trend_canvas.setMinimumHeight(280)
+                page_l.addWidget(self.conditions_trend_canvas, 1)
+            else:
+                self.conditions_trend_image_label.setAlignment(Qt.AlignCenter)
+                self.conditions_trend_image_label.setWordWrap(True)
+                self.conditions_trend_image_label.setMinimumHeight(280)
+                self.conditions_trend_image_label.setObjectName("CutoutImage")
+                self.conditions_trend_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.conditions_trend_image_label.setText("No conditions trend data loaded yet.")
+                page_l.addWidget(self.conditions_trend_image_label, 1)
+        return page
+
+    def _build_cloud_analysis_tab(self, entries: list[tuple[str, str, str]]) -> QWidget:
+        page = QWidget(self.tabs)
+        page_l = QVBoxLayout(page)
+        page_l.setContentsMargins(10, 10, 10, 10)
+        page_l.setSpacing(8)
+
+        top = QWidget(page)
+        top_l = QVBoxLayout(top)
+        top_l.setContentsMargins(0, 0, 0, 0)
+        top_l.setSpacing(8)
+
+        self.cloud_live_label = QLabel("Live cloud (selected source): -", top)
+        self.cloud_live_label.setObjectName("SectionHint")
+        self.cloud_live_label.setProperty("weather_chip", True)
+        self.cloud_live_label.setProperty("weather_chip_role", "weather")
+        self.cloud_annual_label = QLabel("Annual cloud average: -", top)
+        self.cloud_annual_label.setObjectName("SectionHint")
+        self.cloud_annual_label.setProperty("weather_chip", True)
+        self.cloud_annual_label.setProperty("weather_chip_role", "context")
+        self.cloud_map_source_label = QLabel("Source EarthEnv", top)
+        self.cloud_map_source_label.setObjectName("SectionHint")
+        self.cloud_map_source_label.setProperty("weather_chip", True)
+        self.cloud_map_source_label.setProperty("weather_chip_role", "clock")
+
+        summary_row = QWidget(top)
+        summary_l = QHBoxLayout(summary_row)
+        summary_l.setContentsMargins(0, 0, 0, 0)
+        summary_l.setSpacing(6)
+        summary_l.addWidget(self.cloud_live_label, 0)
+        summary_l.addWidget(self.cloud_annual_label, 0)
+        summary_l.addWidget(self.cloud_map_source_label, 0)
+        summary_l.addStretch(1)
+        top_l.addWidget(summary_row)
+
+        self.cloud_low_spin = QSpinBox(top)
+        self.cloud_mid_spin = QSpinBox(top)
+        self.cloud_high_spin = QSpinBox(top)
+        for spin, init in ((self.cloud_low_spin, 35), (self.cloud_mid_spin, 20), (self.cloud_high_spin, 10)):
+            spin.setRange(0, 100)
+            spin.setSuffix(" %")
+            spin.setValue(init)
+            spin.setFixedWidth(92)
+            spin.valueChanged.connect(self._recompute_cloud_cover)
+
+        weights_row = QWidget(top)
+        weights_l = QHBoxLayout(weights_row)
+        weights_l.setContentsMargins(0, 0, 0, 0)
+        weights_l.setSpacing(8)
+        weights_l.addWidget(QLabel("Low:", weights_row))
+        weights_l.addWidget(self.cloud_low_spin)
+        weights_l.addWidget(QLabel("Mid:", weights_row))
+        weights_l.addWidget(self.cloud_mid_spin)
+        weights_l.addWidget(QLabel("High:", weights_row))
+        weights_l.addWidget(self.cloud_high_spin)
+        month_lbl = QLabel("Month:", weights_row)
+        month_lbl.setObjectName("SectionHint")
+        weights_l.addWidget(month_lbl)
+        self.cloud_month_combo = QComboBox(weights_row)
+        for key, label in self._MONTH_CHOICES:
+            self.cloud_month_combo.addItem(label, key)
+        self.cloud_month_combo.setMinimumWidth(118)
+        self.cloud_month_combo.setMaximumWidth(150)
+        weights_l.addWidget(self.cloud_month_combo, 0)
+        weights_l.addStretch(1)
+        top_l.addWidget(weights_row)
+
+        calc_row = QWidget(top)
+        calc_l = QHBoxLayout(calc_row)
+        calc_l.setContentsMargins(0, 0, 0, 0)
+        calc_l.setSpacing(8)
+        self.cloud_sunny_bar = QProgressBar(calc_row)
+        self.cloud_sunny_bar.setRange(0, 100)
+        self.cloud_sunny_bar.setTextVisible(True)
+        self.cloud_sunny_bar.setFormat("%p%% clear")
+        self.cloud_sunny_bar.setMinimumWidth(260)
+        self.cloud_sunny_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.cloud_result_label = QLabel("-", calc_row)
+        self.cloud_result_label.setWordWrap(False)
+        self.cloud_result_label.setObjectName("SectionHint")
+        self.cloud_result_label.setProperty("weather_chip", True)
+        self.cloud_result_label.setProperty("weather_chip_role", "solar")
+        calc_l.addWidget(self.cloud_sunny_bar, 1)
+        calc_l.addWidget(self.cloud_result_label, 0)
+        top_l.addWidget(calc_row)
+
+        page_l.addWidget(top)
+
+        cloud_host, self.cloud_map_image_label = self._create_weather_image_stack(
+            page,
+            kind="cloud_map",
+            title="Cloud Map",
+            min_height=320,
+        )
+        page_l.addWidget(cloud_host, 1)
+
+        self.cloud_map_info_label = QLabel("-", page)
+        self.cloud_map_info_label.setWordWrap(False)
+        self.cloud_map_info_label.setObjectName("SectionHint")
+        page_l.addWidget(self.cloud_map_info_label)
+
+        self._append_links(page_l, entries, max_cols=4, min_button_w=88, max_button_w=138)
+        self.cloud_month_combo.currentIndexChanged.connect(self._on_cloud_month_changed)
+        self._recompute_cloud_cover()
+        return page
+
+    def _build_meteogram_tab(self, entries: list[tuple[str, str, str]]) -> QWidget:
+        page = QWidget(self.tabs)
+        page_l = QVBoxLayout(page)
+        page_l.setContentsMargins(10, 10, 10, 10)
+        page_l.setSpacing(6)
+
+        row = QWidget(page)
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(0, 0, 0, 0)
+        row_l.setSpacing(8)
+        lbl = QLabel("Meteogram source:", row)
+        lbl.setObjectName("SectionHint")
+        row_l.addWidget(lbl, 0)
+        self.meteogram_source_combo = QComboBox(row)
+        self.meteogram_source_combo.setMinimumWidth(240)
+        self.meteogram_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for key, label in self._CONDITION_SOURCE_CHOICES:
+            if key == "average":
+                continue
+            self.meteogram_source_combo.addItem(label, key)
+        row_l.addWidget(self.meteogram_source_combo, 1)
+        row_l.addSpacing(8)
+        self._append_links_inline(row_l, entries, min_button_w=82, max_button_w=128, add_open_all=True)
+        row_l.addStretch(1)
+        page_l.addWidget(row)
+
+        if _HAS_QTWEBENGINE and _HAS_PLOTLY and QWebEngineView is not None:
+            host, web_view = self._create_weather_plot_stack(
+                page,
+                kind="meteogram",
+                title="Meteogram",
+                min_height=320,
+            )
+            self.meteogram_web = web_view
+            page_l.addWidget(host, 1)
+        else:
+            self.meteogram_web = None
+            self.meteogram_image_label = QLabel("", page)
+            self.meteogram_canvas = None
+            if _HAS_MPL_CANVAS and FigureCanvas is not None:
+                self.meteogram_figure = Figure(figsize=(9.0, 4.0), dpi=120)
+                self.meteogram_canvas = FigureCanvas(self.meteogram_figure)
+                self.meteogram_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.meteogram_canvas.setMinimumHeight(320)
+                page_l.addWidget(self.meteogram_canvas, 1)
+            else:
+                self.meteogram_image_label.setAlignment(Qt.AlignCenter)
+                self.meteogram_image_label.setWordWrap(True)
+                self.meteogram_image_label.setMinimumHeight(320)
+                self.meteogram_image_label.setObjectName("CutoutImage")
+                self.meteogram_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.meteogram_image_label.setText("No meteogram data loaded yet.")
+                page_l.addWidget(self.meteogram_image_label, 1)
+
+        self.meteogram_source_combo.currentIndexChanged.connect(self._update_live_views)
+        return page
+
+    def _build_satellite_tab(self, entries: list[tuple[str, str, str]]) -> QWidget:
+        page = QWidget(self.tabs)
+        page_l = QVBoxLayout(page)
+        page_l.setContentsMargins(10, 10, 10, 10)
+        page_l.setSpacing(8)
+
+        sat_host, self.satellite_image_label = self._create_weather_image_stack(
+            page,
+            kind="satellite",
+            title="Satellite",
+            min_height=340,
+        )
+        page_l.addWidget(sat_host, 1)
+
+        self._append_links(page_l, entries, max_cols=4, min_button_w=88, max_button_w=138)
+        return page
+
+    @Slot()
+    def _recompute_cloud_cover(self) -> None:
+        if not hasattr(self, "cloud_low_spin"):
+            return
+        low = float(self.cloud_low_spin.value())
+        mid = float(self.cloud_mid_spin.value())
+        high = float(self.cloud_high_spin.value())
+        effective_cloud = max(0.0, min(100.0, 0.65 * low + 0.25 * mid + 0.10 * high))
+        clear_rate = max(0.0, min(100.0, 100.0 - effective_cloud))
+        self.cloud_sunny_bar.setValue(int(round(clear_rate)))
+        if clear_rate >= 80.0:
+            rating = "excellent"
+        elif clear_rate >= 60.0:
+            rating = "good"
+        elif clear_rate >= 40.0:
+            rating = "fair"
+        else:
+            rating = "poor"
+        self.cloud_result_label.setText(
+            f"{clear_rate:.1f}% clear · {rating} · cloud {effective_cloud:.1f}%"
+        )
+
+    @Slot(str, int, int)
+    def _on_live_progress(self, status: str, step: int, total: int) -> None:
+        current = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+        in_cloud_tab = current is self.tabs.widget(2) if hasattr(self, "tabs") and self.tabs.count() >= 3 else False
+        in_sat_tab = current is self.tabs.widget(3) if hasattr(self, "tabs") and self.tabs.count() >= 4 else False
+        status_text = status or "Loading live data..."
+        if ("monthly cloud map" in status_text.lower()) and not in_cloud_tab:
+            status_text = "Refreshing weather providers..."
+        if ("satellite preview" in status_text.lower()) and not in_sat_tab:
+            status_text = "Refreshing weather providers..."
+        self.live_status_label.setText(self._compact_live_status(status_text))
+        self.live_status_label.setToolTip(status_text)
+        if total > 0:
+            self.live_progress.setRange(0, int(total))
+            self.live_progress.setValue(max(0, min(int(total), int(step))))
+        else:
+            self.live_progress.setRange(0, 0)
+        if self.live_progress.isHidden():
+            self.live_progress.show()
+
+    @Slot(dict)
+    def _on_live_partial(self, payload: dict) -> None:
+        if isinstance(payload, dict):
+            self._live_payload = self._merged_live_payload(payload)
+            self._update_live_views()
+
+    @Slot(dict)
+    def _on_live_completed(self, payload: dict) -> None:
+        self._live_payload = self._merged_live_payload(payload if isinstance(payload, dict) else {})
+        self._last_live_fetch_perf = perf_counter()
+        self.live_progress.hide()
+        self._update_live_views()
+
+    def _merged_live_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            return {}
+        prev = self._live_payload if isinstance(self._live_payload, dict) else {}
+        if not prev:
+            return payload
+        merged = dict(prev)
+        merged.update(payload)
+
+        new_cloud_map = payload.get("cloud_map")
+        if new_cloud_map is None and isinstance(prev.get("cloud_map"), dict):
+            merged["cloud_map"] = prev.get("cloud_map")
+        new_sat = payload.get("satellite")
+        if new_sat is None and isinstance(prev.get("satellite"), dict):
+            merged["satellite"] = prev.get("satellite")
+        return merged
+
+    @Slot(int)
+    def _on_tab_changed(self, _index: int) -> None:
+        current = self.tabs.currentWidget()
+        is_conditions_tab = bool(current is getattr(self, "conditions_tab_widget", None))
+        if is_conditions_tab:
+            if hasattr(self, "conditions_polling_label"):
+                interval_s = int(max(30.0, self._weather_auto_refresh_s))
+                self.conditions_polling_label.setText(f"Poll {interval_s}s")
+                self.conditions_polling_label.setToolTip(f"Polling every {interval_s} s")
+            self._conditions_poll_timer.start(int(max(30.0, self._weather_auto_refresh_s) * 1000))
+            self._start_live_refresh(force=False, include_cloud_map=False, include_satellite=False)
+            return
+
+        self._conditions_poll_timer.stop()
+        if hasattr(self, "conditions_polling_label"):
+            self.conditions_polling_label.setText("Poll off")
+            self.conditions_polling_label.setToolTip("Polling off")
+
+        is_cloud_tab = bool(hasattr(self, "tabs") and self.tabs.count() >= 3 and current is self.tabs.widget(2))
+        if is_cloud_tab and not self._has_cloud_map_for_current_context():
+            self._start_live_refresh(force=False, include_cloud_map=True, include_satellite=False)
+            return
+
+        is_satellite_tab = bool(hasattr(self, "tabs") and self.tabs.count() >= 4 and current is self.tabs.widget(3))
+        if is_satellite_tab and not self._has_satellite_for_current_site():
+            self._start_live_refresh(force=False, include_cloud_map=False, include_satellite=True)
+            return
+
+    @Slot()
+    def _on_conditions_poll_timeout(self) -> None:
+        if not self.isVisible():
+            return
+        current = self.tabs.currentWidget()
+        if current is not getattr(self, "conditions_tab_widget", None):
+            return
+        if isinstance(self._live_worker, WeatherLiveWorker) and self._live_worker.isRunning():
+            return
+        self._start_live_refresh(force=False, include_cloud_map=False, include_satellite=False)
+
+    def _stop_live_worker(self) -> None:
+        worker = self._live_worker
+        self._live_worker = None
+        if not isinstance(worker, WeatherLiveWorker):
+            return
+        if worker.isRunning():
+            worker.requestInterruption()
+            if not worker.wait(1200):
+                worker.terminate()
+                worker.wait(300)
+
+    def _live_context_key(self) -> str:
+        lat, lon, elev = self._site_coordinates()
+        return "|".join(
+            (
+                f"{lat:.4f}",
+                f"{lon:.4f}",
+                f"{elev:.0f}",
+                self._date.toString("yyyy-MM-dd"),
+                f"{self._sun_alt_limit:.0f}",
+                self._weather_custom_url.strip(),
+                str(self._selected_cloud_month()),
+                self._weather_cloud_source,
+            )
+        )
+
+    def _start_live_refresh(
+        self,
+        *,
+        force: bool,
+        include_cloud_map: Optional[bool] = None,
+        include_satellite: Optional[bool] = None,
+    ) -> None:
+        lat, lon, elev = self._site_coordinates()
+        key = self._live_context_key()
+        if include_cloud_map is None:
+            current = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+            include_cloud_map = bool(
+                current is self.tabs.widget(2) if hasattr(self, "tabs") and self.tabs.count() >= 3 else False
+            )
+            if include_cloud_map and self._has_cloud_map_for_current_context() and not force:
+                include_cloud_map = False
+        if include_satellite is None:
+            current = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+            include_satellite = bool(
+                current is self.tabs.widget(3) if hasattr(self, "tabs") and self.tabs.count() >= 4 else False
+            )
+            if include_satellite and self._has_satellite_for_current_site() and not force:
+                include_satellite = False
+        needs_cloud_fetch = bool(include_cloud_map) and not self._has_cloud_map_for_current_context()
+        needs_sat_fetch = bool(include_satellite) and not self._has_satellite_for_current_site()
+        now_perf = perf_counter()
+        if not force and key == self._last_live_context_key and self._live_payload:
+            if (
+                now_perf - float(self._last_live_fetch_perf) < float(self._weather_auto_refresh_s)
+                and not needs_cloud_fetch
+                and not needs_sat_fetch
+            ):
+                return
+        self._last_live_context_key = key
+        self._stop_live_worker()
+        self.live_progress.setRange(0, 0)
+        self.live_progress.show()
+        self.live_status_label.setText("Loading sources…")
+        self.live_status_label.setToolTip("Loading live weather providers...")
+        if bool(include_cloud_map):
+            self._set_weather_image_loading("cloud_map", "Loading cloud climatology…", visible=True)
+        if bool(include_satellite):
+            self._set_weather_image_loading("satellite", "Loading satellite preview…", visible=True)
+        worker = WeatherLiveWorker(
+            lat=lat,
+            lon=lon,
+            elev=elev,
+            custom_conditions_url=self._weather_custom_url,
+            cloud_map_source=self._weather_cloud_source,
+            cloud_map_month=self._selected_cloud_month(),
+            force_refresh=force,
+            include_cloud_map=bool(include_cloud_map),
+            include_satellite=bool(include_satellite),
+            parent=self,
+        )
+        worker.progress.connect(self._on_live_progress)
+        worker.partial.connect(self._on_live_partial)
+        worker.completed.connect(self._on_live_completed)
+        worker.finished.connect(lambda: self.live_progress.hide())
+        self._live_worker = worker
+        worker.start()
+
+    @staticmethod
+    def _fallback_plot_bytes(
+        series: dict[str, object],
+        title: str,
+        *,
+        max_points: int = 72,
+        dark: bool = True,
+        theme_tokens: Optional[dict[str, str]] = None,
+    ) -> bytes:
+        ts_raw = series.get("timestamps")
+        ts = [int(v) for v in ts_raw if isinstance(v, (int, float))] if isinstance(ts_raw, list) else []
+        temp = [float(v) for v in series.get("temp_c", []) if isinstance(v, (int, float))]
+        wind = [float(v) for v in series.get("wind_ms", []) if isinstance(v, (int, float))]
+        cloud = [float(v) for v in series.get("cloud_pct", []) if isinstance(v, (int, float))]
+        rh = [float(v) for v in series.get("rh_pct", []) if isinstance(v, (int, float))]
+        pressure = [float(v) for v in series.get("pressure_hpa", []) if isinstance(v, (int, float))]
+        n = max(len(temp), len(wind), len(cloud), len(rh), len(pressure))
+        if n <= 1:
+            return b""
+        n = min(int(max_points), n)
+        if ts and len(ts) >= n:
+            x_axis = [datetime.fromtimestamp(int(v), tz=timezone.utc).astimezone() for v in ts[-n:]]
+        else:
+            base = datetime.now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=n - 1)
+            x_axis = [base + timedelta(hours=i) for i in range(n)]
+        use_tokens = theme_tokens or resolve_theme_tokens(DEFAULT_UI_THEME, dark_enabled=dark)
+        plot_bg = str(use_tokens.get("plot_bg", "#121b29"))
+        plot_panel_bg = str(use_tokens.get("plot_panel_bg", plot_bg))
+        plot_text = str(use_tokens.get("plot_text", "#d7e4f0" if dark else "#253347"))
+        plot_grid = str(use_tokens.get("plot_grid", "#2f4666" if dark else "#d6deea"))
+        soft_grid_css = _softened_plot_grid_css_from_tokens(use_tokens, alpha=0.42)
+        plot_font = _plot_font_css_stack(use_tokens)
+
+        fig = Figure(figsize=(9.0, 4.4), dpi=120)
+        fig.patch.set_facecolor(plot_bg)
+        axes = fig.subplots(
+            3,
+            1,
+            sharex=True,
+            gridspec_kw={"height_ratios": [0.44, 0.33, 0.23], "hspace": 0.12},
+        )
+        ax_temp = axes[0]
+        ax_cloud = axes[1]
+        ax_press = axes[2]
+        for axis in (ax_temp, ax_cloud, ax_press):
+            axis.set_facecolor(plot_panel_bg)
+        handles: list[Any] = []
+        labels: list[str] = []
+
+        def add_line(axis, values: list[float], name: str, color: str, style: str = "-") -> None:
+            if len(values) < n:
+                return
+            (line,) = axis.plot(x_axis, values[-n:], color=color, linewidth=1.8, linestyle=style, label=name)
+            handles.append(line)
+            labels.append(name)
+
+        add_line(ax_temp, temp, "Temp (°C)", str(use_tokens.get("plot_series_temp", "#f08a24")))
+        add_line(ax_temp, wind, "Wind (m/s)", str(use_tokens.get("plot_series_wind", "#4aa7ff")))
+        add_line(ax_cloud, cloud, "Cloud (%)", str(use_tokens.get("plot_series_cloud", "#5cd2ff")))
+        add_line(ax_cloud, rh, "Humidity (%)", str(use_tokens.get("plot_series_humidity", "#86d37f")), "--")
+        add_line(ax_press, pressure, "Pressure (hPa)", str(use_tokens.get("plot_series_pressure", "#b29bff")), "-.")
+
+        ax_temp.set_title(title, color=plot_text)
+        ax_temp.set_ylabel("Temp / Wind", color=plot_text)
+        ax_cloud.set_ylabel("Cloud / RH", color=plot_text)
+        ax_press.set_ylabel("Pressure (hPa)", color=plot_text)
+        ax_press.set_xlabel("Time (local)", color=plot_text)
+        for axis in (ax_temp, ax_cloud, ax_press):
+            axis.tick_params(axis="x", colors=plot_text)
+            axis.tick_params(axis="y", colors=plot_text)
+            axis.grid(True, alpha=0.28, linestyle="--", linewidth=0.7, color=plot_grid)
+            for spine in axis.spines.values():
+                spine.set_color(plot_grid)
+            axis.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+        fig.autofmt_xdate(rotation=20)
+        if handles:
+            fig.legend(
+                handles,
+                labels,
+                loc="lower center",
+                ncol=min(5, len(handles)),
+                frameon=False,
+                bbox_to_anchor=(0.5, -0.02),
+                labelcolor=plot_text,
+            )
+        out = io.BytesIO()
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        fig.savefig(out, format="png")
+        return out.getvalue()
+
+    @staticmethod
+    def _build_plotly_html(
+        series: dict[str, object],
+        title: str,
+        *,
+        max_points: int = 96,
+        dark: bool = True,
+        theme_tokens: Optional[dict[str, str]] = None,
+        show_legend: bool = False,
+    ) -> Optional[str]:
+        if not (_HAS_PLOTLY and plotly_to_html is not None and plotly_make_subplots is not None and go is not None):
+            return None
+        ts_raw = series.get("timestamps")
+        ts = [int(v) for v in ts_raw if isinstance(v, (int, float))] if isinstance(ts_raw, list) else []
+        temp = [float(v) for v in series.get("temp_c", []) if isinstance(v, (int, float))]
+        wind = [float(v) for v in series.get("wind_ms", []) if isinstance(v, (int, float))]
+        cloud = [float(v) for v in series.get("cloud_pct", []) if isinstance(v, (int, float))]
+        rh = [float(v) for v in series.get("rh_pct", []) if isinstance(v, (int, float))]
+        pressure = [float(v) for v in series.get("pressure_hpa", []) if isinstance(v, (int, float))]
+        n = max(len(temp), len(wind), len(cloud), len(rh), len(pressure))
+        if n <= 1:
+            return None
+        n = min(int(max_points), n)
+        if ts and len(ts) >= n:
+            x = [datetime.fromtimestamp(int(v), tz=timezone.utc).astimezone() for v in ts[-n:]]
+        else:
+            base = datetime.now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=n - 1)
+            x = [base + timedelta(hours=i) for i in range(n)]
+        use_tokens = theme_tokens or resolve_theme_tokens(DEFAULT_UI_THEME, dark_enabled=dark)
+        plot_bg = str(use_tokens.get("plot_bg", "#121b29"))
+        plot_panel_bg = str(use_tokens.get("plot_panel_bg", plot_bg))
+        plot_text = str(use_tokens.get("plot_text", "#d7e4f0" if dark else "#253347"))
+        plot_grid = str(use_tokens.get("plot_grid", "#2f4666" if dark else "#d6deea"))
+        soft_grid_css = _softened_plot_grid_css_from_tokens(use_tokens, alpha=0.42)
+        plot_font = _plot_font_css_stack(use_tokens)
+
+        fig = plotly_make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.06,
+            row_heights=[0.44, 0.33, 0.23],
+            specs=[
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+                [{"secondary_y": False}],
+            ],
+        )
+
+        def add(values: list[float], name: str, color: str, *, row: int, dash: str = "solid") -> None:
+            if len(values) < n:
+                return
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=values[-n:],
+                    mode="lines",
+                    name=name,
+                    line={"color": color, "width": 2, "dash": dash},
+                ),
+                row=row,
+                col=1,
+            )
+
+        add(temp, "Temp (°C)", str(use_tokens.get("plot_series_temp", "#f08a24")), row=1)
+        add(wind, "Wind (m/s)", str(use_tokens.get("plot_series_wind", "#4aa7ff")), row=1)
+        add(cloud, "Cloud (%)", str(use_tokens.get("plot_series_cloud", "#00d0ff")), row=2)
+        add(rh, "Humidity (%)", str(use_tokens.get("plot_series_humidity", "#76dc7a")), row=2, dash="dash")
+        add(pressure, "Pressure (hPa)", str(use_tokens.get("plot_series_pressure", "#b29bff")), row=3, dash="dot")
+
+        fig.update_layout(
+            template="plotly_dark" if dark else "plotly_white",
+            title=title,
+            margin={"l": 46, "r": 14, "t": 36, "b": 34 if not show_legend else 64},
+            showlegend=bool(show_legend),
+            legend={"orientation": "h", "y": -0.22, "x": 0.5, "xanchor": "center"},
+            hovermode="x unified",
+            paper_bgcolor=plot_bg,
+            plot_bgcolor=plot_panel_bg,
+            font={"color": plot_text, "family": plot_font},
+        )
+        fig.update_xaxes(showgrid=True, gridcolor=soft_grid_css, zerolinecolor=soft_grid_css, color=plot_text, row=1, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor=soft_grid_css, zerolinecolor=soft_grid_css, color=plot_text, row=2, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor=soft_grid_css, zerolinecolor=soft_grid_css, color=plot_text, row=3, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor=soft_grid_css, zerolinecolor=soft_grid_css, color=plot_text, row=1, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor=soft_grid_css, zerolinecolor=soft_grid_css, color=plot_text, row=2, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor=soft_grid_css, zerolinecolor=soft_grid_css, color=plot_text, row=3, col=1)
+        fig.update_xaxes(title_text="Time (local)", row=3, col=1)
+        fig.update_yaxes(title_text="Temp / Wind", row=1, col=1)
+        fig.update_yaxes(title_text="Cloud / RH", row=2, col=1)
+        fig.update_yaxes(title_text="Pressure (hPa)", row=3, col=1)
+        html_fragment = plotly_to_html(
+            fig,
+            include_plotlyjs=False,
+            full_html=False,
+            config={"displaylogo": False, "responsive": True, "scrollZoom": True},
+        )
+        html_fragment = html_fragment.replace("<div>", "<div id='plot-host' style='width:100%;height:100%;min-height:100%;'>", 1)
+        graph_id_match = re.search(r'<div id="([^"]+)" class="plotly-graph-div"', html_fragment)
+        graph_id = graph_id_match.group(1) if graph_id_match else ""
+        resize_script = ""
+        if graph_id:
+            resize_script = (
+                "<script>"
+                "(function(){"
+                f"const gd=document.getElementById('{graph_id}');"
+                "if(!gd||!window.Plotly){return;}"
+                "const resize=()=>{"
+                "gd.style.width='100%';"
+                "gd.style.height='100%';"
+                "if(window.Plotly&&Plotly.Plots){Plotly.Plots.resize(gd);}"
+                "};"
+                "window.addEventListener('resize', resize);"
+                "if(window.ResizeObserver){new ResizeObserver(resize).observe(document.body);}"
+                "setTimeout(resize,0);"
+                "setTimeout(resize,120);"
+                "})();"
+                "</script>"
+            )
+        font_face_css = _embedded_display_font_css()
+        html_head = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<style>"
+            f"{font_face_css}"
+            f"html,body,#plot-host{{margin:0;width:100%;height:100%;overflow:hidden;background:{plot_bg};}}"
+            f"html,body,#plot-host,.plotly-graph-div{{font-family:{plot_font};}}"
+            ".plotly-graph-div{width:100%!important;height:100%!important;}"
+            "</style>"
+        )
+        if _PLOTLY_JS_BASE_DIR:
+            return (
+                f"{html_head}<script src='plotly.min.js'></script></head><body>"
+                f"{html_fragment}{resize_script}</body></html>"
+            )
+        return (
+            f"{html_head}<script src='https://cdn.plot.ly/plotly-3.4.0.min.js'></script></head><body>"
+            f"{html_fragment}{resize_script}</body></html>"
+        )
+
+    @staticmethod
+    def _render_series_on_canvas(
+        figure: Figure,
+        canvas: "FigureCanvas",
+        series: dict[str, object],
+        *,
+        title: str,
+        max_points: int,
+        dark: bool,
+        theme_tokens: Optional[dict[str, str]] = None,
+        show_legend: bool = False,
+    ) -> bool:
+        ts_raw = series.get("timestamps")
+        ts = [int(v) for v in ts_raw if isinstance(v, (int, float))] if isinstance(ts_raw, list) else []
+        temp = [float(v) for v in series.get("temp_c", []) if isinstance(v, (int, float))]
+        wind = [float(v) for v in series.get("wind_ms", []) if isinstance(v, (int, float))]
+        cloud = [float(v) for v in series.get("cloud_pct", []) if isinstance(v, (int, float))]
+        rh = [float(v) for v in series.get("rh_pct", []) if isinstance(v, (int, float))]
+        pressure = [float(v) for v in series.get("pressure_hpa", []) if isinstance(v, (int, float))]
+
+        n = max(len(temp), len(wind), len(cloud), len(rh), len(pressure))
+        if n <= 1:
+            figure.clear()
+            ax = figure.add_subplot(111)
+            ax.set_axis_off()
+            use_tokens = theme_tokens or resolve_theme_tokens(DEFAULT_UI_THEME, dark_enabled=dark)
+            ax.text(
+                0.5,
+                0.5,
+                "No series data.",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color=str(use_tokens.get("plot_text", "#d9e2f0" if dark else "#2e3c4f")),
+            )
+            canvas.draw_idle()
+            return False
+        n = min(max_points, n)
+        if ts and len(ts) >= n:
+            x_axis = [datetime.fromtimestamp(int(v), tz=timezone.utc).astimezone() for v in ts[-n:]]
+        else:
+            base = datetime.now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=n - 1)
+            x_axis = [base + timedelta(hours=i) for i in range(n)]
+        use_tokens = theme_tokens or resolve_theme_tokens(DEFAULT_UI_THEME, dark_enabled=dark)
+        plot_bg = str(use_tokens.get("plot_bg", "#0f1825" if dark else "#f7f9fc"))
+        plot_panel_bg = str(use_tokens.get("plot_panel_bg", "#162334" if dark else "#ffffff"))
+        plot_grid = str(use_tokens.get("plot_grid", "#2f4666" if dark else "#d6deea"))
+        plot_text = str(use_tokens.get("plot_text", "#d9e2f0" if dark else "#253347"))
+        soft_grid_rgba = _softened_plot_grid_rgba_from_tokens(use_tokens, alpha=0.42)
+        soft_grid_css = _softened_plot_grid_qcolor_from_tokens(use_tokens).name()
+
+        figure.clear()
+        figure.patch.set_facecolor(plot_bg)
+        axes = figure.subplots(
+            3,
+            1,
+            sharex=True,
+            gridspec_kw={"height_ratios": [0.44, 0.33, 0.23], "hspace": 0.10},
+        )
+        ax_temp = axes[0]
+        ax_cloud = axes[1]
+        ax_press = axes[2]
+        ax_temp.set_facecolor(plot_panel_bg)
+        ax_cloud.set_facecolor(plot_panel_bg)
+        ax_press.set_facecolor(plot_panel_bg)
+
+        handles: list[Any] = []
+        labels: list[str] = []
+
+        def _plot(axis, values: list[float], name: str, color: str, style: str = "-") -> None:
+            if len(values) < n:
+                return
+            (line,) = axis.plot(x_axis, values[-n:], color=color, linewidth=1.9, linestyle=style, label=name)
+            handles.append(line)
+            labels.append(name)
+
+        _plot(ax_temp, temp, "Temp (°C)", str(use_tokens.get("plot_series_temp", "#f08a24")))
+        _plot(ax_temp, wind, "Wind (m/s)", str(use_tokens.get("plot_series_wind", "#4aa7ff")))
+        _plot(ax_cloud, cloud, "Cloud (%)", str(use_tokens.get("plot_series_cloud", "#00d0ff")))
+        _plot(ax_cloud, rh, "Humidity (%)", str(use_tokens.get("plot_series_humidity", "#76dc7a")), "--")
+        _plot(ax_press, pressure, "Pressure (hPa)", str(use_tokens.get("plot_series_pressure", "#b29bff")), "-.")
+
+        ax_temp.set_title(title, color=plot_text, fontsize=11, pad=6)
+        ax_temp.set_ylabel("Temp / Wind", color=plot_text)
+        ax_cloud.set_ylabel("Cloud / RH", color=plot_text)
+        ax_press.set_ylabel("Pressure (hPa)", color=plot_text)
+        ax_press.set_xlabel("Time (local)", color=plot_text)
+        for axis in (ax_temp, ax_cloud, ax_press):
+            axis.tick_params(axis="x", colors=plot_text)
+            axis.tick_params(axis="y", colors=plot_text)
+            axis.grid(True, linestyle="--", linewidth=0.7, color=soft_grid_rgba)
+            axis.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+        for spine in ax_temp.spines.values():
+            spine.set_color(soft_grid_css)
+        for spine in ax_cloud.spines.values():
+            spine.set_color(soft_grid_css)
+        for spine in ax_press.spines.values():
+            spine.set_color(soft_grid_css)
+
+        if handles and show_legend:
+            figure.legend(
+                handles,
+                labels,
+                loc="lower center",
+                ncol=min(5, len(handles)),
+                frameon=False,
+                bbox_to_anchor=(0.5, 0.01),
+                labelcolor=plot_text,
+            )
+        figure.subplots_adjust(left=0.06, right=0.992, top=0.94, bottom=0.11 if not show_legend else 0.15, hspace=0.10)
+        canvas.draw_idle()
+        return True
+
+    def _rescale_preview_pixmaps(self) -> None:
+        if hasattr(self, "conditions_trend_image_label") and not self._conditions_raw_pixmap.isNull():
+            size = self.conditions_trend_image_label.size()
+            if size.width() > 2 and size.height() > 2:
+                self.conditions_trend_image_label.setPixmap(
+                    self._conditions_raw_pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+        if hasattr(self, "meteogram_image_label") and not self._meteogram_raw_pixmap.isNull():
+            size = self.meteogram_image_label.size()
+            if size.width() > 2 and size.height() > 2:
+                self.meteogram_image_label.setPixmap(
+                    self._meteogram_raw_pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+        if hasattr(self, "cloud_map_image_label") and not self._cloud_map_raw_pixmap.isNull():
+            size = self.cloud_map_image_label.size()
+            if size.width() > 2 and size.height() > 2:
+                self.cloud_map_image_label.setPixmap(
+                    self._cloud_map_raw_pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+        if hasattr(self, "satellite_image_label") and not self._satellite_raw_pixmap.isNull():
+            size = self.satellite_image_label.size()
+            if size.width() > 2 and size.height() > 2:
+                self.satellite_image_label.setPixmap(
+                    self._satellite_raw_pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+
+    def _series_for_source(self, source_key: str, series_map: dict[str, dict[str, object]]) -> Optional[dict[str, object]]:
+        row = series_map.get(source_key)
+        if isinstance(row, dict):
+            return row
+        fallback = series_map.get("open_meteo")
+        if isinstance(fallback, dict):
+            return fallback
+        for key in ("metar", "custom", "meteoblue", "windy", "meteo_icm"):
+            value = series_map.get(key)
+            if isinstance(value, dict):
+                return value
+        return None
+
+    def _set_plot_html(self, web_view: Optional["QWebEngineView"], html: str) -> None:
+        if web_view is None or not html:
+            return
+        kind = str(web_view.property("weather_plot_kind") or "").strip().lower()
+        if kind:
+            self._set_weather_plot_loading(kind, "Rendering interactive chart…", visible=True)
+        if _PLOTLY_JS_BASE_DIR:
+            web_view.setHtml(html, QUrl.fromLocalFile(str(_PLOTLY_JS_BASE_DIR) + "/"))
+            return
+        web_view.setHtml(html)
+
+    @staticmethod
+    def _series_has_points(series: object, *, min_points: int = 2) -> bool:
+        if not isinstance(series, dict):
+            return False
+        for key in ("temp_c", "wind_ms", "cloud_pct", "rh_pct", "pressure_hpa"):
+            values = series.get(key)
+            if isinstance(values, list) and len(values) >= int(min_points):
+                return True
+        return False
+
+    def _series_for_forecast_source(
+        self, preferred_key: str, series_map: dict[str, dict[str, object]]
+    ) -> tuple[Optional[str], Optional[dict[str, object]]]:
+        preferred = series_map.get(preferred_key)
+        if self._series_has_points(preferred):
+            return preferred_key, preferred
+        for key in ("open_meteo", "meteoblue", "windy", "meteo_icm"):
+            candidate = series_map.get(key)
+            if self._series_has_points(candidate):
+                return key, candidate
+        return None, None
+
+    def _has_cloud_map_for_current_context(self) -> bool:
+        payload = self._live_payload if isinstance(self._live_payload, dict) else {}
+        cloud_map = payload.get("cloud_map")
+        if not isinstance(cloud_map, dict):
+            return False
+        data = cloud_map.get("image_bytes")
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return False
+        month_match = int(_safe_int(cloud_map.get("month")) or self._selected_cloud_month()) == self._selected_cloud_month()
+        source_match = str(cloud_map.get("source") or "").strip().lower() == str(self._weather_cloud_source or "").strip().lower()
+        return bool(month_match and source_match)
+
+    def _has_satellite_for_current_site(self) -> bool:
+        payload = self._live_payload if isinstance(self._live_payload, dict) else {}
+        sat = payload.get("satellite")
+        if not isinstance(sat, dict):
+            return False
+        data = sat.get("image_bytes")
+        return bool(isinstance(data, (bytes, bytearray)) and data)
+
+    def _update_live_views(self) -> None:
+        payload = self._live_payload if isinstance(self._live_payload, dict) else {}
+        providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
+        series_map = payload.get("series") if isinstance(payload.get("series"), dict) else {}
+        averages = payload.get("averages") if isinstance(payload.get("averages"), dict) else {}
+        sections = payload.get("sections") if isinstance(payload.get("sections"), dict) else {}
+        errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
+
+        source_key = str(self.live_source_combo.currentData() or "average")
+        current_row: dict[str, object] = {}
+        if source_key == "average":
+            current_row = {
+                "temp_c": _safe_float((averages.get("temp_c") or {}).get("value")) if isinstance(averages.get("temp_c"), dict) else None,
+                "wind_ms": _safe_float((averages.get("wind_ms") or {}).get("value")) if isinstance(averages.get("wind_ms"), dict) else None,
+                "cloud_pct": _safe_float((averages.get("cloud_pct") or {}).get("value")) if isinstance(averages.get("cloud_pct"), dict) else None,
+                "rh_pct": _safe_float((averages.get("rh_pct") or {}).get("value")) if isinstance(averages.get("rh_pct"), dict) else None,
+                "pressure_hpa": _safe_float((averages.get("pressure_hpa") or {}).get("value")) if isinstance(averages.get("pressure_hpa"), dict) else None,
+                "note": "Average values from available conditions providers.",
+                "updated_utc": "-",
+            }
+        else:
+            row = providers.get(source_key)
+            if isinstance(row, dict):
+                current_row = row
+
+        self._set_weather_chip_label(self.live_temp_label, "T", self._fmt_value(_safe_float(current_row.get('temp_c')), '°C'))
+        self._set_weather_chip_label(self.live_wind_label, "W", self._fmt_value(_safe_float(current_row.get('wind_ms')), 'm/s'))
+        self._set_weather_chip_label(self.live_cloud_label, "C", self._fmt_value(_safe_float(current_row.get('cloud_pct')), '%'))
+        self._set_weather_chip_label(self.live_rh_label, "RH", self._fmt_value(_safe_float(current_row.get('rh_pct')), '%'))
+        self._set_weather_chip_label(
+            self.live_pressure_label,
+            "P",
+            self._fmt_value(_safe_float(current_row.get('pressure_hpa')), 'hPa'),
+        )
+
+        base_status = str(current_row.get("note") or "Live data: idle").strip()
+        if errors:
+            base_status = f"{base_status} | Partial errors: {len(errors)}"
+        full_status = base_status or "Live data: idle"
+        self.live_status_label.setText(self._compact_live_status(full_status))
+        self.live_status_label.setToolTip(full_status)
+
+        updated_txt = str(current_row.get("updated_utc") or "-").strip()
+        if hasattr(self, "conditions_updated_label"):
+            self.conditions_updated_label.setText(f"UTC {self._compact_weather_update(updated_txt)}")
+        forecast_rows: list[str] = []
+        conditions_ok = 0
+        conditions_err = 0
+        forecast_ok = 0
+        forecast_err = 0
+        for key in ("open_meteo", "meteo_icm", "meteoblue", "windy", "metar", "custom"):
+            row = providers.get(key)
+            if not isinstance(row, dict):
+                continue
+            categories = row.get("categories") if isinstance(row.get("categories"), list) else []
+            status = str(row.get("status") or "-").strip().lower()
+            note = self._short_provider_note(row.get("note"), 54)
+            label = str(row.get("label") or key)
+            if "forecast" in categories:
+                if status in {"ok", "partial"}:
+                    forecast_ok += 1
+                elif status == "error":
+                    forecast_err += 1
+                forecast_rows.append(f"{label}: {status}{f' ({note})' if note else ''}")
+            if "conditions" in categories:
+                if status in {"ok", "partial"}:
+                    conditions_ok += 1
+                elif status == "error":
+                    conditions_err += 1
+        if hasattr(self, "conditions_summary_label"):
+            cond_status = sections.get("conditions") if isinstance(sections.get("conditions"), dict) else {}
+            cond_msg = str(cond_status.get("message") or "").strip()
+            if cond_msg:
+                compact_msg = cond_msg.replace("Conditions providers", "").replace("providers", "").strip(" .:")
+                self.conditions_summary_label.setText(compact_msg or cond_msg)
+                self.conditions_summary_label.setToolTip(cond_msg)
+            else:
+                summary_text = f"ok {conditions_ok} · err {conditions_err}"
+                self.conditions_summary_label.setText(summary_text)
+                self.conditions_summary_label.setToolTip(summary_text)
+        if hasattr(self, "forecast_summary_label"):
+            forecast_status = sections.get("forecast") if isinstance(sections.get("forecast"), dict) else {}
+            forecast_msg = str(forecast_status.get("message") or "").strip()
+            if forecast_msg:
+                self.forecast_summary_label.setText(f"Forecast: {forecast_msg}")
+            else:
+                self.forecast_summary_label.setText(f"Forecast status: ok {forecast_ok}, errors {forecast_err}.")
+        if hasattr(self, "forecast_provider_details"):
+            details = " | ".join(forecast_rows[:3]) if forecast_rows else "-"
+            if len(forecast_rows) > 3:
+                details = f"{details} | … +{len(forecast_rows) - 3} more"
+            self.forecast_provider_details.setText(details)
+
+        if hasattr(self, "cloud_live_label"):
+            self.cloud_live_label.setText(
+                f"Live cloud {self._fmt_value(_safe_float(current_row.get('cloud_pct')), '%')}"
+            )
+        if hasattr(self, "cloud_annual_label"):
+            annual = _safe_float(payload.get("annual_cloud_pct"))
+            if annual is None:
+                self.cloud_annual_label.setText("Annual avg -")
+            else:
+                self.cloud_annual_label.setText(f"Annual avg {annual:.1f}%")
+
+        # Conditions trend chart
+        selected_series = self._series_for_source(source_key if source_key != "average" else "open_meteo", series_map)
+        parent = self.parent()
+        dark = bool(getattr(parent, "settings", None).value("general/darkMode", DEFAULT_DARK_MODE, type=bool)) if hasattr(parent, "settings") else DEFAULT_DARK_MODE
+
+        # Forecast chart
+        if hasattr(self, "forecast_source_combo"):
+            forecast_key = str(self.forecast_source_combo.currentData() or "open_meteo")
+            resolved_key, forecast_series = self._series_for_forecast_source(forecast_key, series_map)
+            if resolved_key and resolved_key != forecast_key:
+                idx = self.forecast_source_combo.findData(resolved_key)
+                if idx >= 0:
+                    blocker = QSignalBlocker(self.forecast_source_combo)
+                    self.forecast_source_combo.setCurrentIndex(idx)
+                    del blocker
+                    forecast_key = resolved_key
+            if self._series_has_points(forecast_series):
+                html = self._build_plotly_html(
+                    forecast_series,
+                    f"Forecast: {forecast_key}",
+                    max_points=72,
+                    dark=dark,
+                    theme_tokens=getattr(self, "_theme_tokens", None),
+                )
+                if html and hasattr(self, "forecast_web") and self.forecast_web is not None:
+                    self._set_plot_html(self.forecast_web, html)
+                elif hasattr(self, "forecast_canvas") and self.forecast_canvas is not None:
+                    self._render_series_on_canvas(
+                        self.forecast_figure,
+                        self.forecast_canvas,
+                        forecast_series,
+                        title=f"Forecast: {forecast_key}",
+                        max_points=72,
+                        dark=dark,
+                        theme_tokens=getattr(self, "_theme_tokens", None),
+                    )
+                elif hasattr(self, "forecast_image_label"):
+                    chart_bytes = self._fallback_plot_bytes(
+                        forecast_series,
+                        f"Forecast: {forecast_key}",
+                        max_points=72,
+                        dark=dark,
+                        theme_tokens=getattr(self, "_theme_tokens", None),
+                    )
+                    pix = QPixmap()
+                    if chart_bytes and pix.loadFromData(chart_bytes):
+                        self.forecast_image_label.setText("")
+                        self.forecast_image_label.setPixmap(
+                            pix.scaled(
+                                self.forecast_image_label.size(),
+                                Qt.KeepAspectRatio,
+                                Qt.SmoothTransformation,
+                            )
+                        )
+                    else:
+                        self.forecast_image_label.setPixmap(QPixmap())
+                        self.forecast_image_label.setText("Unable to render forecast chart.")
+            elif hasattr(self, "forecast_canvas") and self.forecast_canvas is not None:
+                self._render_series_on_canvas(
+                    self.forecast_figure,
+                    self.forecast_canvas,
+                    {},
+                    title="Forecast",
+                    max_points=72,
+                    dark=dark,
+                    theme_tokens=getattr(self, "_theme_tokens", None),
+                )
+            elif hasattr(self, "forecast_image_label"):
+                self.forecast_image_label.setPixmap(QPixmap())
+                self.forecast_image_label.setText("No forecast data available yet.")
+
+        if self._series_has_points(selected_series):
+            html = self._build_plotly_html(
+                selected_series,
+                f"Conditions trend: {source_key}",
+                max_points=12,
+                dark=dark,
+                theme_tokens=getattr(self, "_theme_tokens", None),
+                show_legend=True,
+            )
+            if html and hasattr(self, "conditions_trend_web") and self.conditions_trend_web is not None:
+                self._set_plot_html(self.conditions_trend_web, html)
+            elif hasattr(self, "conditions_trend_web") and self.conditions_trend_web is not None:
+                self._weather_plot_loaded["conditions"] = False
+                self._set_weather_plot_loading("conditions", "Unable to render interactive chart.", visible=True)
+            elif hasattr(self, "conditions_trend_canvas") and self.conditions_trend_canvas is not None:
+                self._render_series_on_canvas(
+                    self.conditions_trend_figure,
+                    self.conditions_trend_canvas,
+                    selected_series,
+                    title=f"Conditions trend: {source_key}",
+                    max_points=18,
+                    dark=dark,
+                    theme_tokens=getattr(self, "_theme_tokens", None),
+                    show_legend=True,
+                )
+            elif hasattr(self, "conditions_trend_image_label"):
+                chart_bytes = self._fallback_plot_bytes(
+                    selected_series,
+                    f"Conditions trend: {source_key}",
+                    max_points=12,
+                    dark=dark,
+                    theme_tokens=getattr(self, "_theme_tokens", None),
+                    show_legend=True,
+                )
+                pix = QPixmap()
+                if chart_bytes and pix.loadFromData(chart_bytes):
+                    self._conditions_raw_pixmap = pix
+                    self.conditions_trend_image_label.setText("")
+                    self._rescale_preview_pixmaps()
+                else:
+                    self._conditions_raw_pixmap = QPixmap()
+                    self.conditions_trend_image_label.setPixmap(QPixmap())
+                    self.conditions_trend_image_label.setText("Unable to render conditions trend.")
+        elif hasattr(self, "conditions_trend_canvas") and self.conditions_trend_canvas is not None:
+            self._render_series_on_canvas(
+                self.conditions_trend_figure,
+                self.conditions_trend_canvas,
+                {},
+                title="Conditions trend",
+                max_points=18,
+                dark=dark,
+                theme_tokens=getattr(self, "_theme_tokens", None),
+            )
+        elif hasattr(self, "conditions_trend_web") and self.conditions_trend_web is not None:
+            self._weather_plot_loaded["conditions"] = False
+            self._set_weather_plot_loading("conditions", "No conditions trend data for selected source.", visible=True)
+        elif hasattr(self, "conditions_trend_image_label"):
+            self._conditions_raw_pixmap = QPixmap()
+            self.conditions_trend_image_label.setPixmap(QPixmap())
+            self.conditions_trend_image_label.setText("No conditions trend data for selected source.")
+
+        # Meteogram chart
+        if hasattr(self, "meteogram_source_combo"):
+            meteo_key = str(self.meteogram_source_combo.currentData() or "open_meteo")
+            meteo_series = self._series_for_source(meteo_key, series_map)
+            if self._series_has_points(meteo_series):
+                html = self._build_plotly_html(
+                    meteo_series,
+                    f"Meteogram: {meteo_key}",
+                    max_points=96,
+                    dark=dark,
+                    theme_tokens=getattr(self, "_theme_tokens", None),
+                    show_legend=True,
+                )
+                if html and hasattr(self, "meteogram_web") and self.meteogram_web is not None:
+                    self._set_plot_html(self.meteogram_web, html)
+                elif hasattr(self, "meteogram_web") and self.meteogram_web is not None:
+                    self._weather_plot_loaded["meteogram"] = False
+                    self._set_weather_plot_loading("meteogram", "Unable to render interactive chart.", visible=True)
+                elif hasattr(self, "meteogram_canvas") and self.meteogram_canvas is not None:
+                    self._render_series_on_canvas(
+                        self.meteogram_figure,
+                        self.meteogram_canvas,
+                        meteo_series,
+                        title=f"Meteogram: {meteo_key}",
+                        max_points=96,
+                        dark=dark,
+                        theme_tokens=getattr(self, "_theme_tokens", None),
+                        show_legend=True,
+                    )
+                elif hasattr(self, "meteogram_image_label"):
+                    chart_bytes = self._fallback_plot_bytes(
+                        meteo_series,
+                        f"Meteogram: {meteo_key}",
+                        max_points=96,
+                        dark=dark,
+                        theme_tokens=getattr(self, "_theme_tokens", None),
+                        show_legend=True,
+                    )
+                    pix = QPixmap()
+                    if chart_bytes and pix.loadFromData(chart_bytes):
+                        self._meteogram_raw_pixmap = pix
+                        self.meteogram_image_label.setText("")
+                        self._rescale_preview_pixmaps()
+                    else:
+                        self._meteogram_raw_pixmap = QPixmap()
+                        self.meteogram_image_label.setPixmap(QPixmap())
+                        self.meteogram_image_label.setText("Unable to render meteogram.")
+            elif hasattr(self, "meteogram_canvas") and self.meteogram_canvas is not None:
+                self._render_series_on_canvas(
+                    self.meteogram_figure,
+                    self.meteogram_canvas,
+                    {},
+                    title="Meteogram",
+                    max_points=96,
+                    dark=dark,
+                )
+            elif hasattr(self, "meteogram_web") and self.meteogram_web is not None:
+                self._weather_plot_loaded["meteogram"] = False
+                self._set_weather_plot_loading("meteogram", "No meteogram data for selected source.", visible=True)
+            elif hasattr(self, "meteogram_image_label"):
+                self._meteogram_raw_pixmap = QPixmap()
+                self.meteogram_image_label.setPixmap(QPixmap())
+                self.meteogram_image_label.setText("No meteogram data for selected source.")
+
+        # Cloud map
+        if hasattr(self, "cloud_map_image_label"):
+            cloud_map_obj = payload.get("cloud_map")
+            if isinstance(cloud_map_obj, dict):
+                cm_bytes = cloud_map_obj.get("image_bytes")
+                cm_caption = str(cloud_map_obj.get("caption", "-")).strip()
+                cm_url = str(cloud_map_obj.get("url", "")).strip()
+                approx = _safe_float(cloud_map_obj.get("approx_cloud_pct"))
+                month_name = str(cloud_map_obj.get("month_name") or "").strip()
+                pix = QPixmap()
+                if isinstance(cm_bytes, (bytes, bytearray)) and cm_bytes and pix.loadFromData(bytes(cm_bytes)):
+                    self._cloud_map_raw_pixmap = pix
+                    self.cloud_map_image_label.setText("")
+                    self._set_weather_image_loading("cloud_map", "", visible=False)
+                    self._rescale_preview_pixmaps()
+                    info_parts: list[str] = []
+                    if month_name:
+                        info_parts.append(month_name)
+                    if approx is not None:
+                        info_parts.append(f"marker cloud {approx:.1f}%")
+                    if cm_url:
+                        info_parts.append("EarthEnv")
+                    info_text = " | ".join(info_parts) if info_parts else "Monthly cloud map loaded."
+                    self.cloud_map_info_label.setText(info_text)
+                    if hasattr(self, "cloud_map_source_label"):
+                        source_name = "EarthEnv" if cm_url else "Source -"
+                        self.cloud_map_source_label.setText(source_name)
+                elif cm_caption:
+                    self._set_weather_image_loading("cloud_map", "", visible=False)
+                    if self._cloud_map_raw_pixmap.isNull():
+                        self.cloud_map_image_label.setPixmap(QPixmap())
+                        self.cloud_map_image_label.setText("Monthly cloud map unavailable.")
+                    self.cloud_map_info_label.setText(cm_caption)
+                    if hasattr(self, "cloud_map_source_label"):
+                        self.cloud_map_source_label.setText("Source -")
+
+        # Satellite preview
+        if hasattr(self, "satellite_image_label"):
+            sat_obj = payload.get("satellite")
+            if isinstance(sat_obj, dict):
+                sat_bytes = sat_obj.get("image_bytes")
+                sat_caption = str(sat_obj.get("caption", "-")).strip()
+                sat_url = str(sat_obj.get("url", "")).strip()
+                pix = QPixmap()
+                if isinstance(sat_bytes, (bytes, bytearray)) and sat_bytes and pix.loadFromData(bytes(sat_bytes)):
+                    self._satellite_raw_pixmap = pix
+                    self.satellite_image_label.setText("")
+                    self._set_weather_image_loading("satellite", "", visible=False)
+                    self._rescale_preview_pixmaps()
+                    tip_parts = [part for part in (sat_caption, sat_url) if part]
+                    self.satellite_image_label.setToolTip("\n".join(tip_parts))
+                elif sat_caption:
+                    self._set_weather_image_loading("satellite", "", visible=False)
+                    if self._satellite_raw_pixmap.isNull():
+                        self.satellite_image_label.setPixmap(QPixmap())
+                        self.satellite_image_label.setText("Satellite preview unavailable.")
+                    self.satellite_image_label.setToolTip(sat_caption or "")
+
+    @Slot()
+    def _on_cloud_month_changed(self) -> None:
+        self._start_live_refresh(force=False, include_cloud_map=True, include_satellite=False)
+
+    @Slot(int)
+    def _on_conditions_source_combo_changed(self, _idx: int) -> None:
+        if not hasattr(self, "conditions_source_combo"):
+            return
+        selected = self.conditions_source_combo.currentData()
+        main_idx = self.live_source_combo.findData(selected)
+        if main_idx < 0 or self.live_source_combo.currentIndex() == main_idx:
+            return
+        blocker = QSignalBlocker(self.live_source_combo)
+        self.live_source_combo.setCurrentIndex(main_idx)
+        del blocker
+        self._update_live_views()
+
+    @Slot()
+    def _sync_conditions_source_combo(self) -> None:
+        if not hasattr(self, "conditions_source_combo"):
+            return
+        selected = self.live_source_combo.currentData()
+        idx = self.conditions_source_combo.findData(selected)
+        if idx < 0:
+            return
+        blocker = QSignalBlocker(self.conditions_source_combo)
+        self.conditions_source_combo.setCurrentIndex(idx)
+        del blocker
+
+    @staticmethod
+    def _parse_weather_datetime(value: str) -> Optional[datetime]:
+        text = str(value or "").strip()
+        if not text or text == "-":
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _weather_chip_markup(prefix: str, value: str) -> str:
+        prefix_text = html_module.escape(str(prefix or "").strip())
+        value_text = html_module.escape(str(value or "-").strip() or "-")
+        return (
+            f"<span style=\"font-weight:500;\">{prefix_text}</span> "
+            f"<span style=\"font-weight:700;\">{value_text}</span>"
+        )
+
+    def _set_weather_chip_label(
+        self,
+        label: QLabel,
+        prefix: str,
+        value: str,
+        *,
+        tooltip: Optional[str] = None,
+    ) -> None:
+        value_text = str(value or "-").strip() or "-"
+        label.setText(self._weather_chip_markup(prefix, value_text))
+        label.setToolTip(str(tooltip or f"{prefix} {value_text}").strip())
+
+    def _update_summary_chip_widths(self) -> None:
+        chip_font = QFont(self.local_time_label.font())
+        value_font = QFont(chip_font)
+        value_font.setBold(True)
+        chip_metrics = QFontMetrics(chip_font)
+        value_metrics = QFontMetrics(value_font)
+        horizontal_padding = 26
+
+        local_width = max(
+            chip_metrics.horizontalAdvance("L") + value_metrics.horizontalAdvance("88:88:88") + horizontal_padding,
+            118,
+        )
+        utc_width = max(
+            chip_metrics.horizontalAdvance("U") + value_metrics.horizontalAdvance("88:88:88") + horizontal_padding,
+            118,
+        )
+        phase_width = max(
+            chip_metrics.horizontalAdvance("Phase")
+            + value_metrics.horizontalAdvance("100%")
+            + horizontal_padding
+            + 6,
+            132,
+        )
+        self.local_time_label.setFixedWidth(local_width)
+        self.utc_time_label.setFixedWidth(utc_width)
+        self.moon_phase_info_bar.setFixedWidth(phase_width)
+
+    def _compact_weather_time(self, value: str) -> str:
+        dt = self._parse_weather_datetime(value)
+        if dt is None:
+            return "-"
+        return dt.strftime('%H:%M:%S')
+
+    def _compact_weather_event(self, value: str) -> str:
+        dt = self._parse_weather_datetime(value)
+        if dt is None:
+            return "-"
+        obs_date = self._date.toPython() if isinstance(self._date, QDate) and self._date.isValid() else date.today()
+        delta_days = (dt.date() - obs_date).days
+        suffix = f" +{delta_days}d" if delta_days > 0 else (f" {delta_days}d" if delta_days < 0 else "")
+        return f"{suffix.strip()} {dt.strftime('%H:%M')}".strip()
+
+    def _compact_weather_update(self, value: str) -> str:
+        dt = self._parse_weather_datetime(value)
+        if dt is None:
+            text = str(value or "").strip()
+            return text or "-"
+        return dt.strftime("%H:%M:%S")
+
+    @staticmethod
+    def _compact_live_status(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return "Idle"
+        lowered = value.lower()
+        if "average values from available conditions providers" in lowered:
+            return "Avg of sources"
+        if "loading live weather providers" in lowered:
+            return "Loading sources…"
+        if "refreshing weather providers" in lowered:
+            return "Refreshing…"
+        if "live data: idle" in lowered:
+            return "Idle"
+        if "partial errors" in lowered:
+            match = re.search(r"partial errors:\s*(\d+)", lowered)
+            if match:
+                return f"Partial errors: {match.group(1)}"
+        return value[:40].rstrip() + "…" if len(value) > 41 else value
+
+    def _apply_summary_labels(self) -> None:
+        lat, lon, _ = self._site_coordinates()
+        self._update_summary_chip_widths()
+        self.obs_label.setText(f"Obs: {self._obs_name}")
+        self.coords_label.setText(f"Lat/Lon: {lat:.5f}, {lon:.5f}")
+        self.sun_limit_label.setText(f"Sun ≤ {self._sun_alt_limit:.0f}°")
+        self._set_weather_chip_label(self.date_chip_label, "Date", self._date.toString('yyyy-MM-dd'))
+        self._set_weather_chip_label(self.local_time_label, "L", self._compact_weather_time(self._local_time_text))
+        self._set_weather_chip_label(self.utc_time_label, "U", self._compact_weather_time(self._utc_time_text))
+        self._set_weather_chip_label(self.sunrise_info_label, "Sun↑", self._compact_weather_event(self._sunrise_text))
+        self._set_weather_chip_label(self.sunset_info_label, "Sun↓", self._compact_weather_event(self._sunset_text))
+        self._set_weather_chip_label(self.moonrise_info_label, "Moon↑", self._compact_weather_event(self._moonrise_text))
+        self._set_weather_chip_label(self.moonset_info_label, "Moon↓", self._compact_weather_event(self._moonset_text))
+        self.moon_phase_info_bar.setValue(self._moon_phase_pct)
+        self.moon_phase_info_bar.setFormat(f"Phase {self._moon_phase_pct}%")
+        self.moon_phase_info_bar.setToolTip(f"Moon phase {self._moon_phase_pct}%")
+
+    def _rebuild(self) -> None:
+        self._apply_summary_labels()
+
+        while self.tabs.count() > 0:
+            widget = self.tabs.widget(0)
+            self.tabs.removeTab(0)
+            if widget is not None:
+                widget.deleteLater()
+
+        sources = self._source_urls()
+        self.tabs.addTab(self._build_meteogram_tab(sources["forecast"]), "Meteograms")
+        self.conditions_tab_widget = self._build_conditions_tab(sources["conditions"])
+        self.tabs.addTab(self.conditions_tab_widget, "Conditions")
+        self.tabs.addTab(self._build_cloud_analysis_tab(sources["cloud"]), "Cloud Analysis")
+        self.tabs.addTab(self._build_satellite_tab(sources["satellite"]), "Satellite")
+
+        if hasattr(self, "cloud_month_combo"):
+            default_month = self._default_cloud_month()
+            idx = self.cloud_month_combo.findData(int(default_month))
+            if idx >= 0:
+                blocker = QSignalBlocker(self.cloud_month_combo)
+                self.cloud_month_combo.setCurrentIndex(idx)
+                del blocker
+
+        idx = self.live_source_combo.findData(self._weather_default_source)
+        if idx >= 0:
+            blocker = QSignalBlocker(self.live_source_combo)
+            self.live_source_combo.setCurrentIndex(idx)
+            del blocker
+        self._sync_conditions_source_combo()
+
+        self._on_tab_changed(self.tabs.currentIndex())
+        self._update_live_views()
+        self._start_live_refresh(force=False, include_cloud_map=True, include_satellite=True)
+
+
 class AddTargetDialog(QDialog):
     """Two-step target add dialog with lazy-expanded metadata details."""
 
@@ -1353,6 +8983,8 @@ class AddTargetDialog(QDialog):
         top_row = QHBoxLayout()
         self.resolve_btn = QPushButton("Resolve", self)
         self.resolve_btn.clicked.connect(self._resolve_target)
+        _set_button_variant(self.resolve_btn, "secondary")
+        _set_button_icon_kind(self.resolve_btn, "resolve")
         top_row.addWidget(self.resolve_btn)
         top_row.addStretch(1)
         layout.addLayout(top_row)
@@ -1389,11 +9021,18 @@ class AddTargetDialog(QDialog):
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
+        _style_dialog_button_box(self.button_box)
         ok_btn = self.button_box.button(QDialogButtonBox.Ok)
         if ok_btn:
             ok_btn.setEnabled(False)
         layout.addWidget(self.button_box)
-        self.setMinimumWidth(max(500, self.sizeHint().width()))
+        _fit_dialog_to_screen(
+            self,
+            preferred_width=760,
+            preferred_height=620,
+            min_width=560,
+            min_height=420,
+        )
 
         self.query_edit.returnPressed.connect(self._resolve_target)
         self.query_edit.textChanged.connect(self._on_query_changed)
@@ -1533,11 +9172,14 @@ class ClockWorker(QThread):
 
         logger.info("ClockWorker exiting for site %s", self.site.name)
 
-    def stop(self):
-        logger.info("ClockWorker stop requested for site %s", self.site.name)
+    def request_stop(self):
         self.running = False
         self._wait_cond.wakeAll()  # interrupt the 1‑second wait
         self.quit()
+
+    def stop(self):
+        logger.info("ClockWorker stop requested for site %s", self.site.name)
+        self.request_stop()
         self.wait()
 
 
@@ -1645,6 +9287,200 @@ class FinderChartWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             self.completed.emit(self.request_id, self.key, b"", str(exc))
 
+
+class BhtomSuggestionWorker(QThread):
+    """Background loader/ranker for BHTOM suggestions with incremental page updates."""
+
+    pageReady = Signal(int, list, list, int, int)
+    completed = Signal(int, list, list, list, str)
+
+    def __init__(
+        self,
+        request_id: int,
+        payload: dict[str, object],
+        site: "Site",
+        targets: list["Target"],
+        limit_altitude: float,
+        sun_alt_limit: float,
+        min_moon_sep: float,
+        bhtom_base_url: str,
+        bhtom_token: str,
+        cached_candidates: Optional[list[dict[str, object]]] = None,
+        emit_partials: bool = True,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.request_id = int(request_id)
+        self.payload = payload
+        self.site = site
+        self.targets = targets
+        self.limit_altitude = float(limit_altitude)
+        self.sun_alt_limit = float(sun_alt_limit)
+        self.min_moon_sep = float(min_moon_sep)
+        self.bhtom_base_url = bhtom_base_url
+        self.bhtom_token = bhtom_token
+        self.cached_candidates = list(cached_candidates) if cached_candidates else None
+        self.emit_partials = bool(emit_partials)
+
+    def run(self):
+        try:
+            candidates: list[dict[str, object]] = list(self.cached_candidates or [])
+            final_notes: list[str] = []
+            final_ranked: list[dict[str, object]] = []
+
+            if candidates:
+                final_ranked, final_notes = _rank_local_target_suggestions_from_candidates(
+                    payload=self.payload,
+                    site=self.site,
+                    targets=self.targets,
+                    limit_altitude=self.limit_altitude,
+                    sun_alt_limit=self.sun_alt_limit,
+                    min_moon_sep=self.min_moon_sep,
+                    candidates=candidates,
+                )
+                if self.emit_partials:
+                    self.pageReady.emit(
+                        self.request_id,
+                        final_ranked,
+                        final_notes,
+                        -1,
+                        len(candidates),
+                    )
+            else:
+                seen_keys: set[str] = set()
+                for page in range(1, BHTOM_MAX_SUGGESTION_PAGES + 1):
+                    if self.isInterruptionRequested():
+                        self.completed.emit(self.request_id, [], [], [], "cancelled")
+                        return
+
+                    payload = _fetch_bhtom_target_page_payload(
+                        endpoint_base_url=self.bhtom_base_url,
+                        token=self.bhtom_token,
+                        page=page,
+                    )
+                    items = _extract_bhtom_items(payload)
+                    if not items:
+                        if page == 1:
+                            if isinstance(payload, dict):
+                                keys = ", ".join(sorted(str(key) for key in payload.keys()))
+                                raise RuntimeError(f"BHTOM returned an unexpected payload shape (keys: {keys or 'none'}).")
+                            raise RuntimeError("BHTOM returned an unexpected payload shape.")
+                        break
+
+                    for item in items:
+                        if self.isInterruptionRequested():
+                            self.completed.emit(self.request_id, [], [], [], "cancelled")
+                            return
+                        candidate = _build_bhtom_candidate_from_item(item)
+                        if candidate is None:
+                            continue
+                        target = candidate.get("target")
+                        if not isinstance(target, Target):
+                            continue
+                        dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+                        if not dedupe_key or dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        candidates.append(candidate)
+
+                    final_ranked, final_notes = _rank_local_target_suggestions_from_candidates(
+                        payload=self.payload,
+                        site=self.site,
+                        targets=self.targets,
+                        limit_altitude=self.limit_altitude,
+                        sun_alt_limit=self.sun_alt_limit,
+                        min_moon_sep=self.min_moon_sep,
+                        candidates=candidates,
+                    )
+
+                    if self.emit_partials:
+                        self.pageReady.emit(
+                            self.request_id,
+                            final_ranked,
+                            final_notes,
+                            page,
+                            len(candidates),
+                        )
+
+                    if not _bhtom_payload_has_more(payload, page, len(items)):
+                        break
+
+            self.completed.emit(self.request_id, final_ranked, final_notes, candidates, "")
+        except Exception as exc:  # noqa: BLE001
+            self.completed.emit(self.request_id, [], [], [], str(exc))
+
+
+class BhtomObservatoryPresetWorker(QThread):
+    """Background loader for BHTOM observatory/camera presets."""
+
+    progress = Signal(int, int, str)
+    completed = Signal(int, list, str)
+
+    def __init__(self, request_id: int, base_url: str, token: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.request_id = int(request_id)
+        self.base_url = str(base_url)
+        self.token = str(token)
+
+    def run(self):
+        try:
+            items: list[dict[str, Any]] = []
+            for page in range(1, BHTOM_MAX_OBSERVATORY_PAGES + 1):
+                if self.isInterruptionRequested():
+                    self.completed.emit(self.request_id, [], "cancelled")
+                    return
+                payload = _fetch_bhtom_observatory_page_payload(
+                    endpoint_base_url=self.base_url,
+                    token=self.token,
+                    page=page,
+                )
+                page_items = _extract_bhtom_observatory_items(payload)
+                if not page_items:
+                    if page == 1:
+                        if isinstance(payload, dict):
+                            keys = ", ".join(sorted(str(key) for key in payload.keys()))
+                            raise RuntimeError(
+                                f"BHTOM observatory endpoint returned an unexpected payload shape (keys: {keys or 'none'})."
+                            )
+                        raise RuntimeError("BHTOM observatory endpoint returned an unexpected payload shape.")
+                    break
+                items.extend(page_items)
+                self.progress.emit(page, BHTOM_MAX_OBSERVATORY_PAGES, f"Loading BHTOM presets... page {page}")
+                if not _bhtom_observatory_payload_has_more(payload, page, len(page_items)):
+                    break
+            presets = _build_bhtom_observatory_presets(items)
+            if not presets:
+                raise RuntimeError("BHTOM returned no usable observatory/camera presets.")
+            self.completed.emit(self.request_id, presets, "")
+        except Exception as exc:  # noqa: BLE001
+            self.completed.emit(self.request_id, [], str(exc))
+
+
+class ObservatoryLookupWorker(QThread):
+    """Resolve observatory coordinates in background to keep dialog responsive."""
+
+    completed = Signal(float, float, object, str, str)
+
+    def __init__(
+        self,
+        query: str,
+        resolver: Callable[[str], tuple[float, float, Optional[float], str]],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.query = str(query)
+        self.resolver = resolver
+
+    def run(self):
+        try:
+            lat, lon, elev, display_name = self.resolver(self.query)
+            self.completed.emit(float(lat), float(lon), elev, str(display_name), "")
+        except Exception as exc:  # noqa: BLE001
+            self.completed.emit(0.0, 0.0, None, "", str(exc))
+
 # --------------------------------------------------
 # --- Models (Pydantic) -----------------------------
 # --------------------------------------------------
@@ -1680,6 +9516,19 @@ class Site(BaseModel):
     latitude: float = Field(..., description="Latitude in °")
     longitude: float = Field(..., description="Longitude in °")
     elevation: float = Field(0.0, description="Elevation in m")
+    limiting_magnitude: float = Field(
+        DEFAULT_LIMITING_MAGNITUDE,
+        description="Magnitude threshold used by observatory/telescope profile.",
+    )
+    telescope_diameter_mm: float = Field(0.0, description="Telescope aperture/diameter in mm.")
+    focal_length_mm: float = Field(0.0, description="Telescope focal length in mm.")
+    pixel_size_um: float = Field(0.0, description="Detector pixel size in micrometers (µm).")
+    detector_width_px: int = Field(0, description="Detector width in pixels.")
+    detector_height_px: int = Field(0, description="Detector height in pixels.")
+    custom_conditions_url: str = Field(
+        "",
+        description="Optional per-observatory JSON endpoint used by Weather -> Custom URL.",
+    )
 
     def to_earthlocation(self) -> EarthLocation:  # noqa: D401
         return EarthLocation(lat=self.latitude * u.deg, lon=self.longitude * u.deg, height=self.elevation * u.m)
@@ -1687,6 +9536,25 @@ class Site(BaseModel):
     @property
     def timezone_name(self) -> str:  # noqa: D401
         return _TZ_FINDER.timezone_at(lng=self.longitude, lat=self.latitude) or "UTC"
+
+    @property
+    def pixel_scale_arcsec_per_px(self) -> Optional[float]:  # noqa: D401
+        focal = _safe_float(self.focal_length_mm)
+        pixel = _safe_float(self.pixel_size_um)
+        if focal is None or pixel is None or focal <= 0.0 or pixel <= 0.0:
+            return None
+        return float(206.265 * pixel / focal)
+
+    @property
+    def fov_arcmin(self) -> Optional[tuple[float, float]]:  # noqa: D401
+        scale = self.pixel_scale_arcsec_per_px
+        if scale is None:
+            return None
+        width = int(self.detector_width_px or 0)
+        height = int(self.detector_height_px or 0)
+        if width <= 0 or height <= 0:
+            return None
+        return (float(width) * scale / 60.0, float(height) * scale / 60.0)
 
 
 class SessionSettings(BaseModel):
@@ -1712,6 +9580,887 @@ def _targets_match(left: Target, right: Target, max_sep_deg: float = 0.05) -> bo
         return float(left.skycoord.separation(right.skycoord).deg) < max_sep_deg
     except Exception:
         return False
+
+
+class ObservatoryManagerDialog(QDialog):
+    """Manage observatories with search and inline configuration editing."""
+
+    def __init__(self, observatories: dict[str, Site], parent=None, preset_keys: Optional[dict[str, str]] = None):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.setWindowTitle("Observatory Manager")
+        self.resize(1140, 700)
+
+        self._sites: dict[str, Site] = {
+            name: Site(**site.model_dump())
+            for name, site in observatories.items()
+        }
+        self._selected_name: Optional[str] = None
+        self._loading_fields = False
+        self._list_sync = False
+        self._preset_sync = False
+        preset_keys = preset_keys or {}
+        self._site_preset_keys: dict[str, str] = {
+            name: str(preset_keys.get(name, "custom") or "custom")
+            for name in self._sites
+        }
+        self._bhtom_preset_map: dict[str, dict[str, object]] = {}
+        self._lookup_worker: Optional[ObservatoryLookupWorker] = None
+        self._preset_loading = False
+        self._preset_status_default = "BHTOM presets load in background when token is configured."
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        header = QLabel(
+            "Manage observatories (coordinates, limiting magnitude, telescope/camera profile, and optional custom weather endpoint).",
+            self,
+        )
+        header.setObjectName("SectionHint")
+        header.setWordWrap(True)
+        root.addWidget(header)
+
+        left_col = QWidget(self)
+        left_layout = QVBoxLayout(left_col)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(QLabel("Observatories", left_col))
+        self.search_edit = QLineEdit(left_col)
+        self.search_edit.setPlaceholderText("Search observatory...")
+        self.search_edit.setMinimumHeight(34)
+        left_layout.addWidget(self.search_edit)
+        self.obs_list = QListWidget(left_col)
+        self.obs_list.setMinimumWidth(340)
+        self.obs_list.setUniformItemSizes(True)
+        left_layout.addWidget(self.obs_list, 1)
+        list_actions = QHBoxLayout()
+        list_actions.setContentsMargins(0, 0, 0, 0)
+        list_actions.setSpacing(6)
+        self.add_btn = QPushButton("New", left_col)
+        self.remove_btn = QPushButton("Remove", left_col)
+        self.save_cfg_btn = QPushButton("Save Config", left_col)
+        self.add_btn.setMinimumHeight(34)
+        self.remove_btn.setMinimumHeight(34)
+        self.save_cfg_btn.setMinimumHeight(34)
+        self.add_btn.setMinimumWidth(92)
+        self.remove_btn.setMinimumWidth(92)
+        self.save_cfg_btn.setMinimumWidth(128)
+        _set_button_variant(self.add_btn, "primary")
+        _set_button_variant(self.remove_btn, "ghost")
+        _set_button_variant(self.save_cfg_btn, "secondary")
+        _set_button_icon_kind(self.add_btn, "new")
+        _set_button_icon_kind(self.remove_btn, "remove")
+        _set_button_icon_kind(self.save_cfg_btn, "save")
+        list_actions.addWidget(self.add_btn)
+        list_actions.addWidget(self.remove_btn)
+        list_actions.addWidget(self.save_cfg_btn)
+        list_actions.addStretch(1)
+        left_layout.addLayout(list_actions)
+
+        right_col = QWidget(self)
+        right_layout = QVBoxLayout(right_col)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(QLabel("Configuration", right_col))
+
+        top_form = QFormLayout()
+        top_form.setContentsMargins(0, 0, 0, 0)
+        top_form.setHorizontalSpacing(12)
+        top_form.setVerticalSpacing(8)
+        top_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        top_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        self.name_edit = QLineEdit(right_col)
+        self.name_edit.setPlaceholderText("Observatory name")
+        self.name_edit.setMinimumWidth(200)
+        self.name_edit.setMaximumWidth(300)
+        self.name_edit.setMinimumHeight(34)
+        self.lat_edit = QLineEdit(right_col)
+        self.lat_edit.setValidator(QDoubleValidator(-90.0, 90.0, 6, right_col))
+        self.lat_edit.setMinimumHeight(34)
+        self.lon_edit = QLineEdit(right_col)
+        self.lon_edit.setValidator(QDoubleValidator(-180.0, 180.0, 6, right_col))
+        self.lon_edit.setMinimumHeight(34)
+        self.elev_edit = QLineEdit(right_col)
+        self.elev_edit.setValidator(QDoubleValidator(-1000.0, 20000.0, 2, right_col))
+        self.elev_edit.setMinimumHeight(34)
+        self.lim_mag_spin = QDoubleSpinBox(right_col)
+        self.lim_mag_spin.setRange(-5.0, 30.0)
+        self.lim_mag_spin.setDecimals(1)
+        self.lim_mag_spin.setSingleStep(0.1)
+        self.lim_mag_spin.setMinimumHeight(34)
+        self.telescope_diameter_spin = QDoubleSpinBox(right_col)
+        self.telescope_diameter_spin.setRange(0.0, 50.0)
+        self.telescope_diameter_spin.setDecimals(3)
+        self.telescope_diameter_spin.setSingleStep(0.05)
+        self.telescope_diameter_spin.setSuffix(" m")
+        self.telescope_diameter_spin.setMinimumHeight(34)
+        self.focal_length_spin = QDoubleSpinBox(right_col)
+        self.focal_length_spin.setRange(0.0, 20000.0)
+        self.focal_length_spin.setDecimals(1)
+        self.focal_length_spin.setSingleStep(10.0)
+        self.focal_length_spin.setSuffix(" mm")
+        self.focal_length_spin.setMinimumHeight(34)
+        self.pixel_size_spin = QDoubleSpinBox(right_col)
+        self.pixel_size_spin.setRange(0.0, 100.0)
+        self.pixel_size_spin.setDecimals(3)
+        self.pixel_size_spin.setSingleStep(0.1)
+        self.pixel_size_spin.setSuffix(" µm")
+        self.pixel_size_spin.setMinimumHeight(34)
+        self.detector_width_spin = QSpinBox(right_col)
+        self.detector_width_spin.setRange(0, 20000)
+        self.detector_width_spin.setSingleStep(16)
+        self.detector_width_spin.setSuffix(" px")
+        self.detector_width_spin.setMinimumHeight(34)
+        self.detector_height_spin = QSpinBox(right_col)
+        self.detector_height_spin.setRange(0, 20000)
+        self.detector_height_spin.setSingleStep(16)
+        self.detector_height_spin.setSuffix(" px")
+        self.detector_height_spin.setMinimumHeight(34)
+        self.pixel_scale_display = QLineEdit(right_col)
+        self.pixel_scale_display.setReadOnly(True)
+        self.pixel_scale_display.setPlaceholderText("auto")
+        self.pixel_scale_display.setMinimumHeight(34)
+        self.fov_display = QLineEdit(right_col)
+        self.fov_display.setReadOnly(True)
+        self.fov_display.setPlaceholderText("auto")
+        self.fov_display.setMinimumHeight(34)
+        self.custom_conditions_url_edit = QLineEdit(right_col)
+        self.custom_conditions_url_edit.setPlaceholderText("https://example.com/station.json")
+        self.custom_conditions_url_edit.setToolTip("Optional endpoint used when Weather source = Custom URL.")
+        self.custom_conditions_url_edit.setMinimumHeight(34)
+        self.lookup_btn = QPushButton("Lookup Coordinates", right_col)
+        self.lookup_btn.setToolTip("Resolve latitude/longitude/elevation from observatory name")
+        self.lookup_btn.setMinimumHeight(34)
+        self.lookup_btn.setMinimumWidth(170)
+        _set_button_variant(self.lookup_btn, "secondary")
+        _set_button_icon_kind(self.lookup_btn, "lookup")
+        self.preset_combo = QComboBox(right_col)
+        self.preset_combo.addItem("Custom (editable)", "custom")
+        self.preset_combo.setMinimumHeight(34)
+        self.preset_combo.setMaximumWidth(300)
+        self.preset_info = QLabel("", right_col)
+        self.preset_info.setObjectName("SectionHint")
+        self.preset_info.setWordWrap(True)
+        _set_label_tone(self.preset_info, "muted")
+        self.lookup_info = QLabel("", right_col)
+        self.lookup_info.setObjectName("SectionHint")
+        self.lookup_info.setWordWrap(True)
+        _set_label_tone(self.lookup_info, "info")
+
+        preset_actions = QWidget(right_col)
+        preset_actions_layout = QHBoxLayout(preset_actions)
+        preset_actions_layout.setContentsMargins(0, 0, 0, 0)
+        preset_actions_layout.setSpacing(8)
+        preset_actions_layout.addWidget(self.lookup_btn)
+        preset_actions_layout.addStretch(1)
+        self.preset_progress = QProgressBar(right_col)
+        self.preset_progress.setTextVisible(False)
+        self.preset_progress.setMinimumWidth(140)
+        self.preset_progress.setMaximumWidth(220)
+        self.preset_progress.setRange(0, 0)
+        self.preset_progress.hide()
+        self.preset_status_label = QLabel(self._preset_status_default, right_col)
+        self.preset_status_label.setObjectName("SectionHint")
+        self.preset_status_label.setWordWrap(True)
+        _set_label_tone(self.preset_status_label, "muted")
+        self.lookup_progress = QProgressBar(right_col)
+        self.lookup_progress.setTextVisible(False)
+        self.lookup_progress.setMinimumWidth(140)
+        self.lookup_progress.setMaximumWidth(220)
+        self.lookup_progress.setRange(0, 0)
+        self.lookup_progress.hide()
+
+        # Keep entry fields visually aligned and readable.
+        for w in (
+            self.name_edit,
+            self.lat_edit,
+            self.lon_edit,
+            self.elev_edit,
+            self.lim_mag_spin,
+            self.telescope_diameter_spin,
+            self.focal_length_spin,
+            self.pixel_size_spin,
+            self.detector_width_spin,
+            self.detector_height_spin,
+            self.pixel_scale_display,
+            self.fov_display,
+            self.custom_conditions_url_edit,
+            self.preset_combo,
+        ):
+            w.setMinimumWidth(170)
+            w.setMaximumWidth(300)
+
+        top_form.addRow("Preset:", self.preset_combo)
+        top_form.addRow("", preset_actions)
+        top_form.addRow("", self.preset_progress)
+        top_form.addRow("", self.lookup_progress)
+        top_form.addRow("", self.preset_status_label)
+        top_form.addRow("", self.lookup_info)
+        right_layout.addLayout(top_form)
+
+        site_panel = QWidget(right_col)
+        site_layout = QVBoxLayout(site_panel)
+        site_layout.setContentsMargins(0, 0, 0, 0)
+        site_layout.setSpacing(6)
+        site_title = QLabel("Site", site_panel)
+        site_title.setObjectName("SectionHint")
+        site_layout.addWidget(site_title)
+        site_form = QFormLayout()
+        site_form.setContentsMargins(0, 0, 0, 0)
+        site_form.setHorizontalSpacing(12)
+        site_form.setVerticalSpacing(8)
+        site_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        site_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        site_form.addRow("Name:", self.name_edit)
+        site_form.addRow("Latitude:", self.lat_edit)
+        site_form.addRow("Longitude:", self.lon_edit)
+        site_form.addRow("Elevation (m):", self.elev_edit)
+        site_form.addRow("Limiting Mag:", self.lim_mag_spin)
+        site_form.addRow("Custom conditions URL:", self.custom_conditions_url_edit)
+        site_layout.addLayout(site_form)
+        site_layout.addStretch(1)
+
+        optics_panel = QWidget(right_col)
+        optics_layout = QVBoxLayout(optics_panel)
+        optics_layout.setContentsMargins(0, 0, 0, 0)
+        optics_layout.setSpacing(6)
+        optics_title = QLabel("Optics & Camera", optics_panel)
+        optics_title.setObjectName("SectionHint")
+        optics_layout.addWidget(optics_title)
+        optics_form = QFormLayout()
+        optics_form.setContentsMargins(0, 0, 0, 0)
+        optics_form.setHorizontalSpacing(12)
+        optics_form.setVerticalSpacing(8)
+        optics_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        optics_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        optics_form.addRow("Telescope Ø (m):", self.telescope_diameter_spin)
+        optics_form.addRow("Focal length:", self.focal_length_spin)
+        optics_form.addRow("Pixel size:", self.pixel_size_spin)
+        optics_form.addRow("Detector width:", self.detector_width_spin)
+        optics_form.addRow("Detector height:", self.detector_height_spin)
+        optics_form.addRow("Pixel scale:", self.pixel_scale_display)
+        optics_form.addRow("FOV:", self.fov_display)
+        optics_layout.addLayout(optics_form)
+        optics_layout.addStretch(1)
+
+        fields_row = QHBoxLayout()
+        fields_row.setContentsMargins(0, 0, 0, 0)
+        fields_row.setSpacing(16)
+        fields_row.addWidget(site_panel, 1)
+        fields_row.addWidget(optics_panel, 1)
+        right_layout.addLayout(fields_row, 1)
+        right_layout.addWidget(self.preset_info)
+        right_layout.addStretch(1)
+
+        body_splitter = QSplitter(Qt.Horizontal, self)
+        body_splitter.addWidget(left_col)
+        body_splitter.addWidget(right_col)
+        body_splitter.setHandleWidth(1)
+        body_splitter.setStretchFactor(0, 2)
+        body_splitter.setStretchFactor(1, 3)
+        body_splitter.setSizes([460, 700])
+        body_splitter.setChildrenCollapsible(False)
+        root.addWidget(body_splitter, 1)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.button_box.accepted.connect(self._accept_dialog)
+        self.button_box.rejected.connect(self.reject)
+        _style_dialog_button_box(self.button_box)
+        self.save_cfg_btn.clicked.connect(self._save_to_config)
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setContentsMargins(0, 2, 0, 0)
+        bottom_bar.setSpacing(8)
+        bottom_bar.addStretch(1)
+        bottom_bar.addWidget(self.button_box, 0, Qt.AlignRight)
+        root.addLayout(bottom_bar)
+
+        self.search_edit.textChanged.connect(self._refresh_list)
+        self.obs_list.currentItemChanged.connect(self._on_list_selection_changed)
+        self.add_btn.clicked.connect(self._add_observatory)
+        self.remove_btn.clicked.connect(self._remove_observatory)
+        self.lookup_btn.clicked.connect(self._lookup_coordinates_for_current)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        self.name_edit.editingFinished.connect(self._store_current_site_from_editors)
+        self.lat_edit.editingFinished.connect(self._store_current_site_from_editors)
+        self.lon_edit.editingFinished.connect(self._store_current_site_from_editors)
+        self.elev_edit.editingFinished.connect(self._store_current_site_from_editors)
+        self.custom_conditions_url_edit.editingFinished.connect(self._store_current_site_from_editors)
+        self.lim_mag_spin.valueChanged.connect(self._on_limiting_mag_changed)
+        self.telescope_diameter_spin.valueChanged.connect(self._on_optics_fields_changed)
+        self.focal_length_spin.valueChanged.connect(self._on_optics_fields_changed)
+        self.pixel_size_spin.valueChanged.connect(self._on_optics_fields_changed)
+        self.detector_width_spin.valueChanged.connect(self._on_optics_fields_changed)
+        self.detector_height_spin.valueChanged.connect(self._on_optics_fields_changed)
+
+        parent = self.parent()
+        cached_loader = getattr(parent, "_cached_bhtom_observatory_presets", None)
+        if callable(cached_loader):
+            try:
+                cached = cached_loader()
+            except Exception:
+                cached = None
+            if cached:
+                self._set_bhtom_presets(cached)
+                self.preset_status_label.setText(f"Loaded {len(cached)} cached BHTOM presets.")
+        parent_changed_sig = getattr(parent, "bhtom_observatory_presets_changed", None)
+        if parent_changed_sig is not None and hasattr(parent_changed_sig, "connect"):
+            parent_changed_sig.connect(self._on_parent_bhtom_presets_changed)
+        parent_loading_sig = getattr(parent, "bhtom_observatory_presets_loading", None)
+        if parent_loading_sig is not None and hasattr(parent_loading_sig, "connect"):
+            parent_loading_sig.connect(self._on_parent_bhtom_presets_loading)
+        status_getter = getattr(parent, "_bhtom_observatory_prefetch_status", None)
+        if callable(status_getter):
+            try:
+                is_loading, status_txt = status_getter()
+            except Exception:
+                is_loading, status_txt = False, ""
+            self._set_preset_loading_state(bool(is_loading), str(status_txt or ""))
+        launcher = getattr(parent, "_ensure_bhtom_observatory_prefetch", None)
+        if callable(launcher):
+            try:
+                launcher(force_refresh=False)
+            except Exception:
+                pass
+        self._rebuild_preset_combo()
+        self._refresh_list()
+        _fit_dialog_to_screen(
+            self,
+            preferred_width=1460,
+            preferred_height=860,
+            min_width=1120,
+            min_height=720,
+        )
+        if self.obs_list.count() == 0:
+            self._set_editors_enabled(False)
+
+    def observatories(self) -> dict[str, Site]:
+        return {
+            name: Site(**site.model_dump())
+            for name, site in sorted(self._sites.items(), key=lambda item: item[0].lower())
+        }
+
+    def preset_keys(self) -> dict[str, str]:
+        return {
+            name: str(self._site_preset_keys.get(name, "custom") or "custom")
+            for name in sorted(self._sites.keys(), key=str.lower)
+        }
+
+    def _manual_editor_widgets(self) -> tuple[QWidget, ...]:
+        return (
+            self.lat_edit,
+            self.lon_edit,
+            self.elev_edit,
+            self.lim_mag_spin,
+            self.custom_conditions_url_edit,
+            self.telescope_diameter_spin,
+            self.focal_length_spin,
+            self.pixel_size_spin,
+            self.detector_width_spin,
+            self.detector_height_spin,
+            self.lookup_btn,
+        )
+
+    def _apply_custom_mode_ui(self) -> None:
+        if self._selected_name is None:
+            return
+        preset_key = str(self._site_preset_keys.get(self._selected_name, "custom") or "custom")
+        editable = preset_key == "custom"
+        if editable:
+            self.preset_info.setText("Custom preset: manual editing enabled.")
+            return
+        preset = self._bhtom_preset_map.get(preset_key)
+        if isinstance(preset, dict):
+            label = str(preset.get("label", "BHTOM preset")).strip() or "BHTOM preset"
+            self.preset_info.setText(f"Using preset: {label} (values are editable).")
+            return
+        self.preset_info.setText(f"Saved preset key '{preset_key}' (values are editable).")
+
+    def _rebuild_preset_combo(self) -> None:
+        selected_key = "custom"
+        if self._selected_name is not None:
+            selected_key = str(self._site_preset_keys.get(self._selected_name, "custom") or "custom")
+        self._preset_sync = True
+        try:
+            self.preset_combo.clear()
+            self.preset_combo.addItem("Custom (editable)", "custom")
+            for key, preset in sorted(
+                self._bhtom_preset_map.items(),
+                key=lambda item: str(item[1].get("label", "")).lower(),
+            ):
+                self.preset_combo.addItem(str(preset.get("label", key)), key)
+            idx = self.preset_combo.findData(selected_key)
+            if idx < 0:
+                idx = 0
+            self.preset_combo.setCurrentIndex(idx)
+        finally:
+            self._preset_sync = False
+        self._apply_custom_mode_ui()
+
+    def _set_editors_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.name_edit,
+            self.preset_combo,
+            self.pixel_scale_display,
+            self.fov_display,
+            self.remove_btn,
+        ):
+            widget.setEnabled(enabled)
+        for widget in self._manual_editor_widgets():
+            widget.setEnabled(enabled)
+        if not enabled:
+            self.lookup_info.setText("")
+            self.preset_info.setText("")
+            self.pixel_scale_display.clear()
+            self.fov_display.clear()
+            self.custom_conditions_url_edit.clear()
+            return
+        self._apply_custom_mode_ui()
+
+    def _set_bhtom_presets(self, presets: object) -> None:
+        self._bhtom_preset_map = {}
+        if not isinstance(presets, list):
+            self._rebuild_preset_combo()
+            return
+        for preset in presets:
+            if not isinstance(preset, dict):
+                continue
+            key = str(preset.get("key", "")).strip()
+            label = str(preset.get("label", "")).strip()
+            site = preset.get("site")
+            if not key or not label or not isinstance(site, Site):
+                continue
+            self._bhtom_preset_map[key] = {
+                "key": key,
+                "label": label,
+                "site": Site(**site.model_dump()),
+            }
+        self._rebuild_preset_combo()
+
+    def _set_preset_loading_state(self, loading: bool, message: str = "") -> None:
+        self._preset_loading = bool(loading)
+        if self._preset_loading:
+            self.preset_progress.setRange(0, 0)
+            self.preset_progress.show()
+            self.preset_status_label.setText(message.strip() or "Loading BHTOM presets...")
+            _set_label_tone(self.preset_status_label, "info")
+            return
+        self.preset_progress.hide()
+        self.preset_progress.setRange(0, 1)
+        self.preset_progress.setValue(0)
+        text = message.strip()
+        if text:
+            self.preset_status_label.setText(text)
+            _set_label_tone(self.preset_status_label, "success")
+            return
+        if self._bhtom_preset_map:
+            self.preset_status_label.setText(f"Loaded {len(self._bhtom_preset_map)} BHTOM presets.")
+            _set_label_tone(self.preset_status_label, "success")
+        else:
+            self.preset_status_label.setText(self._preset_status_default)
+            _set_label_tone(self.preset_status_label, "muted")
+
+    @Slot(list, str)
+    def _on_parent_bhtom_presets_changed(self, presets: list, message: str) -> None:
+        self._set_bhtom_presets(presets)
+        final_message = str(message or "").strip()
+        if not final_message:
+            final_message = f"Loaded {len(self._bhtom_preset_map)} BHTOM presets."
+        self._set_preset_loading_state(False, final_message)
+
+    @Slot(bool, str)
+    def _on_parent_bhtom_presets_loading(self, loading: bool, message: str) -> None:
+        self._set_preset_loading_state(bool(loading), str(message or ""))
+
+    def _set_lookup_loading_state(self, loading: bool) -> None:
+        if loading:
+            self.lookup_progress.setRange(0, 0)
+            self.lookup_progress.show()
+            self.lookup_btn.setEnabled(False)
+            self.lookup_btn.setText("...")
+            return
+        self.lookup_progress.hide()
+        self.lookup_progress.setRange(0, 1)
+        self.lookup_progress.setValue(0)
+        self.lookup_btn.setEnabled(self._selected_name is not None)
+        self.lookup_btn.setText("Lookup Coordinates")
+
+    @Slot(float, float, object, str, str)
+    def _on_lookup_worker_completed(self, lat: float, lon: float, elev: object, display_name: str, err: str) -> None:
+        self._set_lookup_loading_state(False)
+        if err:
+            QMessageBox.warning(self, "Lookup Failed", err)
+            return
+        self._loading_fields = True
+        try:
+            self.lat_edit.setText(f"{float(lat):.6f}")
+            self.lon_edit.setText(f"{float(lon):.6f}")
+            elev_value = _safe_float(elev)
+            if elev_value is not None:
+                self.elev_edit.setText(f"{elev_value:.1f}")
+            elif not self.elev_edit.text().strip():
+                self.elev_edit.setText("0")
+            self.lookup_info.setText(str(display_name or "").strip())
+            _set_label_tone(self.lookup_info, "info")
+        finally:
+            self._loading_fields = False
+        self._store_current_site_from_editors(show_errors=False)
+
+    def closeEvent(self, event):
+        worker = self._lookup_worker
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    worker.requestInterruption()
+                    worker.quit()
+                    worker.wait(1000)
+            except Exception:
+                pass
+            self._lookup_worker = None
+        super().closeEvent(event)
+
+    @Slot(int)
+    def _on_preset_changed(self, _index: int) -> None:
+        if self._preset_sync or self._loading_fields or self._selected_name is None:
+            return
+        key = str(self.preset_combo.currentData() or "custom")
+        if key not in self._bhtom_preset_map:
+            key = "custom"
+        self._site_preset_keys[self._selected_name] = key
+        if key != "custom":
+            preset = self._bhtom_preset_map.get(key)
+            if isinstance(preset, dict):
+                preset_site = preset.get("site")
+            else:
+                preset_site = None
+            if isinstance(preset_site, Site):
+                site = self._sites.get(self._selected_name)
+                if site is not None:
+                    site.latitude = float(preset_site.latitude)
+                    site.longitude = float(preset_site.longitude)
+                    site.elevation = float(preset_site.elevation)
+                    site.limiting_magnitude = float(preset_site.limiting_magnitude)
+                    site.telescope_diameter_mm = float(preset_site.telescope_diameter_mm)
+                    site.focal_length_mm = float(preset_site.focal_length_mm)
+                    # Keep existing camera geometry when BHTOM preset does not provide it.
+                    if float(preset_site.pixel_size_um) > 0.0:
+                        site.pixel_size_um = float(preset_site.pixel_size_um)
+                    if int(preset_site.detector_width_px) > 0:
+                        site.detector_width_px = int(preset_site.detector_width_px)
+                    if int(preset_site.detector_height_px) > 0:
+                        site.detector_height_px = int(preset_site.detector_height_px)
+                    self._loading_fields = True
+                    try:
+                        self.lat_edit.setText(f"{site.latitude}")
+                        self.lon_edit.setText(f"{site.longitude}")
+                        self.elev_edit.setText(f"{site.elevation}")
+                        self.lim_mag_spin.setValue(float(site.limiting_magnitude))
+                        self.telescope_diameter_spin.setValue(float(site.telescope_diameter_mm) / 1000.0)
+                        self.focal_length_spin.setValue(float(site.focal_length_mm))
+                        self.pixel_size_spin.setValue(float(site.pixel_size_um))
+                        self.detector_width_spin.setValue(int(site.detector_width_px))
+                        self.detector_height_spin.setValue(int(site.detector_height_px))
+                    finally:
+                        self._loading_fields = False
+                    self._update_optics_summary(site)
+        self._apply_custom_mode_ui()
+
+    def _read_float(self, edit: QLineEdit, label: str) -> float:
+        raw = edit.text().strip().replace(",", ".")
+        if not raw:
+            raise ValueError(f"{label} is required.")
+        return float(raw)
+
+    def _update_optics_summary(self, site: Optional[Site] = None) -> None:
+        site_obj = site
+        if site_obj is None and self._selected_name is not None:
+            site_obj = self._sites.get(self._selected_name)
+        if site_obj is None:
+            self.pixel_scale_display.clear()
+            self.fov_display.clear()
+            return
+        scale = site_obj.pixel_scale_arcsec_per_px
+        if scale is None:
+            self.pixel_scale_display.setText("-")
+        else:
+            self.pixel_scale_display.setText(f"{scale:.3f} arcsec/px")
+        fov = site_obj.fov_arcmin
+        if fov is None:
+            self.fov_display.setText("-")
+        else:
+            self.fov_display.setText(f"{fov[0]:.1f} x {fov[1]:.1f} arcmin")
+
+    def _store_current_site_from_editors(self, show_errors: bool = False) -> bool:
+        if self._loading_fields or self._selected_name is None:
+            return True
+        old_name = self._selected_name
+        new_name = self.name_edit.text().strip()
+        if not new_name:
+            if show_errors:
+                QMessageBox.warning(self, "Invalid Observatory", "Name cannot be empty.")
+            return False
+        if new_name != old_name and new_name in self._sites:
+            if show_errors:
+                QMessageBox.warning(self, "Invalid Observatory", f"Observatory '{new_name}' already exists.")
+            return False
+        try:
+            latitude = self._read_float(self.lat_edit, "Latitude")
+            longitude = self._read_float(self.lon_edit, "Longitude")
+            elevation = self._read_float(self.elev_edit, "Elevation")
+            if not -90.0 <= latitude <= 90.0:
+                raise ValueError("Latitude must be within [-90, 90].")
+            if not -180.0 <= longitude <= 180.0:
+                raise ValueError("Longitude must be within [-180, 180].")
+        except Exception as exc:
+            if show_errors:
+                QMessageBox.warning(self, "Invalid Coordinates", str(exc))
+            return False
+
+        site = Site(
+            name=new_name,
+            latitude=latitude,
+            longitude=longitude,
+            elevation=elevation,
+            limiting_magnitude=float(self.lim_mag_spin.value()),
+            custom_conditions_url=self.custom_conditions_url_edit.text().strip(),
+            telescope_diameter_mm=float(self.telescope_diameter_spin.value()) * 1000.0,
+            focal_length_mm=float(self.focal_length_spin.value()),
+            pixel_size_um=float(self.pixel_size_spin.value()),
+            detector_width_px=int(self.detector_width_spin.value()),
+            detector_height_px=int(self.detector_height_spin.value()),
+        )
+        if new_name != old_name:
+            self._sites.pop(old_name, None)
+            self._sites[new_name] = site
+            preset_key = str(self._site_preset_keys.pop(old_name, "custom") or "custom")
+            self._site_preset_keys[new_name] = preset_key
+            self._selected_name = new_name
+            self._refresh_list()
+        else:
+            self._sites[old_name] = site
+        self._update_optics_summary(site)
+        return True
+
+    def _on_limiting_mag_changed(self, _value: float) -> None:
+        if self._loading_fields or self._selected_name is None:
+            return
+        site = self._sites.get(self._selected_name)
+        if site is None:
+            return
+        site.limiting_magnitude = float(self.lim_mag_spin.value())
+        self._update_optics_summary(site)
+
+    @Slot()
+    def _on_optics_fields_changed(self, _value: object = None) -> None:
+        if self._loading_fields or self._selected_name is None:
+            return
+        site = self._sites.get(self._selected_name)
+        if site is None:
+            return
+        site.telescope_diameter_mm = float(self.telescope_diameter_spin.value()) * 1000.0
+        site.focal_length_mm = float(self.focal_length_spin.value())
+        site.pixel_size_um = float(self.pixel_size_spin.value())
+        site.detector_width_px = int(self.detector_width_spin.value())
+        site.detector_height_px = int(self.detector_height_spin.value())
+        self._update_optics_summary(site)
+
+    def _on_list_selection_changed(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
+        if self._list_sync:
+            return
+        if current is None:
+            self._selected_name = None
+            self._set_editors_enabled(False)
+            return
+        name = str(current.data(Qt.UserRole) or current.text()).strip()
+        site = self._sites.get(name)
+        if site is None:
+            self._selected_name = None
+            self._set_editors_enabled(False)
+            return
+        self._selected_name = name
+        self._loading_fields = True
+        try:
+            self._set_editors_enabled(True)
+            self.name_edit.setText(site.name)
+            self.lat_edit.setText(f"{site.latitude}")
+            self.lon_edit.setText(f"{site.longitude}")
+            self.elev_edit.setText(f"{site.elevation}")
+            self.lim_mag_spin.setValue(float(site.limiting_magnitude))
+            self.custom_conditions_url_edit.setText(str(site.custom_conditions_url or "").strip())
+            self.telescope_diameter_spin.setValue(float(site.telescope_diameter_mm) / 1000.0)
+            self.focal_length_spin.setValue(float(site.focal_length_mm))
+            self.pixel_size_spin.setValue(float(site.pixel_size_um))
+            self.detector_width_spin.setValue(int(site.detector_width_px))
+            self.detector_height_spin.setValue(int(site.detector_height_px))
+            self.lookup_info.setText("")
+            _set_label_tone(self.lookup_info, "info")
+            preset_key = str(self._site_preset_keys.get(name, "custom") or "custom")
+            displayed_preset_key = preset_key if preset_key in self._bhtom_preset_map else "custom"
+            self._preset_sync = True
+            try:
+                idx = self.preset_combo.findData(displayed_preset_key)
+                if idx < 0:
+                    idx = 0
+                self.preset_combo.setCurrentIndex(idx)
+            finally:
+                self._preset_sync = False
+            self._update_optics_summary(site)
+        finally:
+            self._loading_fields = False
+        self._apply_custom_mode_ui()
+
+    def _refresh_list(self) -> None:
+        query = self.search_edit.text().strip().lower()
+        previous = self._selected_name
+        names = sorted(self._sites.keys(), key=str.lower)
+        if query:
+            names = [name for name in names if query in name.lower()]
+
+        self._list_sync = True
+        try:
+            self.obs_list.clear()
+            for name in names:
+                item = QListWidgetItem(name)
+                item.setData(Qt.UserRole, name)
+                self.obs_list.addItem(item)
+        finally:
+            self._list_sync = False
+
+        target_name = previous if previous in names else (names[0] if names else None)
+        if target_name is None:
+            self.obs_list.setCurrentItem(None)
+            self._selected_name = None
+            self._set_editors_enabled(False)
+            return
+        for row in range(self.obs_list.count()):
+            item = self.obs_list.item(row)
+            if item is None:
+                continue
+            if str(item.data(Qt.UserRole) or item.text()) == target_name:
+                self.obs_list.setCurrentRow(row)
+                break
+
+    @Slot()
+    def _add_observatory(self) -> None:
+        if not self._store_current_site_from_editors(show_errors=True):
+            return
+        base = "New Observatory"
+        candidate = base
+        suffix = 2
+        while candidate in self._sites:
+            candidate = f"{base} {suffix}"
+            suffix += 1
+        template = self._sites.get(self._selected_name or "")
+        if template is None:
+            template = Site(
+                name=candidate,
+                latitude=0.0,
+                longitude=0.0,
+                elevation=0.0,
+                limiting_magnitude=DEFAULT_LIMITING_MAGNITUDE,
+                custom_conditions_url="",
+                telescope_diameter_mm=0.0,
+                focal_length_mm=0.0,
+                pixel_size_um=0.0,
+                detector_width_px=0,
+                detector_height_px=0,
+            )
+        self._sites[candidate] = Site(
+            name=candidate,
+            latitude=float(template.latitude),
+            longitude=float(template.longitude),
+            elevation=float(template.elevation),
+            limiting_magnitude=float(template.limiting_magnitude),
+            custom_conditions_url=str(template.custom_conditions_url or "").strip(),
+            telescope_diameter_mm=float(template.telescope_diameter_mm),
+            focal_length_mm=float(template.focal_length_mm),
+            pixel_size_um=float(template.pixel_size_um),
+            detector_width_px=int(template.detector_width_px),
+            detector_height_px=int(template.detector_height_px),
+        )
+        self._site_preset_keys[candidate] = "custom"
+        self._selected_name = candidate
+        self.search_edit.clear()
+        self._refresh_list()
+        self.name_edit.setFocus()
+        self.name_edit.selectAll()
+
+    @Slot()
+    def _remove_observatory(self) -> None:
+        name = self._selected_name
+        if not name:
+            return
+        if len(self._sites) <= 1:
+            QMessageBox.warning(self, "Cannot Remove", "At least one observatory must remain.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Remove Observatory",
+            f"Remove observatory '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self._sites.pop(name, None)
+        self._site_preset_keys.pop(name, None)
+        self._selected_name = None
+        self._refresh_list()
+
+    @Slot()
+    def _lookup_coordinates_for_current(self) -> None:
+        query = self.name_edit.text().strip()
+        if not query:
+            QMessageBox.warning(self, "Missing Name", "Enter observatory name first.")
+            return
+        if self._lookup_worker is not None and self._lookup_worker.isRunning():
+            return
+        parent = self.parent()
+        resolver = getattr(parent, "_lookup_observatory_coordinates", None)
+        if not callable(resolver):
+            QMessageBox.warning(self, "Lookup Unavailable", "Coordinate lookup is unavailable in this context.")
+            return
+        self._set_lookup_loading_state(True)
+        worker = ObservatoryLookupWorker(query=query, resolver=resolver, parent=self)
+        worker.completed.connect(self._on_lookup_worker_completed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda: setattr(self, "_lookup_worker", None))
+        self._lookup_worker = worker
+        worker.start()
+
+    @Slot()
+    def _accept_dialog(self) -> None:
+        if not self._store_current_site_from_editors(show_errors=True):
+            return
+        if not self._sites:
+            QMessageBox.warning(self, "No Observatories", "Add at least one observatory.")
+            return
+        self.accept()
+
+    @Slot()
+    def _save_to_config(self) -> None:
+        if not self._store_current_site_from_editors(show_errors=True):
+            return
+        if not self._sites:
+            QMessageBox.warning(self, "No Observatories", "Add at least one observatory.")
+            return
+        parent = self.parent()
+        saver = getattr(parent, "_save_custom_observatories", None)
+        if not callable(saver):
+            QMessageBox.warning(self, "Save Failed", "Saving observatory config is unavailable in this context.")
+            return
+        try:
+            saver(self.observatories(), preset_keys=self.preset_keys())
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Save Failed", str(exc))
+            return
+        if parent is not None and hasattr(parent, "_observatory_preset_keys"):
+            try:
+                parent._observatory_preset_keys = self.preset_keys()
+            except Exception:
+                pass
+        self.lookup_info.setText("Configuration saved.")
+        _set_label_tone(self.lookup_info, "success")
 
 
 class SuggestionTableModel(QAbstractTableModel):
@@ -1745,6 +10494,7 @@ class SuggestionTableModel(QAbstractTableModel):
         self,
         suggestions: list[dict[str, object]],
         moon_sep_threshold: float,
+        mag_warning_threshold: float = DEFAULT_LIMITING_MAGNITUDE,
         parent=None,
     ):
         super().__init__(parent)
@@ -1757,7 +10507,8 @@ class SuggestionTableModel(QAbstractTableModel):
         self._max_airmass = 99.0
         self._max_magnitude = 99.0
         self._moon_sep_threshold = float(moon_sep_threshold)
-        self._sort_column = self.COL_IMPORTANCE
+        self._mag_warning_threshold = float(mag_warning_threshold)
+        self._sort_column = self.COL_SCORE
         self._sort_order = Qt.DescendingOrder
         self._hover_row: Optional[int] = None
         self._hover_name_row: Optional[int] = None
@@ -1925,28 +10676,47 @@ class SuggestionTableModel(QAbstractTableModel):
                 return "This target has already been added to the current plan."
 
         if role == Qt.BackgroundRole:
+            hover_bg = _theme_color_from_widget(self, "table_hover_bg", "#ff3d78")
+            warning_bg = _theme_color_from_widget(self, "table_warning_bg", "#fff1a8")
+            action_done_bg = _theme_color_from_widget(self, "table_action_done_bg", "#e6f4ea")
+            action_hover_bg = _theme_color_from_widget(self, "table_action_hover_bg", "#d8e2ef")
+            action_bg = _theme_color_from_widget(self, "table_action_bg", "#c7d1dc")
             if row == self._hover_row:
-                return QBrush(QColor("#ff3d78"))
+                return QBrush(QColor(hover_bg))
             if col == self.COL_MOON_SEP and item.get("moon_sep_warning"):
-                return QBrush(QColor("#fff1a8"))
+                return QBrush(QColor(warning_bg))
             if col == self.COL_ACTION:
                 if item.get("added_to_plan"):
-                    return QBrush(QColor("#e6f4ea"))
+                    return QBrush(QColor(action_done_bg))
                 if row == self._hover_action_row:
-                    return QBrush(QColor("#d8e2ef"))
-                return QBrush(QColor("#c7d1dc"))
+                    return QBrush(QColor(action_hover_bg))
+                return QBrush(QColor(action_bg))
 
         if role == Qt.ForegroundRole:
-            if row == self._hover_row:
-                return QBrush(QColor("#ffcb3a"))
+            warning_text = _theme_color_from_widget(self, "table_warning_text", "#3f3200")
+            action_done_text = _theme_color_from_widget(self, "table_action_done_text", "#4f6f52")
+            action_hover_text = _theme_color_from_widget(self, "table_action_hover_text", "#17212b")
+            action_text = _theme_color_from_widget(self, "table_action_text", "#243241")
+            hover_name_text = _theme_color_from_widget(self, "accent_primary", "#59f3ff")
+            state_warning = _theme_color_from_widget(self, "state_warning", "#c9a227")
+            state_error = _theme_color_from_widget(self, "state_error", "#b85a5a")
+            if col == self.COL_NAME and row == self._hover_name_row:
+                return QBrush(QColor(hover_name_text))
+            if col == self.COL_MAG and target.magnitude is not None and math.isfinite(float(target.magnitude)):
+                mag_value = float(target.magnitude)
+                delta = abs(mag_value - self._mag_warning_threshold)
+                if delta <= 1.0:
+                    return QBrush(QColor(state_warning))
+                if mag_value > self._mag_warning_threshold:
+                    return QBrush(QColor(state_error))
             if col == self.COL_MOON_SEP and item.get("moon_sep_warning"):
-                return QBrush(QColor("#3f3200"))
+                return QBrush(QColor(warning_text))
             if col == self.COL_ACTION:
                 if item.get("added_to_plan"):
-                    return QBrush(QColor("#4f6f52"))
+                    return QBrush(QColor(action_done_text))
                 if row == self._hover_action_row:
-                    return QBrush(QColor("#17212b"))
-                return QBrush(QColor("#243241"))
+                    return QBrush(QColor(action_hover_text))
+                return QBrush(QColor(action_text))
 
         if role not in (Qt.DisplayRole, Qt.EditRole):
             return None
@@ -2086,6 +10856,7 @@ class SuggestedTargetsDialog(QDialog):
         suggestions: list[dict[str, object]],
         notes: list[str],
         moon_sep_threshold: float,
+        mag_warning_threshold: float,
         initial_score_filter: float,
         bhtom_base_url: str,
         add_callback: Callable[[Target], bool],
@@ -2095,7 +10866,13 @@ class SuggestedTargetsDialog(QDialog):
         super().__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("Suggested Targets")
-        self.resize(1280, 680)
+        _fit_dialog_to_screen(
+            self,
+            preferred_width=1460,
+            preferred_height=860,
+            min_width=1180,
+            min_height=720,
+        )
         self._add_callback = add_callback
         self._reload_callback = reload_callback
         self._bhtom_base_url = bhtom_base_url.rstrip("/")
@@ -2120,6 +10897,7 @@ class SuggestedTargetsDialog(QDialog):
 
         self.summary_label = QLabel(self)
         self.summary_label.setWordWrap(True)
+        _set_label_tone(self.summary_label, "muted")
         layout.addWidget(self.summary_label)
 
         filters_row = QHBoxLayout()
@@ -2180,18 +10958,29 @@ class SuggestedTargetsDialog(QDialog):
         filters_row.addStretch(1)
         self.reset_filters_btn = QPushButton("Reset", self)
         self.reset_filters_btn.setToolTip("Restore the default suggested-target filters.")
+        _set_button_variant(self.reset_filters_btn, "ghost")
+        _set_button_icon_kind(self.reset_filters_btn, "clear")
         filters_row.addWidget(self.reset_filters_btn)
         self.reload_btn = QPushButton("Reload", self)
         self.reload_btn.setToolTip("Fetch a fresh BHTOM target list and rebuild suggestions.")
         self.reload_btn.setEnabled(self._reload_callback is not None)
+        _set_button_variant(self.reload_btn, "secondary")
+        _set_button_icon_kind(self.reload_btn, "refresh")
         filters_row.addWidget(self.reload_btn)
         layout.addLayout(filters_row)
 
         self._restore_filter_settings()
 
-        self.table_model = SuggestionTableModel(suggestions, moon_sep_threshold, self)
+        self.table_model = SuggestionTableModel(
+            suggestions,
+            moon_sep_threshold,
+            mag_warning_threshold=mag_warning_threshold,
+            parent=self,
+        )
         self.table_view = QTableView(self)
+        self.table_view.setObjectName("SuggestionTable")
         self.table_view.setModel(self.table_model)
+        self.table_view.setItemDelegate(SuggestedTargetsDelegate(self.table_view))
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.setSelectionMode(QTableView.SingleSelection)
         self.table_view.setSortingEnabled(True)
@@ -2199,7 +10988,11 @@ class SuggestedTargetsDialog(QDialog):
         self.table_view.setHorizontalScrollMode(QTableView.ScrollPerPixel)
         self.table_view.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.table_view.setMouseTracking(True)
+        self.table_view.setAttribute(Qt.WA_Hover, True)
+        self.table_view.viewport().setMouseTracking(True)
+        self.table_view.viewport().setAttribute(Qt.WA_Hover, True)
         self.table_view.verticalHeader().setVisible(False)
+        self.table_view.setAlternatingRowColors(True)
         self.table_view.setShowGrid(False)
         self.table_view.viewport().installEventFilter(self)
         header = self.table_view.horizontalHeader()
@@ -2220,7 +11013,14 @@ class SuggestedTargetsDialog(QDialog):
         self.table_view.setColumnWidth(SuggestionTableModel.COL_WINDOW, 140)
         self.table_view.setColumnWidth(SuggestionTableModel.COL_MOON_SEP, 90)
         self.table_view.setColumnWidth(SuggestionTableModel.COL_ACTION, 74)
-        layout.addWidget(self.table_view, 1)
+        self.table_loading_widget = self._build_table_loading_placeholder("Loading BHTOM targets…")
+        self.table_stack_host = QWidget(self)
+        self.table_stack = QStackedLayout(self.table_stack_host)
+        self.table_stack.setContentsMargins(0, 0, 0, 0)
+        self.table_stack.addWidget(self.table_loading_widget)
+        self.table_stack.addWidget(self.table_view)
+        self.table_stack.setCurrentWidget(self.table_view)
+        layout.addWidget(self.table_stack_host, 1)
 
         self.notes_label = QLabel(self)
         self.notes_label.setWordWrap(True)
@@ -2230,6 +11030,7 @@ class SuggestedTargetsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
+        _style_dialog_button_box(buttons)
         layout.addWidget(buttons)
 
         self.importance_spin.valueChanged.connect(self._apply_filters)
@@ -2244,8 +11045,58 @@ class SuggestedTargetsDialog(QDialog):
         self.table_view.clicked.connect(self._on_table_clicked)
         self.table_view.entered.connect(self._on_table_entered)
 
-        self.table_view.sortByColumn(SuggestionTableModel.COL_IMPORTANCE, Qt.DescendingOrder)
+        self.table_view.sortByColumn(SuggestionTableModel.COL_SCORE, Qt.DescendingOrder)
         self._apply_filters()
+
+    def _build_table_loading_placeholder(self, message: str) -> QWidget:
+        widget = QWidget(self)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        card = QFrame(widget)
+        card.setObjectName("VisibilityLoadingCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 18, 20, 18)
+        card_layout.setSpacing(14)
+        title = QLabel("Suggested Targets", card)
+        title.setObjectName("SectionTitle")
+        title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        skeleton = SkeletonShimmerWidget("table", card)
+        skeleton.setMinimumHeight(380)
+        hint_label = QLabel(message, card)
+        hint_label.setObjectName("SectionHint")
+        hint_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        hint_label.setWordWrap(True)
+        card_layout.addWidget(title)
+        card_layout.addWidget(skeleton, 1)
+        card_layout.addWidget(hint_label)
+        layout.addWidget(card, 1)
+        widget._loading_hint_label = hint_label  # type: ignore[attr-defined]
+        return widget
+
+    def set_loading_state(self, loading: bool, message: str = "") -> None:
+        is_loading = bool(loading)
+        hint_label = getattr(self.table_loading_widget, "_loading_hint_label", None)
+        if message and isinstance(hint_label, QLabel):
+            hint_label.setText(message)
+        self.table_view.setEnabled(not is_loading)
+        if is_loading:
+            self.table_model.set_hover_row(None)
+            self.table_model.set_name_hover_row(None)
+            self.table_model.set_action_hover_row(None)
+            self.table_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            self.table_stack.setCurrentWidget(self.table_loading_widget)
+            return
+        self.table_stack.setCurrentWidget(self.table_view)
+
+    def update_suggestions(self, suggestions: list[dict[str, object]], notes: list[str]) -> None:
+        self._notes = list(notes)
+        self.table_model.replace_suggestions(suggestions)
+        self.table_view.setColumnWidth(
+            SuggestionTableModel.COL_NAME,
+            self._default_name_column_width(suggestions),
+        )
+        self._refresh_dialog_state()
 
     def _default_name_column_width(self, suggestions: list[dict[str, object]]) -> int:
         name_font = QFont(self.table_view.font())
@@ -2357,13 +11208,7 @@ class SuggestedTargetsDialog(QDialog):
             QApplication.restoreOverrideCursor()
             self.reload_btn.setEnabled(True)
 
-        self._notes = notes
-        self.table_model.replace_suggestions(suggestions)
-        self.table_view.setColumnWidth(
-            SuggestionTableModel.COL_NAME,
-            self._default_name_column_width(suggestions),
-        )
-        self._refresh_dialog_state()
+        self.update_suggestions(suggestions, notes)
 
     @Slot()
     def _refresh_dialog_state(self) -> None:
@@ -2416,11 +11261,15 @@ class SuggestedTargetsDialog(QDialog):
         )
 
     def eventFilter(self, watched, event):  # noqa: D401
-        if watched is self.table_view.viewport() and event.type() == QEvent.Type.Leave:
-            self.table_model.set_hover_row(None)
-            self.table_model.set_name_hover_row(None)
-            self.table_model.set_action_hover_row(None)
-            self.table_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        if watched is self.table_view.viewport():
+            if event.type() in (QEvent.Type.MouseMove, QEvent.Type.HoverMove):
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                self._on_table_entered(self.table_view.indexAt(pos))
+            elif event.type() == QEvent.Type.Leave:
+                self.table_model.set_hover_row(None)
+                self.table_model.set_name_hover_row(None)
+                self.table_model.set_action_hover_row(None)
+                self.table_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         return super().eventFilter(watched, event)
 
     def _open_bhtom_target(self, row: int) -> None:
@@ -2448,6 +11297,7 @@ class AstronomyWorker(QThread):
     """Runs astroplan calculations off the GUI thread."""
 
     finished: Signal = Signal(dict)  # payload with curves & events
+    aborted: Signal = Signal()
 
     _cache: dict = {}
 
@@ -2461,6 +11311,10 @@ class AstronomyWorker(QThread):
     def run(self) -> None:  # noqa: D401
         obs_date = self.settings.date
         site = self.settings.site
+        site_key = (
+            f"{site.name}|{site.latitude:.6f}|{site.longitude:.6f}|{site.elevation:.1f}|"
+            f"{obs_date.toString('yyyy-MM-dd')}|{self.settings.time_samples}|{self.settings.limit_altitude:.1f}"
+        )
         observer = Observer(location=site.to_earthlocation(), timezone=site.timezone_name)
 
         # Caching key: site coords + elevation + calendar date + sample count
@@ -2476,6 +11330,10 @@ class AstronomyWorker(QThread):
         next_mid = datetime(obs_date.year(), obs_date.month(), obs_date.day(), 0, 0) + timedelta(days=1)
         local_mid_dt = tz.localize(next_mid)
         midnight = Time(local_mid_dt)
+
+        if self.isInterruptionRequested():
+            self.aborted.emit()
+            return
 
         if (
             key in cache
@@ -2535,6 +11393,9 @@ class AstronomyWorker(QThread):
             moon_ras = []
             moon_decs = []
             for t in times.datetime:
+                if self.isInterruptionRequested():
+                    self.aborted.emit()
+                    return
                 # PyEphem expects UTC datetime
                 eph_observer.date = t
                 sun.compute(eph_observer)
@@ -2559,11 +11420,15 @@ class AstronomyWorker(QThread):
 
         # Start payload with cached/global events
         payload: dict[str, object] = {k: v for k, v in {"times": jd, **events}.items()}
+        payload["site_key"] = site_key
         moon_coords = SkyCoord(
             ra=np.array(events["moon_ra"]) * u.deg,
             dec=np.array(events["moon_dec"]) * u.deg,
         )
         for tgt in self.targets:
+            if self.isInterruptionRequested():
+                self.aborted.emit()
+                return
             fixed = FixedTarget(name=tgt.name, coord=tgt.skycoord)
             altaz = observer.altaz(times, fixed)
             moon_sep = tgt.skycoord.separation(moon_coords).deg
@@ -2586,25 +11451,57 @@ class AstronomyWorker(QThread):
 class LLMConfig:
     """Configuration for a local OpenAI-compatible inference server."""
 
-    DEFAULT_URL = "http://localhost:8080"
-    DEFAULT_MODEL = "bitnet-b1.58-3b"
-    DEFAULT_TIMEOUT_S = 45
+    DEFAULT_URL = "http://localhost:11434"
+    DEFAULT_MODEL = "gemma4:e4b"
+    DEFAULT_TIMEOUT_S = 180
+    DEFAULT_MAX_TOKENS = 192
+    DEFAULT_WARMUP_MAX_TOKENS = 8
+    DEFAULT_TEMPERATURE = 0.2
+    DEFAULT_CHAT_FONT_PT = 12
+    DEFAULT_CHAT_SPACING = "comfortable"
+    DEFAULT_CHAT_TINT_STRENGTH = "medium"
+    DEFAULT_CHAT_WIDTH = "normal"
+    DEFAULT_STATUS_ERROR_CLEAR_S = 8
 
     def __init__(
         self,
         url: str = DEFAULT_URL,
         model: str = DEFAULT_MODEL,
         timeout_s: int = DEFAULT_TIMEOUT_S,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> None:
         normalized_url = str(url or self.DEFAULT_URL).strip().rstrip("/")
         normalized_model = str(model or self.DEFAULT_MODEL).strip()
         self.url = normalized_url or self.DEFAULT_URL
         self.model = normalized_model or self.DEFAULT_MODEL
         self.timeout_s = max(5, int(timeout_s))
+        self.max_tokens = max(32, int(max_tokens))
+
+
+AI_CHAT_SPACING_CHOICES = [
+    ("compact", "Compact"),
+    ("comfortable", "Comfortable"),
+]
+
+AI_CHAT_TINT_CHOICES = [
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+]
+
+AI_CHAT_WIDTH_CHOICES = [
+    ("narrow", "Narrow"),
+    ("normal", "Normal"),
+    ("wide", "Wide"),
+]
 
 
 class LLMWorker(QThread):
     """Send a single prompt to a local OpenAI-compatible server."""
+
+    TRUNCATION_NOTE = (
+        "[Response truncated by token limit. Increase `LLM max tokens` in Settings -> General Settings -> AI if needed.]"
+    )
 
     responseReady = Signal(str, str)  # (tag, text)
     responseChunk = Signal(str, str)  # (tag, delta)
@@ -2684,11 +11581,35 @@ class LLMWorker(QThread):
                 return "".join(parts)
         return ""
 
-    def _consume_sse_stream(self, response) -> str:
+    @staticmethod
+    def _extract_finish_reason(data: object) -> str:
+        if not isinstance(data, dict):
+            return ""
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        finish_reason = first.get("finish_reason")
+        return finish_reason if isinstance(finish_reason, str) else ""
+
+    @classmethod
+    def _append_truncation_note(cls, text: str) -> str:
+        normalized = str(text).rstrip()
+        if not normalized:
+            return cls.TRUNCATION_NOTE
+        if cls.TRUNCATION_NOTE in normalized:
+            return normalized
+        return f"{normalized}\n\n{cls.TRUNCATION_NOTE}"
+
+    def _consume_sse_stream(self, response) -> tuple[str, str]:
         chunks: list[str] = []
         event_lines: list[str] = []
+        finish_reason = ""
 
         def _flush_event() -> bool:
+            nonlocal finish_reason
             if not event_lines:
                 return False
             payload_text = "\n".join(event_lines).strip()
@@ -2701,6 +11622,9 @@ class LLMWorker(QThread):
                 decoded = json.loads(payload_text)
             except json.JSONDecodeError:
                 return False
+            extracted_finish_reason = self._extract_finish_reason(decoded)
+            if extracted_finish_reason:
+                finish_reason = extracted_finish_reason
             delta = self._extract_delta_content(decoded)
             if delta:
                 chunks.append(delta)
@@ -2726,7 +11650,19 @@ class LLMWorker(QThread):
 
         if not self.isInterruptionRequested() and event_lines:
             _flush_event()
-        return "".join(chunks)
+        return "".join(chunks), finish_reason
+
+    def _request_generation_params(self) -> dict[str, object]:
+        if self.tag == "warmup":
+            max_tokens = int(self.config.DEFAULT_WARMUP_MAX_TOKENS)
+        else:
+            max_tokens = int(self.config.max_tokens)
+        return {
+            "max_tokens": max_tokens,
+            "temperature": float(self.config.DEFAULT_TEMPERATURE),
+            "reasoning_effort": "none",
+            "stream": True,
+        }
 
     def run(self) -> None:  # noqa: D401
         if self.isInterruptionRequested():
@@ -2735,13 +11671,12 @@ class LLMWorker(QThread):
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages.append({"role": "user", "content": self.prompt})
+        generation_params = self._request_generation_params()
         payload = json.dumps(
             {
                 "model": self.config.model,
                 "messages": messages,
-                "max_tokens": 1024,
-                "temperature": 0.7,
-                "stream": True,
+                **generation_params,
             }
         ).encode("utf-8")
         request = Request(
@@ -2754,11 +11689,14 @@ class LLMWorker(QThread):
             with urlopen(request, timeout=self.config.timeout_s) as response:
                 content_type = response.headers.get("Content-Type", "")
                 if "text/event-stream" in content_type:
-                    text = self._consume_sse_stream(response)
+                    text, finish_reason = self._consume_sse_stream(response)
                 else:
                     body = response.read().decode("utf-8", errors="replace")
                     decoded = json.loads(body)
+                    finish_reason = self._extract_finish_reason(decoded)
                     text = self._extract_content(decoded)
+            if finish_reason == "length" and self.tag != "warmup":
+                text = self._append_truncation_note(text)
             if not text:
                 raise RuntimeError("LLM response does not contain message content.")
             self.responseReady.emit(self.tag, text)
@@ -2776,7 +11714,7 @@ class LLMWorker(QThread):
             reason = getattr(exc, "reason", str(exc))
             self.errorOccurred.emit(
                 f"Cannot reach LLM server at {self.config.url}: {reason}\n"
-                "Start your local server and verify URL/model in Settings -> General Settings."
+                "Start Ollama, or run the optional Docker profile (`make llm-up-docker`), and verify URL/model in Settings -> General Settings."
             )
         except Exception as exc:  # noqa: BLE001
             self.errorOccurred.emit(f"LLM request failed ({type(exc).__name__}): {exc}")
@@ -2796,9 +11734,10 @@ class TargetTableModel(QAbstractTableModel):
     COL_MOON_SEP = 7
     COL_SCORE = 8
     COL_HOURS = 9
-    COL_PRIORITY = 10
-    COL_OBSERVED = 11
-    COL_ACTIONS = 12
+    COL_MAG = 10
+    COL_PRIORITY = 11
+    COL_OBSERVED = 12
+    COL_ACTIONS = 13
     headers = [
         "Order",
         "Name",
@@ -2810,17 +11749,19 @@ class TargetTableModel(QAbstractTableModel):
         "Moon Sep (°)",
         "Score",
         "Over Lim (h)",
+        "Last Mag/Mag",
         "Pri",
         "Obs",
         "Actions",
     ]
 
-    def __init__(self, targets: List[Target], site: Optional[Site] = None):
-        super().__init__()
+    def __init__(self, targets: List[Target], site: Optional[Site] = None, parent=None):
+        super().__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self._targets = targets
         self.site = site
         self.limit: float | None = None
+        self.color_mode = "text_glow"
         # Cached current values for table display
         self.order_values: list[int] = []
         self.current_alts: list[float] = []
@@ -2848,6 +11789,83 @@ class TargetTableModel(QAbstractTableModel):
         if len(self.row_enabled) < n:
             self.row_enabled.extend([True] * (n - len(self.row_enabled)))
 
+    @staticmethod
+    def _optional_float_key(value: object, descending: bool) -> tuple[int, float]:
+        number = _safe_float(value)
+        if number is None or not math.isfinite(number):
+            return (1, 0.0)
+        return (0, -float(number) if descending else float(number))
+
+    def _table_surface_color(self) -> QColor:
+        return _theme_qcolor_from_widget(self, "table_surface", "#0e1622")
+
+    def _table_alt_surface_color(self) -> QColor:
+        return _theme_qcolor_from_widget(self, "table_surface_alt", "#101a28")
+
+    def _table_color_mode(self) -> str:
+        mode = str(getattr(self, "color_mode", "text_glow") or "text_glow").strip().lower()
+        return mode if mode in {"background", "text_glow"} else "text_glow"
+
+    def _boost_table_tint(self, color: QColor, *, strong: bool = False) -> QColor:
+        out = QColor(color)
+        if not out.isValid():
+            return out
+        dark_surface = self._table_surface_color().lightness() < 128
+        min_alpha = 214 if strong else (160 if dark_surface else 108)
+        if out.alpha() < min_alpha:
+            out.setAlpha(min_alpha)
+        return out
+
+    def _status_color(self, row: int) -> Optional[QColor]:
+        if not (self.site and self.limit is not None):
+            return None
+        alt = self.current_alts[row] if row < len(self.current_alts) else float("nan")
+        if math.isnan(alt):
+            return None
+        hc = getattr(self, "highlight_colors", {})
+        if alt < 0:
+            color = QColor(hc.get("below", QColor(_theme_color_from_widget(self, "table_status_red", "#ff8080"))))
+        elif alt < self.limit:
+            color = QColor(hc.get("limit", QColor(_theme_color_from_widget(self, "table_status_yellow", "#ffff80"))))
+        else:
+            color = QColor(hc.get("above", QColor(_theme_color_from_widget(self, "table_status_green", "#b3ffb3"))))
+        return color if color.isValid() else None
+
+    def _cell_background_color(self, row: int, col: int, tgt: Target, row_is_enabled: bool) -> Optional[QColor]:
+        if not row_is_enabled:
+            return self._boost_table_tint(_theme_qcolor_from_widget(self, "table_disabled_bg", "#ececec"))
+
+        if not (self.site and self.limit is not None):
+            return None
+
+        alt = self.current_alts[row] if row < len(self.current_alts) else float("nan")
+        if math.isnan(alt):
+            return None
+
+        if self._table_color_mode() == "text_glow":
+            return None
+
+        colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        fallback_css = colors[row % len(colors)] if colors else "#4da3ff"
+        plot_css = _normalized_css_color(tgt.plot_color) or fallback_css
+        plot_color = QColor(plot_css)
+
+        if col == self.COL_ALT:
+            status_color = self._status_color(row)
+            if status_color is not None:
+                return self._boost_table_tint(status_color, strong=True)
+
+        if col == self.COL_NAME:
+            brush_color = self.color_map.get(tgt.name)
+            if brush_color and brush_color.isValid():
+                return brush_color
+            return plot_color if plot_color.isValid() else None
+
+        status_color = self._status_color(row)
+        if status_color is not None:
+            return self._boost_table_tint(status_color)
+        return None
+
     def reset_targets(self, targets: list[Target]) -> None:
         self.beginResetModel()
         self._targets[:] = targets
@@ -2858,6 +11876,7 @@ class TargetTableModel(QAbstractTableModel):
         self.scores = []
         self.hours_above_limit = []
         self.row_enabled = []
+        self.color_map.clear()
         self.endResetModel()
 
     def append_target(self, target: Target) -> None:
@@ -2873,7 +11892,9 @@ class TargetTableModel(QAbstractTableModel):
             if not (0 <= row < len(self._targets)):
                 continue
             self.beginRemoveRows(QModelIndex(), row, row)
-            removed.append(self._targets.pop(row))
+            removed_target = self._targets.pop(row)
+            removed.append(removed_target)
+            self.color_map.pop(removed_target.name, None)
             if row < len(self.order_values):
                 self.order_values.pop(row)
             if row < len(self.current_alts):
@@ -2906,6 +11927,7 @@ class TargetTableModel(QAbstractTableModel):
         col = index.column()
         row = index.row()
         row_is_enabled = self.row_enabled[row] if row < len(self.row_enabled) else True
+        cell_bg = self._cell_background_color(row, col, tgt, row_is_enabled)
 
         # Center-align all cell text except left-align names
         if role == Qt.TextAlignmentRole:
@@ -2925,50 +11947,30 @@ class TargetTableModel(QAbstractTableModel):
             ha_angle = Angle(ha, u.hour)
             return ha_angle.to_string(unit=u.hour, sep=":", pad=True, precision=0)
 
-        if role == Qt.BackgroundRole and not row_is_enabled:
-            return QBrush(QColor("#ececec"))
-
-        # Combined row background and per-cell highlights
-        if role == Qt.BackgroundRole and self.site and self.limit is not None:
-            alt = self.current_alts[row] if row < len(self.current_alts) else float("nan")
-            if math.isnan(alt):
-                return None
-
-            # Plot line color for this target (custom per object or palette fallback)
-            colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-            fallback_css = colors[row % len(colors)] if colors else "#4da3ff"
-            plot_css = _normalized_css_color(tgt.plot_color) or fallback_css
-            plot_color = QColor(plot_css)
-
-            # Highlight in Alt column using user-configured colors
-            if col == self.COL_ALT:
-                hc = getattr(self, "highlight_colors", {})
-                if alt < 0:
-                    return QBrush(hc.get("below", QColor("#ff8080")))
-                if alt < self.limit:
-                    return QBrush(hc.get("limit", QColor("#ffff80")))
-                return QBrush(hc.get("above", QColor("#b3ffb3")))
-
-            # Name cell colored by plot color
-            if col == self.COL_NAME:
-                # Use stored color_map for consistent colors across sort
-                brush_color = self.color_map.get(tgt.name)
-                if brush_color:
-                    return QBrush(brush_color)
-                # Fallback to default by-row color
-                return QBrush(plot_color)
-
-            # 3) Otherwise, soft row background
-            if alt >= self.limit:
-                return QBrush(QColor("#d4ffd4"))
-            if alt > 0:
-                return QBrush(QColor("#fff5d4"))
-            return QBrush(QColor("#ffd4d4"))
+        if role == Qt.BackgroundRole and cell_bg is not None and cell_bg.isValid():
+            return QBrush(cell_bg)
 
         if role == Qt.ForegroundRole:
             if not row_is_enabled:
-                return QBrush(QColor("#777777"))
-            return QBrush(QColor("#000000"))
+                return QBrush(QColor(_theme_color_from_widget(self, "table_disabled_text", "#777777")))
+            if self._table_color_mode() == "text_glow":
+                if col == self.COL_NAME:
+                    name_color = QColor(self.color_map.get(tgt.name, QColor()))
+                    if not name_color.isValid():
+                        custom_css = _normalized_css_color(tgt.plot_color)
+                        if custom_css:
+                            name_color = QColor(custom_css)
+                    if name_color.isValid():
+                        return QBrush(name_color)
+                status_color = self._status_color(row)
+                if status_color is not None and status_color.isValid():
+                    status_fg = QColor(status_color)
+                    status_fg = status_fg.lighter(118)
+                    status_fg.setAlpha(255)
+                    return QBrush(status_fg)
+            if cell_bg is not None and cell_bg.isValid():
+                return QBrush(_contrast_text_for_background(cell_bg, table_bg=self._table_surface_color()))
+            return QBrush(QColor(_theme_color_from_widget(self, "base_text", "#000000")))
 
         if role == Qt.ToolTipRole and col == self.COL_NAME:
             display_type = tgt.object_type
@@ -3036,6 +12038,8 @@ class TargetTableModel(QAbstractTableModel):
             return f"{self.scores[row]:.1f}" if row < len(self.scores) else "0.0"
         if col == self.COL_HOURS:
             return f"{self.hours_above_limit[row]:.2f}" if row < len(self.hours_above_limit) else "0.00"
+        if col == self.COL_MAG:
+            return f"{tgt.magnitude:.2f}" if tgt.magnitude is not None else "-"
         if col == self.COL_PRIORITY:
             return str(tgt.priority)
         if col == self.COL_OBSERVED:
@@ -3097,6 +12101,8 @@ class TargetTableModel(QAbstractTableModel):
             rows.sort(key=lambda r: r["score"], reverse=reverse)
         elif column == self.COL_HOURS:
             rows.sort(key=lambda r: r["hours"], reverse=reverse)
+        elif column == self.COL_MAG:
+            rows.sort(key=lambda r: self._optional_float_key(r["target"].magnitude, reverse))
         elif column == self.COL_PRIORITY:
             rows.sort(key=lambda r: r["target"].priority, reverse=reverse)
         elif column == self.COL_OBSERVED:
@@ -3205,6 +12211,19 @@ class TargetTableModel(QAbstractTableModel):
 # --------------------------------------------------
 class MainWindow(QMainWindow):
     darkModeChanged = Signal(bool)
+    bhtom_observatory_presets_changed = Signal(list, str)
+    bhtom_observatory_presets_loading = Signal(bool, str)
+
+    def eventFilter(self, watched, event):  # noqa: D401
+        if hasattr(self, "ai_output") and watched is self.ai_output.viewport():
+            if event.type() == QEvent.Type.Resize:
+                new_width = int(self.ai_output.viewport().width())
+                last_width = int(getattr(self, "_ai_output_last_viewport_width", 0))
+                if abs(new_width - last_width) >= 8:
+                    self._ai_output_last_viewport_width = new_width
+                    if getattr(self, "_ai_messages", None):
+                        QTimer.singleShot(0, self._render_ai_messages)
+        return super().eventFilter(watched, event)
 
     def _update_night_details_constraints(self):
         if not hasattr(self, "info_widget") or not hasattr(self, "info_card"):
@@ -3224,7 +12243,25 @@ class MainWindow(QMainWindow):
         if hasattr(self, "right_dashboard"):
             self.right_dashboard.setMinimumWidth(max(460, card_min_w + 22))
 
+    def _ensure_display_font_loaded(self) -> None:
+        global _DISPLAY_FONT_LOADED
+        if _DISPLAY_FONT_LOADED:
+            return
+        if not _DISPLAY_FONT_PATH.exists():
+            return
+        try:
+            mpl_font_manager.fontManager.addfont(str(_DISPLAY_FONT_PATH))
+        except Exception:
+            pass
+        try:
+            font_id = QFontDatabase.addApplicationFont(str(_DISPLAY_FONT_PATH))
+        except Exception:
+            font_id = -1
+        if font_id >= 0:
+            _DISPLAY_FONT_LOADED = True
+
     def _pick_font_family(self, candidates: list[str]) -> str:
+        self._ensure_display_font_loaded()
         available = set(QFontDatabase.families())
         for family in candidates:
             if family in available:
@@ -3243,41 +12280,227 @@ class MainWindow(QMainWindow):
         if enabled == getattr(self, "_dark_enabled", False):
             if persist:
                 self.settings.setValue("general/darkMode", enabled)
+            self._sync_dark_mode_menu_action()
             return
         self._dark_enabled = enabled
         if persist:
             self.settings.setValue("general/darkMode", self._dark_enabled)
         self._apply_styles()
+        self._sync_dark_mode_menu_action()
         self.darkModeChanged.emit(self._dark_enabled)
+
+    def _sync_dark_mode_menu_action(self) -> None:
+        if not hasattr(self, "dark_act"):
+            return
+        blocker = QSignalBlocker(self.dark_act)
+        self.dark_act.setChecked(bool(getattr(self, "_dark_enabled", False)))
+        del blocker
+
+    def _theme_color(self, key: str, fallback: str) -> str:
+        tokens = getattr(self, "_theme_tokens", {})
+        value = tokens.get(key) if isinstance(tokens, dict) else None
+        return str(value or fallback)
+
+    def _theme_qcolor(self, key: str, fallback: str) -> QColor:
+        raw = self._theme_color(key, fallback)
+        match = re.fullmatch(
+            r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*([0-9.]+))?\s*\)",
+            raw,
+        )
+        if match:
+            red = max(0, min(255, int(match.group(1))))
+            green = max(0, min(255, int(match.group(2))))
+            blue = max(0, min(255, int(match.group(3))))
+            alpha_group = match.group(4)
+            alpha = 255
+            if alpha_group is not None:
+                try:
+                    alpha_value = float(alpha_group)
+                    alpha = int(round(255 * alpha_value)) if alpha_value <= 1.0 else int(round(alpha_value))
+                except ValueError:
+                    alpha = 255
+                alpha = max(0, min(255, alpha))
+            return QColor(red, green, blue, alpha)
+        color = QColor(raw)
+        if color.isValid():
+            return color
+        return QColor(fallback)
+
+    def _accent_secondary_settings_key(self, theme_key: str | None = None) -> str:
+        normalized = normalize_theme_key(theme_key or getattr(self, "_theme_name", DEFAULT_UI_THEME))
+        return f"general/accentSecondaryColorByTheme/{normalized}"
+
+    def _load_accent_secondary_override(self, theme_key: str | None = None, *, migrate_legacy: bool = True) -> str:
+        normalized = normalize_theme_key(theme_key or getattr(self, "_theme_name", DEFAULT_UI_THEME))
+        per_theme_key = self._accent_secondary_settings_key(normalized)
+        stored = _normalized_css_color(self.settings.value(per_theme_key, "", type=str))
+        if stored:
+            return stored
+        if not migrate_legacy:
+            return ""
+        legacy = _normalized_css_color(self.settings.value("general/accentSecondaryColor", "", type=str))
+        active_theme = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
+        if legacy and normalized == active_theme:
+            self.settings.setValue(per_theme_key, legacy)
+            return legacy
+        return ""
+
+    def _save_accent_secondary_override(self, theme_key: str, color: str) -> None:
+        normalized = normalize_theme_key(theme_key)
+        per_theme_key = self._accent_secondary_settings_key(normalized)
+        normalized_color = _normalized_css_color(color)
+        if normalized_color:
+            self.settings.setValue(per_theme_key, normalized_color)
+        else:
+            self.settings.remove(per_theme_key)
+        self.settings.remove("general/accentSecondaryColor")
+
+    def _refresh_mpl_theme(self) -> None:
+        plot_bg = self._theme_color("plot_bg", "#0f1825")
+        plot_panel_bg = self._theme_color("plot_panel_bg", "#162334")
+        plot_text = self._theme_color("plot_text", "#d7e4f0")
+        plot_grid = self._theme_color("plot_grid", "#2f4666")
+        if hasattr(self, "plot_canvas") and hasattr(self, "ax_alt"):
+            self.plot_canvas.figure.patch.set_facecolor(plot_bg)
+            self.ax_alt.set_facecolor(plot_panel_bg)
+            self.ax_alt.tick_params(axis="x", colors=plot_text)
+            self.ax_alt.tick_params(axis="y", colors=plot_text)
+            for spine in self.ax_alt.spines.values():
+                spine.set_color(plot_grid)
+            self.ax_alt.xaxis.label.set_color(plot_text)
+            self.ax_alt.yaxis.label.set_color(plot_text)
+            self.ax_alt.title.set_color(plot_text)
+        if hasattr(self, "polar_canvas") and hasattr(self, "polar_ax"):
+            self.polar_canvas.figure.patch.set_facecolor(plot_bg)
+            self.polar_ax.set_facecolor(plot_panel_bg)
+            self.polar_ax.tick_params(axis="x", colors=plot_text, pad=0)
+            self.polar_ax.tick_params(axis="y", colors=plot_text, pad=1)
+            self.polar_ax.grid(True, color=plot_grid, alpha=0.36, linestyle="--", linewidth=0.7)
+            for spine in self.polar_ax.spines.values():
+                spine.set_color(plot_grid)
+            if hasattr(self, "polar_scatter"):
+                self.polar_scatter.set_color(self._theme_color("polar_target", "#59f3ff"))
+            if hasattr(self, "selected_scatter"):
+                self.selected_scatter.set_color(self._theme_color("polar_selected", "#ff4fd8"))
+            if hasattr(self, "sun_marker"):
+                self.sun_marker.set_color(self._theme_color("polar_sun", "#ffb224"))
+            if hasattr(self, "moon_marker"):
+                self.moon_marker.set_color(self._theme_color("polar_moon", "#dbe7ff"))
+            if hasattr(self, "radar_sweep_line") and self.radar_sweep_line is not None:
+                self.radar_sweep_line.set_color(self._qcolor_rgba_mpl(self._theme_qcolor("accent_secondary", "#ff4fd8"), 0.0))
+            if hasattr(self, "radar_sweep_glow_line") and self.radar_sweep_glow_line is not None:
+                self.radar_sweep_glow_line.set_color(self._qcolor_rgba_mpl(self._theme_qcolor("accent_secondary_soft", "#d38cff"), 0.48))
+            if hasattr(self, "radar_sweep_core") and self.radar_sweep_core is not None:
+                self.radar_sweep_core.set_visible(False)
+            if hasattr(self, "radar_sweep_mesh") and self.radar_sweep_mesh is not None:
+                try:
+                    self.radar_sweep_mesh.set_cmap(self._build_radar_sweep_cmap())
+                except Exception:
+                    pass
+            if hasattr(self, "_radar_echo_artists") or hasattr(self, "radar_sweep_mesh") or (hasattr(self, "radar_echo_scatter") and self.radar_echo_scatter is not None):
+                self._refresh_radar_sweep_artists(redraw=False)
+        if hasattr(self, "plot_canvas"):
+            self.plot_canvas.draw_idle()
+        if hasattr(self, "polar_canvas"):
+            self.polar_canvas.draw_idle()
 
     def _apply_styles(self):
         """Apply a custom stylesheet, fonts, and default icon sizes."""
-        body_family = self._pick_font_family(
-            ["SF Pro Text", "Avenir Next", "Inter", "Segoe UI", "Noto Sans", "Helvetica Neue", "Arial"]
-        )
         display_family = self._pick_font_family(
-            ["SF Pro Display", "Avenir Next", "Inter", "Segoe UI Semibold", body_family]
+            ["Rajdhani", "SF Pro Display", "Avenir Next", "Inter", "Segoe UI Semibold", "Helvetica Neue", "Arial"]
         )
+        body_family = display_family
         font_size = max(9, min(16, int(getattr(self, "_ui_font_size", 11))))
         app_font = QFont(body_family)
         app_font.setPointSize(font_size)
         QApplication.setFont(app_font)
         mpl_family = self._pick_matplotlib_font_family(
-            [body_family, display_family, "DejaVu Sans", "Arial", "Helvetica"]
+            [display_family, body_family, "DejaVu Sans", "Arial", "Helvetica"]
         )
         plt.rcParams["font.family"] = [mpl_family, "DejaVu Sans", "Arial", "Helvetica"]
         self._theme_name = normalize_theme_key(getattr(self, "_theme_name", DEFAULT_UI_THEME))
-        self.setStyleSheet(
-            build_stylesheet(
-                self._theme_name,
-                dark_enabled=getattr(self, "_dark_enabled", False),
-                ui_font_size=font_size,
-                font_family=body_family,
-                display_font_family=display_family,
-            )
+        theme_overrides: dict[str, str] = {}
+        if getattr(self, "_accent_secondary_override", ""):
+            theme_overrides["btn2"] = str(self._accent_secondary_override)
+        self._theme_tokens = resolve_theme_tokens(
+            self._theme_name,
+            dark_enabled=getattr(self, "_dark_enabled", False),
+            ui_font_size=font_size,
+            font_family=body_family,
+            display_font_family=display_family,
+            overrides=theme_overrides or None,
         )
+        stylesheet = build_stylesheet(
+            self._theme_name,
+            dark_enabled=getattr(self, "_dark_enabled", False),
+            ui_font_size=font_size,
+            font_family=body_family,
+            display_font_family=display_family,
+            overrides=theme_overrides or None,
+        )
+        self.setStyleSheet(stylesheet)
+        ai_window = getattr(self, "ai_window", None)
+        if isinstance(ai_window, QDialog):
+            ai_window.setStyleSheet(stylesheet)
+        weather_window = getattr(self, "weather_window", None)
+        if isinstance(weather_window, QDialog):
+            weather_window.setStyleSheet(stylesheet)
+        if getattr(self, "visibility_web", None) is not None:
+            try:
+                self.visibility_web.setStyleSheet(f"background:{self._theme_color('plot_bg', '#0f192b')};")
+                self.visibility_web.page().setBackgroundColor(self._theme_qcolor("plot_bg", "#0f192b"))
+            except Exception:
+                pass
+        if getattr(self, "visibility_plot_host", None) is not None:
+            try:
+                self.visibility_plot_host.setStyleSheet(f"background:{self._theme_color('plot_bg', '#0f192b')};")
+            except Exception:
+                pass
+        if getattr(self, "visibility_loading_widget", None) is not None:
+            try:
+                self.visibility_loading_widget.setStyleSheet(f"background:{self._theme_color('plot_bg', '#0f192b')};")
+            except Exception:
+                pass
+        for placeholder in getattr(self, "_cutout_image_placeholders", {}).values():
+            if isinstance(placeholder, QWidget):
+                try:
+                    placeholder.setStyleSheet(f"background:{self._theme_color('plot_bg', '#0f192b')};")
+                except Exception:
+                    pass
+        for stack in getattr(self, "_cutout_image_stacks", {}).values():
+            host = stack.parentWidget() if isinstance(stack, QStackedLayout) else None
+            if isinstance(host, QWidget):
+                try:
+                    host.setStyleSheet(f"background:{self._theme_color('plot_bg', '#0f192b')};")
+                except Exception:
+                    pass
+        self._refresh_target_color_map()
+        self._refresh_mpl_theme()
         self._refresh_date_nav_icons()
         self._refresh_plot_mode_switch()
+        self._update_plot_mode_label_metrics()
+        if isinstance(getattr(self, "last_payload", None), dict):
+            self._render_visibility_web_plot(self.last_payload)
+        if hasattr(self, "table_model") and hasattr(self, "settings"):
+            palette = highlight_palette_for_theme(
+                getattr(self, "_theme_name", DEFAULT_UI_THEME),
+                dark_enabled=bool(getattr(self, "_dark_enabled", False)),
+                color_blind=bool(getattr(self, "color_blind_mode", False)),
+            )
+            default_colors = {"below": palette.below, "limit": palette.limit, "above": palette.above}
+            self.table_model.highlight_colors = {
+                key: QColor(_resolve_table_highlight_color(self.settings, key, default_colors[key]))
+                for key in default_colors
+            }
+            if hasattr(self, "_emit_table_data_changed"):
+                self._emit_table_data_changed()
+        if isinstance(weather_window, WeatherDialog):
+            self._refresh_weather_window_context()
+        _refresh_button_icons(self)
+        if isinstance(ai_window, QDialog):
+            _refresh_button_icons(ai_window)
+        if isinstance(weather_window, QDialog):
+            _refresh_button_icons(weather_window)
         self._update_night_details_constraints()
         # Apply icon size globally
         self.setIconSize(QSize(20, 20))
@@ -3314,7 +12537,7 @@ class MainWindow(QMainWindow):
     def _build_date_nav_icon(self, kind: str) -> QIcon:
         base = self.palette().color(QPalette.ColorRole.ButtonText)
         if not base.isValid():
-            base = QColor("#d8e6f5")
+            base = self._theme_qcolor("section_title", "#d8e6f5")
         normal = QColor(base)
         normal.setAlpha(225)
         active = QColor(base)
@@ -3337,8 +12560,167 @@ class MainWindow(QMainWindow):
             if isinstance(btn, QToolButton):
                 btn.setIcon(self._build_date_nav_icon(kind))
 
+    def _build_web_loading_placeholder(self, title: str, message: str) -> QWidget:
+        widget = QWidget(self)
+        widget.setAttribute(Qt.WA_StyledBackground, True)
+        widget.setStyleSheet(f"background:{self._theme_color('plot_bg', '#121b29')};")
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+        layout.addStretch(1)
+        card = QFrame(widget)
+        card.setObjectName("VisibilityLoadingCard")
+        card.setMinimumWidth(420)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(30, 26, 30, 26)
+        card_layout.setSpacing(14)
+        title_label = QLabel(title, card)
+        title_label.setObjectName("SectionTitle")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setMinimumWidth(360)
+        skeleton = SkeletonShimmerWidget("plot", card)
+        skeleton.setMinimumHeight(260)
+        hint_label = QLabel(message, card)
+        hint_label.setObjectName("SectionHint")
+        hint_label.setAlignment(Qt.AlignCenter)
+        hint_label.setWordWrap(True)
+        hint_label.setMinimumWidth(380)
+        hint_label.setMaximumWidth(520)
+        hint_label.setMinimumHeight(54)
+        hint_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.MinimumExpanding)
+        card_layout.addWidget(title_label, 0, Qt.AlignHCenter)
+        card_layout.addWidget(skeleton, 0)
+        card_layout.addWidget(hint_label, 0, Qt.AlignHCenter)
+        layout.addWidget(card, 0, Qt.AlignCenter)
+        layout.addStretch(1)
+        widget._loading_hint_label = hint_label  # type: ignore[attr-defined]
+        widget._loading_skeleton = skeleton  # type: ignore[attr-defined]
+        return widget
+
+    def _build_cutout_loading_placeholder(self, title: str, message: str) -> QWidget:
+        widget = QWidget(self)
+        widget.setAttribute(Qt.WA_StyledBackground, True)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        card = QFrame(widget)
+        card.setObjectName("CutoutImage")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 14, 14, 14)
+        card_layout.setSpacing(10)
+        title_label = QLabel(title, card)
+        title_label.setObjectName("SectionTitle")
+        title_label.setAlignment(Qt.AlignCenter)
+        skeleton = SkeletonShimmerWidget("image", card)
+        skeleton.setMinimumHeight(220)
+        hint_label = QLabel(message, card)
+        hint_label.setObjectName("SectionHint")
+        hint_label.setWordWrap(True)
+        hint_label.setAlignment(Qt.AlignCenter)
+        card_layout.addWidget(title_label, 0, Qt.AlignHCenter)
+        card_layout.addWidget(skeleton, 1)
+        card_layout.addWidget(hint_label, 0, Qt.AlignHCenter)
+        layout.addWidget(card, 1)
+        widget._loading_hint_label = hint_label  # type: ignore[attr-defined]
+        return widget
+
+    def _create_cutout_image_stack(
+        self,
+        parent: QWidget,
+        *,
+        kind: str,
+        title: str,
+    ) -> tuple[QWidget, CoverImageLabel]:
+        host = QWidget(parent)
+        host.setAttribute(Qt.WA_StyledBackground, True)
+        host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        stack = QStackedLayout(host)
+        stack.setContentsMargins(0, 0, 0, 0)
+        placeholder = self._build_cutout_loading_placeholder(title, f"Loading {title.lower()}…")
+        image_label = CoverImageLabel("Select a target", host)
+        image_label.setObjectName("CutoutImage")
+        image_label.setProperty("cutout_image", True)
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setWordWrap(True)
+        image_label.setScaledContents(False)
+        image_label.setMinimumSize(1, 1)
+        image_label.setMaximumSize(16777215, 16777215)
+        image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        stack.addWidget(placeholder)
+        stack.addWidget(image_label)
+        stack.setCurrentWidget(image_label)
+        self._cutout_image_stacks[kind] = stack
+        self._cutout_image_placeholders[kind] = placeholder
+        self._cutout_image_labels[kind] = image_label
+        return host, image_label
+
+    def _set_cutout_image_loading(self, kind: str, message: str, *, visible: bool = True) -> None:
+        stack = self._cutout_image_stacks.get(kind)
+        placeholder = self._cutout_image_placeholders.get(kind)
+        image_label = self._cutout_image_labels.get(kind)
+        if stack is None or placeholder is None or image_label is None:
+            return
+        hint_label = getattr(placeholder, "_loading_hint_label", None)
+        if isinstance(hint_label, QLabel):
+            hint_label.setText(message)
+        if visible:
+            stack.setCurrentWidget(placeholder)
+        else:
+            stack.setCurrentWidget(image_label)
+
+    def _set_visibility_loading_state(self, message: str, *, visible: bool = True) -> None:
+        stack = getattr(self, "visibility_plot_stack", None)
+        placeholder = getattr(self, "visibility_loading_widget", None)
+        web_view = getattr(self, "visibility_web", None)
+        if stack is None or placeholder is None or web_view is None:
+            return
+        hint_label = getattr(placeholder, "_loading_hint_label", None)
+        if isinstance(hint_label, QLabel):
+            hint_label.setText(message)
+        if visible:
+            stack.setCurrentWidget(placeholder)
+        else:
+            stack.setCurrentWidget(web_view)
+
+    @Slot(bool)
+    def _on_visibility_web_load_finished(self, ok: bool) -> None:
+        if ok:
+            self._visibility_web_has_content = True
+            self._set_visibility_loading_state("", visible=False)
+            return
+        self._visibility_web_has_content = False
+        self._set_visibility_loading_state("Unable to render interactive chart.", visible=True)
+
     def _line_palette(self) -> list[str]:
-        return COLORBLIND_LINE_COLORS if self.color_blind_mode else DEFAULT_LINE_COLORS
+        palette = line_palette_for_theme(
+            getattr(self, "_theme_name", DEFAULT_UI_THEME),
+            dark_enabled=getattr(self, "_dark_enabled", False),
+            color_blind=bool(getattr(self, "color_blind_mode", False)),
+        )
+        return palette or (COLORBLIND_LINE_COLORS if self.color_blind_mode else DEFAULT_LINE_COLORS)
+
+    @staticmethod
+    def _target_color_key(target: Target) -> str:
+        source_key = _normalize_catalog_token(getattr(target, "source_object_id", ""))
+        if source_key:
+            return f"id:{source_key}"
+        name_key = _normalize_catalog_token(getattr(target, "name", ""))
+        if name_key:
+            return f"name:{name_key}"
+        ra = _safe_float(getattr(target, "ra", None))
+        dec = _safe_float(getattr(target, "dec", None))
+        if ra is not None and dec is not None and math.isfinite(ra) and math.isfinite(dec):
+            return f"coord:{ra:.6f},{dec:.6f}"
+        return f"obj:{id(target)}"
+
+    def _ensure_auto_target_color_palette(self, palette: Optional[list[str]] = None) -> list[str]:
+        use_palette = palette if palette is not None else self._line_palette()
+        signature = tuple(str(color) for color in use_palette)
+        prev_signature = tuple(getattr(self, "_auto_target_color_palette_signature", ()))
+        if signature != prev_signature:
+            self._auto_target_color_palette_signature = signature
+            self._auto_target_color_map = {}
+        return use_palette
 
     def _target_plot_color_css(
         self,
@@ -3349,10 +12731,19 @@ class MainWindow(QMainWindow):
         custom_css = _normalized_css_color(target.plot_color)
         if custom_css:
             return custom_css
-        use_palette = palette if palette is not None else self._line_palette()
+        use_palette = self._ensure_auto_target_color_palette(palette)
         if not use_palette:
-            return "#4da3ff"
-        return str(use_palette[index % len(use_palette)])
+            return self._theme_color("accent_primary", "#4da3ff")
+        key = self._target_color_key(target)
+        auto_map = getattr(self, "_auto_target_color_map", {})
+        cached = _normalized_css_color(auto_map.get(key, ""))
+        if cached:
+            return cached
+        color_css = str(use_palette[len(auto_map) % len(use_palette)])
+        normalized = _normalized_css_color(color_css) or color_css
+        auto_map[key] = str(normalized)
+        self._auto_target_color_map = auto_map
+        return str(normalized)
 
     def _airmass_from_altitude(self, altitude_deg: object) -> np.ndarray:
         altitude = np.asarray(altitude_deg, dtype=float)
@@ -3379,6 +12770,138 @@ class MainWindow(QMainWindow):
         value = _safe_float(limit_airmass[0])
         return value if value is not None else 1.0
 
+    def _visibility_time_window(
+        self,
+        data: dict,
+        tz,
+    ) -> tuple[datetime, datetime, dict[str, datetime]]:
+        event_map: dict[str, datetime] = {}
+        for key in (
+            "sunset",
+            "dusk_civ",
+            "dusk_naut",
+            "dusk",
+            "dawn",
+            "dawn_naut",
+            "dawn_civ",
+            "sunrise",
+            "moonrise",
+            "moonset",
+        ):
+            try:
+                event_map[key] = mdates.num2date(data[key]).astimezone(tz)
+            except Exception:
+                continue
+
+        sunset_dt = event_map.get("sunset")
+        sunrise_dt = event_map.get("sunrise")
+        if isinstance(sunset_dt, datetime) and isinstance(sunrise_dt, datetime):
+            start_dt = sunset_dt - timedelta(hours=1)
+            end_dt = sunrise_dt + timedelta(hours=1)
+            if end_dt > start_dt:
+                return start_dt, end_dt, event_map
+
+        obs_date = self.date_edit.date()
+        start_noon_naive = datetime(obs_date.year(), obs_date.month(), obs_date.day(), 12, 0)
+        next_date = obs_date.addDays(1)
+        end_noon_naive = datetime(next_date.year(), next_date.month(), next_date.day(), 12, 0)
+        try:
+            start_dt = tz.localize(start_noon_naive)
+            end_dt = tz.localize(end_noon_naive)
+        except Exception:
+            center_dt = mdates.num2date(data["midnight"]).astimezone(tz)
+            start_dt = center_dt - timedelta(hours=12)
+            end_dt = center_dt + timedelta(hours=12)
+        return start_dt, end_dt, event_map
+
+    def _visibility_grid_color(self, *, alpha: float = 1.0) -> str:
+        base = self._theme_qcolor("plot_grid", "#2f4666")
+        panel = self._theme_qcolor("plot_panel_bg", "#162334")
+        softened = self._mix_qcolors(base, panel, 0.34)
+        return self._qcolor_rgba_css(softened, alpha)
+
+    def _visibility_grid_rgba(self, *, alpha: float = 1.0) -> tuple[float, float, float, float]:
+        base = self._theme_qcolor("plot_grid", "#2f4666")
+        panel = self._theme_qcolor("plot_panel_bg", "#162334")
+        softened = self._mix_qcolors(base, panel, 0.34)
+        return self._qcolor_rgba_mpl(softened, alpha)
+
+    def _visibility_context_key_from_parts(
+        self,
+        *,
+        site_name: str,
+        latitude: float,
+        longitude: float,
+        elevation: float,
+        obs_date,
+        time_samples: int,
+        limit_altitude: float,
+    ) -> str:
+        return (
+            f"{site_name}|{latitude:.6f}|{longitude:.6f}|{elevation:.1f}|"
+            f"{obs_date.toString('yyyy-MM-dd')}|{int(time_samples)}|{float(limit_altitude):.1f}"
+        )
+
+    def _current_visibility_context_key(self) -> str:
+        try:
+            return self._visibility_context_key_from_parts(
+                site_name=str(self.obs_combo.currentText()),
+                latitude=self._read_site_float(self.lat_edit),
+                longitude=self._read_site_float(self.lon_edit),
+                elevation=self._read_site_float(self.elev_edit),
+                obs_date=self.date_edit.date(),
+                time_samples=self.settings.value("general/timeSamples", 240, type=int),
+                limit_altitude=float(self.limit_spin.value()),
+            )
+        except Exception:
+            return ""
+
+    def _show_visibility_matplotlib_placeholder(self, title: str, message: str) -> None:
+        if getattr(self, "_use_visibility_web", False):
+            return
+        if not hasattr(self, "ax_alt") or not hasattr(self, "plot_canvas"):
+            return
+        plot_bg = self._theme_color("plot_bg", "#0f1825")
+        plot_panel_bg = self._theme_color("plot_panel_bg", "#162334")
+        plot_text = self._theme_color("plot_text", "#d7e4f0")
+        self.ax_alt.clear()
+        self.plot_canvas.figure.patch.set_facecolor(plot_bg)
+        self.ax_alt.set_facecolor(plot_panel_bg)
+        self.ax_alt.set_xticks([])
+        self.ax_alt.set_yticks([])
+        for spine in self.ax_alt.spines.values():
+            spine.set_visible(False)
+        self.ax_alt.text(
+            0.5,
+            0.56,
+            title,
+            transform=self.ax_alt.transAxes,
+            ha="center",
+            va="center",
+            color=plot_text,
+            fontsize=15,
+            fontweight="bold",
+        )
+        self.ax_alt.text(
+            0.5,
+            0.46,
+            message,
+            transform=self.ax_alt.transAxes,
+            ha="center",
+            va="center",
+            color=self._theme_color("section_hint", plot_text),
+            fontsize=10,
+            wrap=True,
+        )
+        self.plot_canvas.draw_idle()
+
+    def _begin_visibility_refresh(self, message: str) -> None:
+        self._visibility_web_has_content = False
+        if getattr(self, "visibility_web", None) is not None:
+            self.visibility_web.setEnabled(False)
+            self._set_visibility_loading_state(message, visible=True)
+        self._show_visibility_matplotlib_placeholder("Visibility Plot", message)
+
     def _configure_main_plot_y_axis(self) -> None:
         if not self._plot_airmass:
             self.ax_alt.set_ylabel("Altitude (°)")
@@ -3397,27 +12920,653 @@ class MainWindow(QMainWindow):
         self.ax_alt.set_yticks(visible_ticks)
         self.ax_alt.set_yticklabels([f"{tick:.1f}" for tick in visible_ticks])
 
+    def _update_plot_mode_label_metrics(self) -> None:
+        if not hasattr(self, "plot_mode_alt_label") or not hasattr(self, "plot_mode_airmass_label"):
+            return
+        for label, text, align in (
+            (self.plot_mode_alt_label, "Altitude", Qt.AlignRight | Qt.AlignVCenter),
+            (self.plot_mode_airmass_label, "Airmass", Qt.AlignLeft | Qt.AlignVCenter),
+        ):
+            metrics_font = QFont(label.font())
+            metrics_font.setWeight(QFont.Weight.Bold)
+            width = QFontMetrics(metrics_font).horizontalAdvance(text) + 28
+            label.setMinimumWidth(max(width, 102))
+            label.setAlignment(align)
+        if hasattr(self, "plot_mode_widget"):
+            switch_width = 70
+            if hasattr(self, "airmass_toggle_btn") and self.airmass_toggle_btn is not None:
+                switch_width = max(switch_width, self.airmass_toggle_btn.minimumSizeHint().width())
+            self.plot_mode_widget.setMinimumWidth(
+                self.plot_mode_alt_label.minimumWidth() + self.plot_mode_airmass_label.minimumWidth() + switch_width + 52
+            )
+            self.plot_mode_widget.setMinimumHeight(44)
+
+    def _animate_plot_mode_switch(self) -> None:
+        labels = (
+            (getattr(self, "plot_mode_alt_label", None), not self._plot_airmass),
+            (getattr(self, "plot_mode_airmass_label", None), self._plot_airmass),
+        )
+        for anim in self._plot_mode_animations:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+        self._plot_mode_animations.clear()
+        for label, active in labels:
+            effect = getattr(label, "_opacity_effect", None)
+            if label is None or effect is None:
+                continue
+            target = 1.0 if active else 0.68
+            anim = QPropertyAnimation(effect, b"opacity", self)
+            anim.setDuration(180)
+            anim.setStartValue(effect.opacity())
+            anim.setEndValue(target)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.finished.connect(lambda a=anim: self._plot_mode_animations.remove(a) if a in self._plot_mode_animations else None)
+            self._plot_mode_animations.append(anim)
+            anim.start()
+
     def _refresh_plot_mode_switch(self) -> None:
         if not hasattr(self, "plot_mode_alt_label") or not hasattr(self, "plot_mode_airmass_label"):
             return
-        base = self.palette().color(QPalette.ColorRole.WindowText)
-        active_color = f"rgba({base.red()}, {base.green()}, {base.blue()}, 255)"
-        inactive_color = f"rgba({base.red()}, {base.green()}, {base.blue()}, 150)"
-        self.plot_mode_alt_label.setStyleSheet(
-            f"font-weight: {'700' if not self._plot_airmass else '500'}; color: {active_color if not self._plot_airmass else inactive_color};"
-        )
-        self.plot_mode_airmass_label.setStyleSheet(
-            f"font-weight: {'700' if self._plot_airmass else '500'}; color: {active_color if self._plot_airmass else inactive_color};"
+        if hasattr(self, "airmass_toggle_btn") and self.airmass_toggle_btn is not None:
+            blocker = QSignalBlocker(self.airmass_toggle_btn)
+            self.airmass_toggle_btn.setChecked(bool(self._plot_airmass))
+            del blocker
+        for label, active in (
+            (self.plot_mode_alt_label, not self._plot_airmass),
+            (self.plot_mode_airmass_label, self._plot_airmass),
+        ):
+            font = QFont(label.font())
+            font.setWeight(QFont.Weight.Bold if active else QFont.Weight.Medium)
+            label.setFont(font)
+            _set_label_tone(label, "info" if active else "muted")
+            effect = getattr(label, "_opacity_effect", None)
+            if effect is not None:
+                effect.setOpacity(1.0 if active else 0.68)
+        self._update_plot_mode_label_metrics()
+
+    @staticmethod
+    def _polar_rgba_array(color: QColor, alphas: np.ndarray) -> np.ndarray:
+        if not color.isValid():
+            color = QColor("#59f3ff")
+        red = color.redF()
+        green = color.greenF()
+        blue = color.blueF()
+        rows = []
+        for alpha in alphas:
+            rows.append((red, green, blue, float(max(0.0, min(1.0, alpha)))))
+        return np.array(rows, dtype=float) if rows else np.empty((0, 4), dtype=float)
+
+    def _ensure_radar_echo_artists(self, count: int) -> None:
+        artists = list(getattr(self, "_radar_echo_artists", []))
+        while len(artists) < count:
+            artist, = self.polar_ax.plot(
+                [],
+                [],
+                linestyle="",
+                marker="x",
+                markersize=6.5,
+                markeredgewidth=1.35,
+                alpha=0.0,
+                zorder=4,
+            )
+            artists.append(artist)
+        while len(artists) > count:
+            artist = artists.pop()
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._radar_echo_artists = artists
+
+    def _build_radar_sweep_cmap(self) -> LinearSegmentedColormap:
+        base = self._theme_qcolor("accent_secondary_soft", "#d38cff")
+        r = float(base.redF())
+        g = float(base.greenF())
+        b = float(base.blueF())
+        return LinearSegmentedColormap.from_list(
+            "astroplanner_radar_sweep",
+            [
+                (0.0, (r, g, b, 0.0)),
+                (0.28, (r, g, b, 0.04)),
+                (0.68, (r, g, b, 0.20)),
+                (1.0, (r, g, b, 0.54)),
+            ],
+            N=512,
         )
 
+    @staticmethod
+    def _radar_sector_vertices(theta_start: float, theta_end: float, outer_radius: float = 90.0, samples: int = 12) -> np.ndarray:
+        arc_thetas = np.linspace(theta_start, theta_end, max(4, int(samples)))
+        vertices: list[tuple[float, float]] = [(theta_start, 0.0)]
+        vertices.extend((float(theta), float(outer_radius)) for theta in arc_thetas)
+        vertices.append((theta_end, 0.0))
+        vertices.append((theta_start, 0.0))
+        return np.array(vertices, dtype=float)
+
+    def _refresh_radar_sweep_artists(self, *, redraw: bool = True, delta_s: Optional[float] = None) -> None:
+        if (
+            not hasattr(self, "radar_sweep_line")
+            or not hasattr(self, "polar_ax")
+        ):
+            return
+        enabled = bool(getattr(self, "_radar_sweep_enabled", False))
+        if not enabled:
+            self.radar_sweep_line.set_data([], [])
+            self.radar_sweep_glow_line.set_data([], [])
+            if hasattr(self, "radar_sweep_core"):
+                self.radar_sweep_core.set_offsets(np.empty((0, 2)))
+            if hasattr(self, "radar_sweep_mesh") and self.radar_sweep_mesh is not None:
+                self.radar_sweep_mesh.set_array(np.zeros_like(self._radar_sweep_mesh_values).ravel())
+                self.radar_sweep_mesh.set_visible(False)
+            self._ensure_radar_echo_artists(0)
+            self._radar_echo_strengths = np.zeros(0, dtype=float)
+            self.polar_scatter.set_alpha(0.52)
+            if hasattr(self, "selected_scatter"):
+                self.selected_scatter.set_alpha(1.0)
+            if redraw and hasattr(self, "polar_canvas"):
+                self.polar_canvas.draw_idle()
+            return
+
+        theta = float(getattr(self, "_radar_sweep_angle", 0.0)) % (2.0 * math.pi)
+        self.radar_sweep_line.set_data([theta, theta], [0.0, 90.0])
+        self.radar_sweep_glow_line.set_data([theta, theta], [0.0, 90.0])
+        if hasattr(self, "radar_sweep_core"):
+            self.radar_sweep_core.set_offsets(np.empty((0, 2)))
+        self.polar_scatter.set_alpha(0.0)
+        if hasattr(self, "selected_scatter"):
+            self.selected_scatter.set_alpha(1.0)
+        if hasattr(self, "radar_sweep_mesh") and self.radar_sweep_mesh is not None:
+            centers = getattr(self, "_radar_sweep_theta_centers", np.empty(0, dtype=float))
+            if isinstance(centers, np.ndarray) and centers.size:
+                trail_extent = math.pi / 2.05
+                deltas = (theta - centers) % (2.0 * math.pi)
+                strengths_1d = np.zeros_like(centers)
+                mask = deltas <= trail_extent
+                if np.any(mask):
+                    normalized = 1.0 - (deltas[mask] / trail_extent)
+                    strengths_1d[mask] = np.power(normalized, 1.28)
+                radial_rows = len(self._radar_sweep_radius_edges) - 1
+                mesh_values = np.repeat(strengths_1d[np.newaxis, :], radial_rows, axis=0)
+                self._radar_sweep_mesh_values = mesh_values
+                self.radar_sweep_mesh.set_array(mesh_values.ravel())
+                self.radar_sweep_mesh.set_visible(bool(np.any(mesh_values > 0.0005)))
+        coords = getattr(self, "_radar_target_coords", np.empty((0, 2)))
+        strengths = getattr(self, "_radar_echo_strengths", np.zeros(0, dtype=float))
+        if not isinstance(strengths, np.ndarray) or strengths.shape[0] != (coords.shape[0] if isinstance(coords, np.ndarray) else 0):
+            strengths = np.zeros(coords.shape[0] if isinstance(coords, np.ndarray) else 0, dtype=float)
+        if delta_s is not None and strengths.size:
+            speed_multiplier = max(0.4, min(2.6, float(getattr(self, "_radar_sweep_speed", 140)) / 100.0))
+            revolution_s = 1.0 / speed_multiplier
+            decay_tau = max(0.06, revolution_s / 6.0)
+            strengths *= math.exp(-max(0.0, float(delta_s)) / decay_tau)
+        if isinstance(coords, np.ndarray) and coords.size:
+            deltas = np.abs(np.angle(np.exp(1j * (coords[:, 0] - theta))))
+            sweep_width = np.deg2rad(8.5)
+            mask = deltas <= sweep_width
+            if np.any(mask):
+                strengths[mask] = np.maximum(strengths[mask], 1.0)
+            visible = strengths > 0.0002
+            if np.any(visible):
+                offsets = coords[visible]
+                vis_strength = strengths[visible]
+                main_sizes = 5.4 + (np.power(vis_strength, 0.78) * 3.6)
+                main_alphas = np.clip(np.power(vis_strength, 1.55) * 0.52, 0.0, 0.52)
+                echo_color = self._theme_qcolor("polar_target", "#59f3ff")
+                self._ensure_radar_echo_artists(len(offsets))
+                for idx, ((theta_value, radius_value), size_value, alpha_value) in enumerate(
+                    zip(offsets, main_sizes, main_alphas)
+                ):
+                    artist = self._radar_echo_artists[idx]
+                    artist.set_data([float(theta_value)], [float(radius_value)])
+                    artist.set_markersize(float(size_value))
+                    artist.set_markeredgewidth(1.05 + (float(alpha_value) * 1.35))
+                    artist.set_color(self._qcolor_rgba_mpl(echo_color, float(alpha_value)))
+                    artist.set_alpha(float(alpha_value))
+                for artist in self._radar_echo_artists[len(offsets):]:
+                    artist.set_data([], [])
+                    artist.set_alpha(0.0)
+            else:
+                for artist in getattr(self, "_radar_echo_artists", []):
+                    artist.set_data([], [])
+                    artist.set_alpha(0.0)
+        else:
+            self._ensure_radar_echo_artists(0)
+        self._radar_echo_strengths = strengths
+        if redraw and hasattr(self, "polar_canvas"):
+            self.polar_canvas.draw_idle()
+
+    def _update_radar_sweep_state(self) -> None:
+        enabled = bool(getattr(self, "_radar_sweep_enabled", False))
+        timer = getattr(self, "_radar_sweep_timer", None)
+        if timer is None:
+            return
+        if enabled:
+            if hasattr(self, "_radar_sweep_clock"):
+                try:
+                    self._radar_sweep_clock.start()
+                except Exception:
+                    pass
+            if not timer.isActive():
+                timer.start()
+        else:
+            timer.stop()
+            self._radar_sweep_clock.invalidate()
+        self._refresh_radar_sweep_artists(redraw=True)
+
+    @Slot()
+    def _advance_radar_sweep(self) -> None:
+        elapsed_ms = 16.0
+        if hasattr(self, "_radar_sweep_clock"):
+            if not self._radar_sweep_clock.isValid():
+                self._radar_sweep_clock.start()
+            elapsed_ms = float(self._radar_sweep_clock.restart())
+        delta_s = max(1.0 / 240.0, min(0.05, elapsed_ms / 1000.0))
+        speed_multiplier = max(0.4, min(2.6, float(getattr(self, "_radar_sweep_speed", 140)) / 100.0))
+        degrees_per_second = 360.0 * speed_multiplier
+        self._radar_sweep_angle = (
+            float(getattr(self, "_radar_sweep_angle", 0.0)) + math.radians(degrees_per_second * delta_s)
+        ) % (2.0 * math.pi)
+        self._refresh_radar_sweep_artists(redraw=True, delta_s=delta_s)
+
     def _reset_plot_navigation_home(self) -> None:
-        if not hasattr(self, "plot_toolbar"):
+        toolbar = getattr(self, "plot_toolbar", None)
+        if toolbar is None:
             return
         try:
-            self.plot_toolbar.update()
-            self.plot_toolbar.push_current()
+            toolbar.update()
+            toolbar.push_current()
         except Exception:
             pass
+
+    def _selected_target_names(self) -> list[str]:
+        if not hasattr(self, "table_view"):
+            return []
+        selection_model = self.table_view.selectionModel()
+        if selection_model is None:
+            return []
+        names: list[str] = []
+        for index in selection_model.selectedRows():
+            row = index.row()
+            if 0 <= row < len(self.targets):
+                names.append(self.targets[row].name)
+        return names
+
+    def _apply_visibility_line_style(self, line: object, *, is_over: bool, is_selected: bool) -> None:
+        if line is None:
+            return
+        try:
+            line.set_solid_capstyle("round")
+            line.set_solid_joinstyle("round")
+            line.set_linewidth(2.3 if (is_over and is_selected) else 1.4)
+            line.set_alpha(1.0 if (is_over and is_selected) else (0.7 if is_over else 0.3))
+            if is_over and is_selected:
+                line_color = QColor(str(getattr(line, "get_color", lambda: "")()))
+                if not line_color.isValid():
+                    line_color = self._theme_qcolor("accent_secondary", "#ff4fd8")
+                line.set_path_effects(
+                    [
+                        mpl_patheffects.Stroke(
+                            linewidth=16.0,
+                            foreground=self._qcolor_rgba_mpl(line_color, 0.012),
+                        ),
+                        mpl_patheffects.Stroke(
+                            linewidth=13.7,
+                            foreground=self._qcolor_rgba_mpl(line_color, 0.020),
+                        ),
+                        mpl_patheffects.Stroke(
+                            linewidth=11.5,
+                            foreground=self._qcolor_rgba_mpl(line_color, 0.032),
+                        ),
+                        mpl_patheffects.Stroke(
+                            linewidth=9.2,
+                            foreground=self._qcolor_rgba_mpl(line_color, 0.048),
+                        ),
+                        mpl_patheffects.Stroke(
+                            linewidth=7.2,
+                            foreground=self._qcolor_rgba_mpl(line_color, 0.070),
+                        ),
+                        mpl_patheffects.Stroke(
+                            linewidth=5.6,
+                            foreground=self._qcolor_rgba_mpl(line_color, 0.102),
+                        ),
+                        mpl_patheffects.Stroke(
+                            linewidth=4.3,
+                            foreground=self._qcolor_rgba_mpl(line_color, 0.142),
+                        ),
+                        mpl_patheffects.Normal(),
+                    ]
+                )
+            else:
+                line.set_path_effects([])
+        except Exception:
+            return
+
+    def _build_visibility_plotly_html(
+        self,
+        data: dict,
+        *,
+        now_override: Optional[datetime] = None,
+    ) -> Optional[str]:
+        if not (_HAS_PLOTLY and plotly_to_html is not None and go is not None):
+            return None
+        try:
+            tz = pytz.timezone(str(data.get("tz", "UTC") or "UTC"))
+        except Exception:
+            tz = pytz.UTC
+        try:
+            times = [t.astimezone(tz) for t in mdates.num2date(data["times"])]
+        except Exception:
+            return None
+        if len(times) < 2:
+            return None
+
+        use_tokens = getattr(
+            self,
+            "_theme_tokens",
+            resolve_theme_tokens(
+                getattr(self, "_theme_name", DEFAULT_UI_THEME),
+                dark_enabled=bool(getattr(self, "_dark_enabled", False)),
+            ),
+        )
+        dark = bool(getattr(self, "_dark_enabled", False))
+        plot_bg = str(use_tokens.get("plot_bg", "#121b29"))
+        plot_panel_bg = str(use_tokens.get("plot_panel_bg", plot_bg))
+        plot_text = str(use_tokens.get("plot_text", "#d7e4f0" if dark else "#253347"))
+        plot_grid = str(use_tokens.get("plot_grid", "#2f4666" if dark else "#d6deea"))
+        plot_guide = str(use_tokens.get("plot_guide", plot_grid))
+        plot_limit = str(use_tokens.get("plot_limit", "#ff5d8f"))
+        plot_now = str(use_tokens.get("plot_now", "#ff3df0"))
+        plot_sun = str(use_tokens.get("plot_sun", "#ffb224"))
+        plot_moon = str(use_tokens.get("plot_moon", "#d7e2ff"))
+        civil_col = str(use_tokens.get("plot_twilight_civil", "#ffd166"))
+        naut_col = str(use_tokens.get("plot_twilight_naut", "#5ab6ff"))
+        astro_col = str(use_tokens.get("plot_twilight_astro", "#8094c8"))
+        plot_font = _plot_font_css_stack(use_tokens)
+
+        limit = float(self.limit_spin.value())
+        sun_alt_limit = self._sun_alt_limit()
+        sun_alt_series = np.array(data.get("sun_alt", np.full(len(times), np.nan)), dtype=float)
+        obs_sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= sun_alt_limit)
+        line_palette = self._line_palette()
+        target_colors = [
+            self._target_plot_color_css(tgt, idx, line_palette)
+            for idx, tgt in enumerate(self.targets)
+        ]
+        row_enabled = list(getattr(self.table_model, "row_enabled", []))
+        if len(row_enabled) != len(self.targets):
+            row_enabled = [True] * len(self.targets)
+        selected_names = set(self._selected_target_names())
+        start_dt, end_dt, event_map = self._visibility_time_window(data, tz)
+        grid_css = self._visibility_grid_color(alpha=0.42)
+        guide_css = self._visibility_grid_color(alpha=0.24)
+
+        fig = go.Figure()
+        y_title = "Airmass" if self._plot_airmass else "Altitude (°)"
+        y_precision = ".2f" if self._plot_airmass else ".1f"
+
+        def _visible_series(values: np.ndarray, mask: np.ndarray) -> list[float]:
+            series = np.array(values, copy=True, dtype=float)
+            series[~mask] = np.nan
+            return [float(v) if np.isfinite(v) else np.nan for v in series]
+
+        for idx, tgt in enumerate(self.targets):
+            if idx >= len(row_enabled) or not row_enabled[idx]:
+                continue
+            row = data.get(tgt.name)
+            if not isinstance(row, dict):
+                continue
+            alt = np.array(row.get("altitude", np.full(len(times), np.nan)), dtype=float)
+            if alt.shape[0] != len(times):
+                continue
+            color = target_colors[idx] if idx < len(target_colors) else self._target_plot_color_css(tgt, idx, line_palette)
+            vis_mask = np.isfinite(alt) & (alt > 0.0)
+            if not vis_mask.any():
+                continue
+            base_y = _visible_series(self._plot_y_values(alt), vis_mask)
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=base_y,
+                    mode="lines",
+                    name=tgt.name,
+                    showlegend=False,
+                    hoverinfo="skip",
+                    line={"color": color, "width": 1.4, "dash": "dash"},
+                    opacity=0.28,
+                )
+            )
+
+            high_mask = np.isfinite(alt) & (alt >= limit) & obs_sun_mask
+            if high_mask.any():
+                high_y = _visible_series(self._plot_y_values(alt), high_mask)
+                is_selected = tgt.name in selected_names
+                if is_selected:
+                    glow_color = QColor(color)
+                    if not glow_color.isValid():
+                        glow_color = self._theme_qcolor("accent_secondary", "#ff4fd8")
+                    for width, alpha in (
+                        (20.0, 0.012),
+                        (17.0, 0.020),
+                        (14.2, 0.032),
+                        (11.6, 0.048),
+                        (9.2, 0.070),
+                        (7.1, 0.102),
+                        (5.4, 0.144),
+                    ):
+                        fig.add_trace(
+                            go.Scatter(
+                                x=times,
+                                y=high_y,
+                                mode="lines",
+                                name=f"{tgt.name} glow",
+                                showlegend=False,
+                                hoverinfo="skip",
+                                line={"color": self._qcolor_rgba_css(glow_color, alpha), "width": width},
+                                opacity=1.0,
+                            )
+                        )
+                fig.add_trace(
+                    go.Scatter(
+                        x=times,
+                        y=high_y,
+                        mode="lines",
+                        name=tgt.name,
+                        showlegend=False,
+                        line={"color": color, "width": 2.8 if is_selected else 1.9},
+                        opacity=1.0 if is_selected else 0.92,
+                        hovertemplate=f"{tgt.name}<br>%{{x|%H:%M}}<br>{y_title}: %{{y:{y_precision}}}<extra></extra>",
+                    )
+                )
+
+        for start_key, end_key, color in (
+            ("sunset", "dusk_civ", civil_col),
+            ("dusk_civ", "dusk_naut", naut_col),
+            ("dusk_naut", "dusk", astro_col),
+            ("dawn", "dawn_naut", astro_col),
+            ("dawn_naut", "dawn_civ", naut_col),
+            ("dawn_civ", "sunrise", civil_col),
+        ):
+            start_evt = event_map.get(start_key)
+            end_evt = event_map.get(end_key)
+            if start_evt is None or end_evt is None or start_evt >= end_evt:
+                continue
+            x0 = max(start_evt, start_dt)
+            x1 = min(end_evt, end_dt)
+            if x0 >= x1:
+                continue
+            fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.22, line_width=0, layer="below")
+
+        for _key, evt in event_map.items():
+            if start_dt <= evt <= end_dt:
+                fig.add_vline(x=evt, line={"color": guide_css, "width": 1, "dash": "dash"}, opacity=1.0)
+
+        limit_value = self._plot_limit_value()
+        fig.add_hline(y=limit_value, line={"color": plot_limit, "width": 1.0}, opacity=0.55)
+
+        if self.sun_check.isChecked() and "sun_alt" in data:
+            sun_y = [float(v) if np.isfinite(v) else np.nan for v in self._plot_y_values(data["sun_alt"])]
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=sun_y,
+                    mode="lines",
+                    name="Sun",
+                    showlegend=False,
+                    line={"color": plot_sun, "width": 1.2},
+                    opacity=0.82,
+                    hovertemplate=f"Sun<br>%{{x|%H:%M}}<br>{y_title}: %{{y:{y_precision}}}<extra></extra>",
+                )
+            )
+        if self.moon_check.isChecked() and "moon_alt" in data:
+            moon_y = [float(v) if np.isfinite(v) else np.nan for v in self._plot_y_values(data["moon_alt"])]
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=moon_y,
+                    mode="lines",
+                    name="Moon",
+                    showlegend=False,
+                    line={"color": plot_moon, "width": 1.2},
+                    opacity=0.84,
+                    hovertemplate=f"Moon<br>%{{x|%H:%M}}<br>{y_title}: %{{y:{y_precision}}}<extra></extra>",
+                )
+            )
+
+        now_dt = now_override
+        if not isinstance(now_dt, datetime):
+            payload_now = data.get("now_local")
+            now_dt = payload_now if isinstance(payload_now, datetime) else datetime.now(tz)
+        if now_dt.tzinfo is None:
+            now_dt = tz.localize(now_dt)
+        else:
+            now_dt = now_dt.astimezone(tz)
+        fig.add_vline(x=now_dt, line={"color": plot_now, "width": 1.4, "dash": "dot"})
+
+        date_label = self.date_edit.date().toString("yyyy-MM-dd") if hasattr(self, "date_edit") else now_dt.strftime("%Y-%m-%d")
+        fig.update_layout(
+            template="plotly_dark" if dark else "plotly_white",
+            title={"text": f"Date: {date_label}", "x": 0.5, "xanchor": "center"},
+            margin={"l": 56, "r": 20, "t": 48, "b": 52},
+            hovermode="x unified",
+            paper_bgcolor=plot_bg,
+            plot_bgcolor=plot_panel_bg,
+            font={"color": plot_text, "family": plot_font},
+            showlegend=False,
+            dragmode="pan",
+        )
+        fig.update_xaxes(
+            range=[start_dt, end_dt],
+            showgrid=True,
+            gridcolor=grid_css,
+            zerolinecolor=grid_css,
+            color=plot_text,
+            tickformat="%H:%M",
+            title_text="Time (local)",
+        )
+        if not self._plot_airmass:
+            fig.update_yaxes(
+                title_text="Altitude (°)",
+                range=[0, 90],
+                tickvals=[0, 15, 30, 45, 60, 75, 90],
+                showgrid=True,
+                gridcolor=grid_css,
+                zerolinecolor=grid_css,
+                color=plot_text,
+            )
+        else:
+            limit_airmass = self._plot_limit_value()
+            max_airmass = max(3.0, min(8.0, float(math.ceil(limit_airmass + 1.0))))
+            ticks = [1.0, 1.1, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0]
+            visible_ticks = [tick for tick in ticks if tick <= max_airmass]
+            if not visible_ticks or visible_ticks[0] != 1.0:
+                visible_ticks.insert(0, 1.0)
+            fig.update_yaxes(
+                title_text="Airmass",
+                range=[max_airmass, 1.0],
+                tickvals=visible_ticks,
+                ticktext=[f"{tick:.1f}" for tick in visible_ticks],
+                showgrid=True,
+                gridcolor=grid_css,
+                zerolinecolor=grid_css,
+                color=plot_text,
+            )
+
+        html_fragment = plotly_to_html(
+            fig,
+            include_plotlyjs=False,
+            full_html=False,
+            config={
+                "displaylogo": False,
+                "responsive": True,
+                "scrollZoom": True,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+            },
+        )
+        html_fragment = html_fragment.replace("<div>", "<div id='plot-host' style='width:100%;height:100%;min-height:100%;'>", 1)
+        graph_id_match = re.search(r'<div id="([^"]+)" class="plotly-graph-div"', html_fragment)
+        graph_id = graph_id_match.group(1) if graph_id_match else ""
+        resize_script = ""
+        if graph_id:
+            resize_script = (
+                "<script>"
+                "(function(){"
+                f"const gd=document.getElementById('{graph_id}');"
+                "if(!gd||!window.Plotly){return;}"
+                "const resize=()=>{"
+                "gd.style.width='100%';"
+                "gd.style.height='100%';"
+                "if(window.Plotly&&Plotly.Plots){Plotly.Plots.resize(gd);}"
+                "};"
+                "window.addEventListener('resize', resize);"
+                "if(window.ResizeObserver){new ResizeObserver(resize).observe(document.body);}"
+                "setTimeout(resize,0);"
+                "setTimeout(resize,120);"
+                "})();"
+                "</script>"
+            )
+        font_face_css = _embedded_display_font_css()
+        html_head = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<style>"
+            f"{font_face_css}"
+            f"html,body,#plot-host{{margin:0;width:100%;height:100%;overflow:hidden;background:{plot_bg};}}"
+            f"html,body,#plot-host,.plotly-graph-div{{font-family:{plot_font};}}"
+            ".plotly-graph-div{width:100%!important;height:100%!important;}"
+            "</style>"
+        )
+        if _PLOTLY_JS_BASE_DIR:
+            return (
+                f"{html_head}<script src='plotly.min.js'></script></head><body>"
+                f"{html_fragment}{resize_script}</body></html>"
+            )
+        return (
+            f"{html_head}<script src='https://cdn.plot.ly/plotly-3.4.0.min.js'></script></head><body>"
+            f"{html_fragment}{resize_script}</body></html>"
+        )
+
+    def _render_visibility_web_plot(
+        self,
+        data: Optional[dict] = None,
+        *,
+        now_override: Optional[datetime] = None,
+    ) -> None:
+        web_view = getattr(self, "visibility_web", None)
+        payload = data if isinstance(data, dict) else getattr(self, "last_payload", None)
+        if web_view is None or not isinstance(payload, dict):
+            return
+        html = self._build_visibility_plotly_html(payload, now_override=now_override)
+        if not html:
+            self._visibility_web_has_content = False
+            self._set_visibility_loading_state("Unable to render interactive chart.", visible=True)
+            return
+        if not self._visibility_web_has_content:
+            self._set_visibility_loading_state("Rendering interactive chart…", visible=True)
+        if _PLOTLY_JS_BASE_DIR:
+            web_view.setHtml(html, QUrl.fromLocalFile(str(_PLOTLY_JS_BASE_DIR) + "/"))
+            return
+        web_view.setHtml(html)
 
     def _refresh_target_color_map(self, palette: Optional[list[str]] = None):
         use_palette = palette if palette is not None else self._line_palette()
@@ -3473,15 +13622,248 @@ class MainWindow(QMainWindow):
             fov_y = base / ratio
         return fov_x, fov_y
 
-    def _cutout_fov_text(self, width_px: int, height_px: int) -> str:
+    def _aladin_fetch_fov_axes_arcmin(self, width_px: int, height_px: int) -> tuple[float, float]:
         fov_x, fov_y = self._cutout_fov_axes_arcmin(width_px, height_px)
+        margin = max(1.0, float(CUTOUT_ALADIN_FETCH_MARGIN))
+        fetch_x = float(fov_x) * margin
+        fetch_y = float(fov_y) * margin
+        min_short_axis = self._aladin_fetch_min_short_axis_arcmin()
+        if width_px > 0 and height_px > 0:
+            ratio = max(0.25, min(4.0, float(width_px) / float(height_px)))
+            if ratio >= 1.0:
+                # Height is the shorter axis in landscape.
+                fetch_y = max(fetch_y, min_short_axis)
+                fetch_x = max(fetch_x, fetch_y * ratio)
+            else:
+                # Width is the shorter axis in portrait.
+                fetch_x = max(fetch_x, min_short_axis)
+                fetch_y = max(fetch_y, fetch_x / ratio)
+        else:
+            fetch_x = max(fetch_x, min_short_axis)
+            fetch_y = max(fetch_y, min_short_axis)
+        context_factor = max(1.0, float(getattr(self, "_aladin_context_factor", 1.0)))
+        if context_factor > 1.0:
+            fetch_x *= context_factor
+            fetch_y *= context_factor
+        return fetch_x, fetch_y
+
+    def _aladin_fetch_min_short_axis_arcmin(self) -> float:
+        fallback = max(1.0, float(CUTOUT_ALADIN_FETCH_MIN_ARCMIN))
+        tel_fov = self._site_telescope_fov_arcmin()
+        if tel_fov is None:
+            return fallback
+        tel_short = min(float(tel_fov[0]), float(tel_fov[1]))
+        if not math.isfinite(tel_short) or tel_short <= 0.0:
+            return fallback
+        dynamic = tel_short * max(1.0, float(CUTOUT_ALADIN_FETCH_TELESCOPE_MARGIN))
+        dynamic = max(float(CUTOUT_MIN_FOV_ARCMIN), dynamic)
+        dynamic = min(float(CUTOUT_ALADIN_FETCH_TELESCOPE_MAX_ARCMIN), dynamic)
+        return dynamic
+
+    def _aladin_fetch_dimensions_px(self, width_px: int, height_px: int) -> tuple[int, int]:
+        w = max(1, int(width_px))
+        h = max(1, int(height_px))
+        short_axis = max(1, min(w, h))
+        min_short_px = max(256, int(CUTOUT_ALADIN_FETCH_MIN_SHORT_PX))
+        scale = max(
+            1.0,
+            float(CUTOUT_ALADIN_FETCH_RES_MULT),
+            float(min_short_px) / float(short_axis),
+        )
+        out_w = max(64, int(round(float(w) * scale)))
+        out_h = max(64, int(round(float(h) * scale)))
+        max_edge = max(min_short_px, int(CUTOUT_ALADIN_FETCH_MAX_EDGE_PX))
+        largest = max(out_w, out_h)
+        if largest > max_edge:
+            down = float(max_edge) / float(largest)
+            out_w = max(64, int(round(float(out_w) * down)))
+            out_h = max(64, int(round(float(out_h) * down)))
+        step = 8
+        out_w = max(64, int(round(out_w / step) * step))
+        out_h = max(64, int(round(out_h / step) * step))
+        return out_w, out_h
+
+    def _site_telescope_fov_arcmin(self, site: Optional[Site] = None) -> Optional[tuple[float, float]]:
+        site_obj = site
+        if site_obj is None:
+            if hasattr(self, "obs_combo") and hasattr(self, "observatories"):
+                site_obj = self.observatories.get(self.obs_combo.currentText())
+            if site_obj is None and hasattr(self, "table_model"):
+                site_obj = self.table_model.site
+        if site_obj is None:
+            return None
+        fov = site_obj.fov_arcmin
+        if fov is None:
+            return None
+        fov_x = _safe_float(fov[0])
+        fov_y = _safe_float(fov[1])
+        if fov_x is None or fov_y is None:
+            return None
+        if not math.isfinite(fov_x) or not math.isfinite(fov_y) or fov_x <= 0.0 or fov_y <= 0.0:
+            return None
+        return float(fov_x), float(fov_y)
+
+    def _telescope_overlay_signature(self, site: Optional[Site] = None) -> str:
+        fov = self._site_telescope_fov_arcmin(site)
+        if fov is None:
+            return "none"
+        return f"{fov[0]:.3f}x{fov[1]:.3f}"
+
+    def _fit_cutout_base_fov_to_telescope(self, tel_fov_x: float, tel_fov_y: float, width_px: int, height_px: int) -> int:
+        ratio = 1.0
+        if width_px > 0 and height_px > 0:
+            ratio = max(0.25, min(4.0, float(width_px) / float(height_px)))
+        if ratio >= 1.0:
+            required_base = max(float(tel_fov_y), float(tel_fov_x) / ratio)
+        else:
+            required_base = max(float(tel_fov_x), float(tel_fov_y) * ratio)
+        return _sanitize_cutout_fov_arcmin(int(round(required_base)))
+
+    def _sync_cutout_fov_to_site(self, site: Optional[Site] = None, persist: bool = False) -> bool:
+        tel_fov = self._site_telescope_fov_arcmin(site)
+        if tel_fov is None:
+            return False
+        render_w, render_h = self._cutout_render_dimensions_px(getattr(self, "aladin_image_label", None))
+        fitted = self._fit_cutout_base_fov_to_telescope(tel_fov[0], tel_fov[1], render_w, render_h)
+        if fitted == int(self._cutout_fov_arcmin):
+            return False
+        self._cutout_fov_arcmin = int(fitted)
+        if persist:
+            self.settings.setValue("general/cutoutFovArcmin", int(self._cutout_fov_arcmin))
+        return True
+
+    def _telescope_overlay_rect(
+        self,
+        width_px: int,
+        height_px: int,
+        margin_px: int = 0,
+        fov_axes: Optional[tuple[float, float]] = None,
+    ) -> Optional[tuple[int, int, int, int]]:
+        tel_fov = self._site_telescope_fov_arcmin()
+        if tel_fov is None:
+            return None
+        if fov_axes is None:
+            cutout_fov_x, cutout_fov_y = self._cutout_fov_axes_arcmin(width_px, height_px)
+        else:
+            cutout_fov_x, cutout_fov_y = float(fov_axes[0]), float(fov_axes[1])
+        if cutout_fov_x <= 0.0 or cutout_fov_y <= 0.0:
+            return None
+        rel_w = max(0.0, min(1.0, float(tel_fov[0]) / float(cutout_fov_x)))
+        rel_h = max(0.0, min(1.0, float(tel_fov[1]) / float(cutout_fov_y)))
+        if rel_w <= 0.0 or rel_h <= 0.0:
+            return None
+        safe_margin = max(0, int(margin_px))
+        avail_w = max(8, int(width_px) - 2 * safe_margin)
+        avail_h = max(8, int(height_px) - 2 * safe_margin)
+        rect_w = max(8, int(round(float(avail_w) * rel_w)))
+        rect_h = max(8, int(round(float(avail_h) * rel_h)))
+        rect_w = min(rect_w, avail_w)
+        rect_h = min(rect_h, avail_h)
+        x0 = safe_margin + max(0, (avail_w - rect_w) // 2)
+        y0 = safe_margin + max(0, (avail_h - rect_h) // 2)
+        return x0, y0, rect_w, rect_h
+
+    def _paint_telescope_fov_overlay(
+        self,
+        painter: QPainter,
+        w: int,
+        h: int,
+        fill: bool = True,
+        color: Optional[QColor] = None,
+        offset_x: int = 0,
+        offset_y: int = 0,
+        fov_axes: Optional[tuple[float, float]] = None,
+        min_margin_px: int = 4,
+    ) -> None:
+        pen_width = max(1, int(min(w, h) * 0.005))
+        margin = max(int(min_margin_px), int(math.ceil(pen_width * 0.8)))
+        overlay = self._telescope_overlay_rect(w, h, margin_px=margin, fov_axes=fov_axes)
+        if overlay is None:
+            return
+        x0, y0, rw, rh = overlay
+        overlay_color = color or self._theme_qcolor("overlay_fov", "#59f3ff")
+        overlay_color.setAlpha(180 if color is None else overlay_color.alpha())
+        pen = QPen(overlay_color)
+        pen.setWidth(pen_width)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        if fill:
+            fill_color = QColor(overlay_color)
+            fill_color.setAlpha(24)
+            painter.setBrush(fill_color)
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        # Qt drawRect includes the right/bottom border pixels; shrink by 1 px
+        # so dashed edges are not clipped when overlay touches panel bounds.
+        draw_w = max(2, int(rw) - 1)
+        draw_h = max(2, int(rh) - 1)
+        painter.drawRect(int(x0 + offset_x), int(y0 + offset_y), draw_w, draw_h)
+
+    def _cutout_fov_text(
+        self,
+        width_px: int,
+        height_px: int,
+        fetch_margin: bool = False,
+        fov_axes: Optional[tuple[float, float]] = None,
+    ) -> str:
+        if fov_axes is not None:
+            fov_x, fov_y = float(fov_axes[0]), float(fov_axes[1])
+        elif fetch_margin:
+            fov_x, fov_y = self._aladin_fetch_fov_axes_arcmin(width_px, height_px)
+        else:
+            fov_x, fov_y = self._cutout_fov_axes_arcmin(width_px, height_px)
         return f"{fov_x:.1f}x{fov_y:.1f} arcmin"
 
     def _cutout_key_for_target(self, target: Target, width_px: int, height_px: int) -> str:
+        fetch_w, fetch_h = self._aladin_fetch_dimensions_px(width_px, height_px)
         return (
             f"{self._cutout_survey_key}:{self._cutout_fov_arcmin}:{width_px}x{height_px}:"
+            f"fetch{fetch_w}x{fetch_h}:"
+            f"ctx{float(getattr(self, '_aladin_context_factor', 1.0)):.2f}:"
+            f"fetchm{CUTOUT_ALADIN_FETCH_MARGIN:.2f}:minfov{CUTOUT_ALADIN_FETCH_MIN_ARCMIN:.1f}:"
+            f"telfetchm{CUTOUT_ALADIN_FETCH_TELESCOPE_MARGIN:.2f}:"
+            f"telfetchmax{CUTOUT_ALADIN_FETCH_TELESCOPE_MAX_ARCMIN:.1f}:"
+            f"res{CUTOUT_ALADIN_FETCH_RES_MULT:.2f}:minpx{CUTOUT_ALADIN_FETCH_MIN_SHORT_PX}:maxpx{CUTOUT_ALADIN_FETCH_MAX_EDGE_PX}:"
+            f"{self._telescope_overlay_signature()}:"
             f"{target.ra:.6f},{target.dec:.6f}"
         )
+
+    def _aladin_visible_image_rect(
+        self,
+        widget_w: int,
+        widget_h: int,
+        image_x: int,
+        image_y: int,
+        image_w: int,
+        image_h: int,
+    ) -> tuple[int, int, int, int]:
+        if widget_w <= 0 or widget_h <= 0:
+            return 0, 0, 1, 1
+        if image_w <= 0 or image_h <= 0:
+            return 0, 0, int(widget_w), int(widget_h)
+        left = max(0, int(image_x))
+        top = max(0, int(image_y))
+        right = min(int(widget_w), int(image_x + image_w))
+        bottom = min(int(widget_h), int(image_y + image_h))
+        if right <= left or bottom <= top:
+            return 0, 0, int(widget_w), int(widget_h)
+        return left, top, int(right - left), int(bottom - top)
+
+    def _aladin_visible_fov_axes_arcmin(
+        self,
+        widget_w: int,
+        widget_h: int,
+        image_x: int,
+        image_y: int,
+        image_w: int,
+        image_h: int,
+    ) -> tuple[float, float]:
+        base_x, base_y = self._aladin_fetch_fov_axes_arcmin(image_w, image_h)
+        _ = (image_x, image_y)
+        # FOV should react to zoom level; panning must not change FOV value.
+        frac_x = max(0.02, min(1.0, float(max(1, widget_w)) / float(max(1, image_w))))
+        frac_y = max(0.02, min(1.0, float(max(1, widget_h)) / float(max(1, image_h))))
+        return float(base_x) * frac_x, float(base_y) * frac_y
 
     def _cutout_resize_signature_for_target(self, target: Optional[Target]) -> Optional[tuple]:
         if target is None:
@@ -3493,6 +13875,8 @@ class MainWindow(QMainWindow):
             self._cutout_view_key,
             self._cutout_survey_key,
             int(self._cutout_fov_arcmin),
+            round(float(getattr(self, "_aladin_context_factor", 1.0)), 3),
+            self._telescope_overlay_signature(),
             int(aw),
             int(ah),
             int(fw),
@@ -3514,8 +13898,11 @@ class MainWindow(QMainWindow):
         target = self._selected_target_or_none()
         if target is None:
             return
+        fov_changed = self._sync_cutout_fov_to_site()
         sig = self._cutout_resize_signature_for_target(target)
-        if sig is None or sig == self._cutout_last_resize_signature:
+        if sig is None:
+            return
+        if (not fov_changed) and sig == self._cutout_last_resize_signature:
             return
         self._cutout_last_resize_signature = sig
         self._update_cutout_preview_for_target(target)
@@ -3523,42 +13910,86 @@ class MainWindow(QMainWindow):
     def _set_cutout_placeholder(self, text: str):
         if not hasattr(self, "aladin_image_label"):
             return
-        for label in (self.aladin_image_label, getattr(self, "finder_image_label", None)):
+        for kind, label in (
+            ("aladin", self.aladin_image_label),
+            ("finder", getattr(self, "finder_image_label", None)),
+        ):
             if label is None:
                 continue
             label.setPixmap(QPixmap())
             label.setText(text)
+            self._set_cutout_image_loading(kind, text, visible=False)
+
+    def _paint_aladin_static_overlay(
+        self,
+        painter: QPainter,
+        w: int,
+        h: int,
+        image_x: Optional[int] = None,
+        image_y: Optional[int] = None,
+        image_w: Optional[int] = None,
+        image_h: Optional[int] = None,
+    ) -> None:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        iw = int(image_w if image_w is not None else w)
+        ih = int(image_h if image_h is not None else h)
+        ix = int(image_x if image_x is not None else 0)
+        iy = int(image_y if image_y is not None else 0)
+        _ = (ix, iy)
+
+        # Keep crosshair + telescope FOV fixed in viewport center.
+        cx = w // 2
+        cy = h // 2
+        radius = max(10, int(min(w, h) * 0.14))
+
+        # Crosshair and center ring for quick visual centering.
+        crosshair = self._theme_qcolor("overlay_crosshair", "#ff5d8f")
+        crosshair.setAlpha(225)
+        pen_cross = QPen(crosshair)
+        pen_cross.setWidth(max(1, int(min(w, h) * 0.01)))
+        painter.setPen(pen_cross)
+        span = max(14, int(min(w, h) * 0.18))
+        painter.drawLine(cx - span, cy, cx + span, cy)
+        painter.drawLine(cx, cy - span, cx, cy + span)
+        ring_color = self._theme_qcolor("overlay_strip_text", "#eef4fc")
+        ring_color.setAlpha(210)
+        pen_ring = QPen(ring_color)
+        pen_ring.setWidth(max(1, int(min(w, h) * 0.008)))
+        painter.setPen(pen_ring)
+        painter.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
+        overlay_fov_axes = self._aladin_visible_fov_axes_arcmin(
+            w,
+            h,
+            ix,
+            iy,
+            iw,
+            ih,
+        )
+        self._paint_telescope_fov_overlay(
+            painter,
+            w,
+            h,
+            fov_axes=overlay_fov_axes,
+        )
+
+        # Keep survey/FOV visible directly on Aladin image.
+        strip_h = max(16, int(h * 0.10))
+        strip_y = h - strip_h
+        strip_bg = self._theme_qcolor("overlay_strip_bg", "#08111d")
+        strip_bg.setAlpha(165)
+        painter.fillRect(0, strip_y, w, strip_h, strip_bg)
+        strip_text = self._theme_qcolor("overlay_strip_text", "#eef4fc")
+        strip_text.setAlpha(240)
+        painter.setPen(strip_text)
+        meta_txt = f"{_cutout_survey_label(self._cutout_survey_key)} | {self._cutout_fov_text(w, h, fov_axes=overlay_fov_axes)}"
+        painter.drawText(8, strip_y, max(8, w - 16), strip_h, Qt.AlignVCenter | Qt.AlignLeft, meta_txt)
 
     def _build_aladin_overlay_pixmap(self, source: QPixmap) -> QPixmap:
         if source.isNull():
             return source
         view = source.copy()
         painter = QPainter(view)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        w = view.width()
-        h = view.height()
-        cx = w // 2
-        cy = h // 2
-        radius = max(12, int(min(w, h) * 0.14))
-
-        # Crosshair and center ring for quick visual centering.
-        pen_cross = QPen(QColor(255, 84, 84, 225))
-        pen_cross.setWidth(max(1, int(min(w, h) * 0.01)))
-        painter.setPen(pen_cross)
-        span = max(18, int(min(w, h) * 0.18))
-        painter.drawLine(cx - span, cy, cx + span, cy)
-        painter.drawLine(cx, cy - span, cx, cy + span)
-        pen_ring = QPen(QColor(250, 250, 250, 210))
-        pen_ring.setWidth(max(1, int(min(w, h) * 0.008)))
-        painter.setPen(pen_ring)
-        painter.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
-
-        # Keep survey/FOV visible directly on Aladin image.
-        strip_h = max(16, int(h * 0.10))
-        painter.fillRect(0, h - strip_h, w, strip_h, QColor(9, 14, 22, 165))
-        painter.setPen(QColor(238, 244, 252, 240))
-        meta_txt = f"{_cutout_survey_label(self._cutout_survey_key)} | {self._cutout_fov_text(w, h)}"
-        painter.drawText(8, h - strip_h, w - 16, strip_h, Qt.AlignVCenter | Qt.AlignLeft, meta_txt)
+        self._paint_aladin_static_overlay(painter, view.width(), view.height())
         painter.end()
         return view
 
@@ -3574,7 +14005,9 @@ class MainWindow(QMainWindow):
         cy = h // 2
 
         # Centered finder reticle (manual, to avoid astroplan offset on non-square frames).
-        pen_cross = QPen(QColor(255, 84, 84, 225))
+        crosshair = self._theme_qcolor("overlay_crosshair", "#ff5d8f")
+        crosshair.setAlpha(225)
+        pen_cross = QPen(crosshair)
         pen_cross.setWidth(max(1, int(min(w, h) * 0.010)))
         painter.setPen(pen_cross)
         span = max(16, int(min(w, h) * 0.10))
@@ -3583,10 +14016,22 @@ class MainWindow(QMainWindow):
         painter.drawLine(cx + gap, cy, cx + span, cy)
         painter.drawLine(cx, cy - span, cx, cy - gap)
         painter.drawLine(cx, cy + gap, cx, cy + span)
+        self._paint_telescope_fov_overlay(
+            painter,
+            w,
+            h,
+            fill=False,
+            color=self._theme_qcolor("overlay_crosshair", "#ff5d8f"),
+            min_margin_px=8,
+        )
 
         strip_h = max(16, int(h * 0.10))
-        painter.fillRect(0, h - strip_h, w, strip_h, QColor(9, 14, 22, 165))
-        painter.setPen(QColor(238, 244, 252, 240))
+        strip_bg = self._theme_qcolor("overlay_strip_bg", "#08111d")
+        strip_bg.setAlpha(165)
+        painter.fillRect(0, h - strip_h, w, strip_h, strip_bg)
+        strip_text = self._theme_qcolor("overlay_strip_text", "#eef4fc")
+        strip_text.setAlpha(240)
+        painter.setPen(strip_text)
         painter.drawText(
             8,
             h - strip_h,
@@ -3603,7 +14048,9 @@ class MainWindow(QMainWindow):
         if key in self._cutout_cache_order:
             self._cutout_cache_order.remove(key)
         self._cutout_cache_order.append(key)
-        while len(self._cutout_cache_order) > CUTOUT_CACHE_MAX:
+        targets_n = len(getattr(self, "targets", []))
+        cache_limit = max(CUTOUT_CACHE_MAX, min(160, int(targets_n) + 24))
+        while len(self._cutout_cache_order) > cache_limit:
             stale = self._cutout_cache_order.pop(0)
             self._cutout_cache.pop(stale, None)
 
@@ -3612,21 +14059,79 @@ class MainWindow(QMainWindow):
         if key in self._finder_cache_order:
             self._finder_cache_order.remove(key)
         self._finder_cache_order.append(key)
-        while len(self._finder_cache_order) > CUTOUT_CACHE_MAX:
+        targets_n = len(getattr(self, "targets", []))
+        cache_limit = max(CUTOUT_CACHE_MAX, min(160, int(targets_n) + 24))
+        while len(self._finder_cache_order) > cache_limit:
             stale = self._finder_cache_order.pop(0)
             self._finder_cache.pop(stale, None)
+
+    def _find_cutout_cache_variant(self, target: Target) -> Optional[tuple[str, QPixmap]]:
+        coord_suffix = f"{target.ra:.6f},{target.dec:.6f}"
+        prefix = f"{self._cutout_survey_key}:{self._cutout_fov_arcmin}:"
+        ctx_token = f"ctx{float(getattr(self, '_aladin_context_factor', 1.0)):.2f}:"
+        overlay_token = f"{self._telescope_overlay_signature()}:"
+        for key in reversed(self._cutout_cache_order):
+            if not key.endswith(coord_suffix):
+                continue
+            if not key.startswith(prefix):
+                continue
+            if ctx_token not in key:
+                continue
+            if overlay_token not in key:
+                continue
+            pix = self._cutout_cache.get(key)
+            if pix is None or pix.isNull():
+                continue
+            return key, pix
+        return None
+
+    def _find_finder_cache_variant(self, target: Target) -> Optional[tuple[str, QPixmap]]:
+        coord_suffix = f"{target.ra:.6f},{target.dec:.6f}"
+        prefix = f"{self._cutout_survey_key}:{self._cutout_fov_arcmin}:"
+        overlay_token = f"{self._telescope_overlay_signature()}:"
+        # Finder chart is independent from Aladin context zoom factor,
+        # so allow reusing cached variants across ctx changes.
+        for key in reversed(self._finder_cache_order):
+            if not key.endswith(coord_suffix):
+                continue
+            if not key.startswith(prefix):
+                continue
+            if overlay_token not in key:
+                continue
+            pix = self._finder_cache.get(key)
+            if pix is None or pix.isNull():
+                continue
+            return key, pix
+        return None
 
     def _show_finder_aladin_fallback(self, key: str, text_if_missing: str) -> bool:
         if not hasattr(self, "finder_image_label"):
             return False
-        fallback = self._cutout_cache.get(key)
+        # Keep Finder tab dedicated to finder output (no Aladin substitution).
+        fallback = self._finder_cache.get(key)
         if fallback is not None and not fallback.isNull():
             self.finder_image_label.setText("")
-            self.finder_image_label.setPixmap(self._build_aladin_overlay_pixmap(fallback))
+            self.finder_image_label.setPixmap(fallback)
+            self._set_cutout_image_loading("finder", "", visible=False)
+            self._finder_displayed_key = key
             return True
         self.finder_image_label.setPixmap(QPixmap())
         self.finder_image_label.setText(text_if_missing)
+        self._set_cutout_image_loading("finder", text_if_missing, visible=False)
+        self._finder_displayed_key = ""
         return False
+
+    def _ensure_aladin_pan_ready(self) -> None:
+        if not hasattr(self, "aladin_image_label"):
+            return
+        label = self.aladin_image_label
+        try:
+            zoom_now = float(label.zoom_factor())
+        except Exception:
+            zoom_now = 1.0
+        if abs(zoom_now - 1.0) > 1e-3:
+            return
+        label.set_zoom(float(CUTOUT_ALADIN_INITIAL_PAN_ZOOM))
 
     def _set_finder_status(self, text: str, busy: bool = False):
         if not hasattr(self, "status_finder_label") or not hasattr(self, "status_finder_progress"):
@@ -3639,6 +14144,46 @@ class MainWindow(QMainWindow):
         self.status_finder_progress.hide()
         self.status_finder_progress.setRange(0, 1)
         self.status_finder_progress.setValue(0)
+
+    def _set_aladin_status(self, text: str, busy: bool = False):
+        if not hasattr(self, "status_aladin_label") or not hasattr(self, "status_aladin_progress"):
+            return
+        self.status_aladin_label.setText(text)
+        if busy:
+            self.status_aladin_progress.setRange(0, 0)
+            self.status_aladin_progress.show()
+            return
+        self.status_aladin_progress.hide()
+        self.status_aladin_progress.setRange(0, 1)
+        self.status_aladin_progress.setValue(0)
+
+    def _finder_prefetch_done_status(self) -> None:
+        total = max(int(getattr(self, "_finder_prefetch_total", 0)), int(getattr(self, "_finder_prefetch_completed", 0)))
+        cached = max(0, int(getattr(self, "_finder_prefetch_cached", 0)))
+        self._set_finder_status(
+            f"Finder: prefetch done ({int(self._finder_prefetch_completed)}/{total}, {cached} cached)",
+            busy=False,
+        )
+
+    def _aladin_prefetch_done_status(self) -> None:
+        total = max(int(getattr(self, "_cutout_prefetch_total", 0)), int(getattr(self, "_cutout_prefetch_completed", 0)))
+        cached = max(0, int(getattr(self, "_cutout_prefetch_cached", 0)))
+        self._set_aladin_status(
+            f"Aladin: prefetch done ({int(self._cutout_prefetch_completed)}/{total}, {cached} cached)",
+            busy=False,
+        )
+
+    def _set_bhtom_status(self, text: str, busy: bool = False):
+        if not hasattr(self, "status_bhtom_label") or not hasattr(self, "status_bhtom_progress"):
+            return
+        self.status_bhtom_label.setText(text)
+        if busy:
+            self.status_bhtom_progress.setRange(0, 0)
+            self.status_bhtom_progress.show()
+            return
+        self.status_bhtom_progress.hide()
+        self.status_bhtom_progress.setRange(0, 1)
+        self.status_bhtom_progress.setValue(0)
 
     def _stop_finder_workers(self, aggressive: bool = False):
         workers = list(getattr(self, "_finder_workers", []))
@@ -3665,15 +14210,9 @@ class MainWindow(QMainWindow):
                 if aggressive:
                     stopped = False
                     try:
-                        stopped = worker.wait(150)
+                        stopped = worker.wait(5500)
                     except Exception:
                         stopped = False
-                    if not stopped:
-                        try:
-                            worker.terminate()
-                            worker.wait(250)
-                        except Exception:
-                            pass
 
             still_running = False
             try:
@@ -3692,6 +14231,14 @@ class MainWindow(QMainWindow):
             self._finder_timeout_timer.stop()
         self._stop_finder_workers(aggressive=False)
         self._finder_pending_key = ""
+        self._finder_pending_name = ""
+        self._finder_pending_background = False
+        self._finder_prefetch_queue.clear()
+        self._finder_prefetch_enqueued_keys.clear()
+        self._finder_prefetch_total = 0
+        self._finder_prefetch_completed = 0
+        self._finder_prefetch_cached = 0
+        self._finder_prefetch_active = False
         self._finder_request_id += 1
         self._set_finder_status("Finder: cancelled" if had_pending else "Finder: idle", busy=False)
 
@@ -3703,38 +14250,79 @@ class MainWindow(QMainWindow):
             return
         if key != self._finder_pending_key:
             return
+        pending_name = str(getattr(self, "_finder_pending_name", "") or "")
         self._finder_pending_key = ""
+        self._finder_pending_name = ""
+        was_background = bool(getattr(self, "_finder_pending_background", False))
+        self._finder_pending_background = False
 
         if err or not payload:
             status_text = "Finder: unavailable"
             if err and err.lower() == "cancelled":
                 status_text = "Finder: cancelled"
-            self._set_finder_status(status_text, busy=False)
+            if not was_background:
+                self._set_finder_status(status_text, busy=False)
+            else:
+                self._finder_prefetch_completed += 1
             if err and err.lower() != "cancelled":
                 logger.warning("Finder chart generation failed for key '%s': %s", key, err)
                 self._finder_retry_after[key] = perf_counter() + FINDER_RETRY_COOLDOWN_S
-            self._show_finder_aladin_fallback(key, "Finder chart unavailable")
+            if not was_background:
+                self._show_finder_aladin_fallback(key, "Finder chart unavailable")
+            self._drain_finder_prefetch_queue()
+            if was_background and not self._finder_pending_key and not self._finder_prefetch_queue:
+                self._finder_prefetch_done_status()
+                self._finder_prefetch_active = False
             return
 
         image = QImage.fromData(payload, "PNG")
         if image.isNull():
-            self._set_finder_status("Finder: decode failed", busy=False)
+            if not was_background:
+                self._set_finder_status("Finder: decode failed", busy=False)
+            else:
+                self._finder_prefetch_completed += 1
             self._finder_retry_after[key] = perf_counter() + FINDER_RETRY_COOLDOWN_S
-            self._show_finder_aladin_fallback(key, "Finder chart decode failed")
+            if not was_background:
+                self._show_finder_aladin_fallback(key, "Finder chart decode failed")
+            self._drain_finder_prefetch_queue()
+            if was_background and not self._finder_pending_key and not self._finder_prefetch_queue:
+                self._finder_prefetch_done_status()
+                self._finder_prefetch_active = False
             return
         pix = QPixmap.fromImage(image)
         if pix.isNull():
-            self._set_finder_status("Finder: decode failed", busy=False)
+            if not was_background:
+                self._set_finder_status("Finder: decode failed", busy=False)
+            else:
+                self._finder_prefetch_completed += 1
             self._finder_retry_after[key] = perf_counter() + FINDER_RETRY_COOLDOWN_S
-            self._show_finder_aladin_fallback(key, "Finder chart decode failed")
+            if not was_background:
+                self._show_finder_aladin_fallback(key, "Finder chart decode failed")
+            self._drain_finder_prefetch_queue()
+            if was_background and not self._finder_pending_key and not self._finder_prefetch_queue:
+                self._finder_prefetch_done_status()
+                self._finder_prefetch_active = False
             return
         pix_with_overlay = self._build_finder_overlay_pixmap(pix)
         self._cache_finder_pixmap(key, pix_with_overlay)
         self._finder_retry_after.pop(key, None)
-        self._set_finder_status("Finder: ready", busy=False)
-        if hasattr(self, "finder_image_label"):
+        if not was_background:
+            name_hint = pending_name.strip()
+            if name_hint:
+                self._set_finder_status(f"Finder: ready ({name_hint})", busy=False)
+            else:
+                self._set_finder_status("Finder: ready", busy=False)
+        if (not was_background) and hasattr(self, "finder_image_label"):
             self.finder_image_label.setText("")
             self.finder_image_label.setPixmap(pix_with_overlay)
+            self._set_cutout_image_loading("finder", "", visible=False)
+            self._finder_displayed_key = key
+        if was_background:
+            self._finder_prefetch_completed += 1
+        self._drain_finder_prefetch_queue()
+        if was_background and not self._finder_pending_key and not self._finder_prefetch_queue:
+            self._finder_prefetch_done_status()
+            self._finder_prefetch_active = False
 
     def _on_finder_chart_worker_finished(self, worker: FinderChartWorker):
         workers = getattr(self, "_finder_workers", None)
@@ -3742,52 +14330,112 @@ class MainWindow(QMainWindow):
             workers.remove(worker)
         if self._finder_worker is worker:
             self._finder_worker = None
+        if self._finder_pending_key:
+            return
+        if self._finder_prefetch_queue:
+            self._drain_finder_prefetch_queue()
+            return
+        if self._finder_prefetch_active and self._finder_prefetch_completed >= self._finder_prefetch_total:
+            self._finder_prefetch_done_status()
+            self._finder_prefetch_active = False
 
     @Slot()
     def _on_finder_chart_timeout(self):
         key = self._finder_pending_key
         if not key:
             return
+        pending_name = str(getattr(self, "_finder_pending_name", "") or "")
+        was_background = bool(getattr(self, "_finder_pending_background", False))
         self._finder_pending_key = ""
+        self._finder_pending_name = ""
+        self._finder_pending_background = False
         self._finder_request_id += 1
         self._finder_retry_after[key] = perf_counter() + FINDER_RETRY_COOLDOWN_S
         self._stop_finder_workers(aggressive=True)
-        self._set_finder_status("Finder: timeout", busy=False)
-        self._show_finder_aladin_fallback(key, "Finder chart timeout")
+        if not was_background:
+            if pending_name.strip():
+                self._set_finder_status(f"Finder: timeout ({pending_name})", busy=False)
+            else:
+                self._set_finder_status("Finder: timeout", busy=False)
+            self._show_finder_aladin_fallback(key, "Finder chart timeout")
+        else:
+            self._finder_prefetch_completed += 1
         logger.warning("Finder chart timed out for key '%s'", key)
+        if not self._finder_workers:
+            self._drain_finder_prefetch_queue()
+        if was_background and not self._finder_pending_key and not self._finder_prefetch_queue and not self._finder_workers:
+            self._finder_prefetch_done_status()
+            self._finder_prefetch_active = False
 
-    def _update_finder_chart_for_target(self, target: Target, key: str):
+    def _update_finder_chart_for_target(self, target: Target, key: str, *, background: bool = False):
         if not hasattr(self, "finder_image_label"):
+            return
+        if (
+            not background
+            and key == getattr(self, "_finder_displayed_key", "")
+            and not self._finder_pending_key
+        ):
             return
         cached = self._finder_cache.get(key)
         if cached is not None and not cached.isNull():
-            if hasattr(self, "_finder_timeout_timer"):
+            if (not background) and hasattr(self, "_finder_timeout_timer"):
                 self._finder_timeout_timer.stop()
-            self.finder_image_label.setText("")
-            self.finder_image_label.setPixmap(cached)
-            self._set_finder_status("Finder: cached", busy=False)
+            if not background:
+                self.finder_image_label.setText("")
+                self.finder_image_label.setPixmap(cached)
+                self._set_cutout_image_loading("finder", "", visible=False)
+                self._set_finder_status(f"Finder: cached ({target.name})", busy=False)
+                self._finder_displayed_key = key
+            return
+        cached_variant = self._find_finder_cache_variant(target)
+        if cached_variant is not None:
+            _variant_key, variant_pix = cached_variant
+            self._cache_finder_pixmap(key, variant_pix)
+            if (not background) and hasattr(self, "_finder_timeout_timer"):
+                self._finder_timeout_timer.stop()
+            if not background:
+                self.finder_image_label.setText("")
+                self.finder_image_label.setPixmap(variant_pix)
+                self._set_cutout_image_loading("finder", "", visible=False)
+                self._set_finder_status(f"Finder: cached ({target.name})", busy=False)
+                self._finder_displayed_key = key
             return
         if self._finder_pending_key == key:
-            self._set_finder_status("Finder: loading...", busy=True)
+            if not background:
+                pending_name = str(getattr(self, "_finder_pending_name", "") or "").strip()
+                if pending_name:
+                    self._set_finder_status(f"Finder: loading {pending_name}...", busy=True)
+                    self._set_cutout_image_loading("finder", f"Loading finder chart for {pending_name}…", visible=True)
+                else:
+                    self._set_finder_status("Finder: loading...", busy=True)
+                    self._set_cutout_image_loading("finder", "Loading finder chart…", visible=True)
+            return
+        if background and self._finder_pending_key:
+            self._enqueue_finder_prefetch(target, key)
             return
 
         retry_after = float(self._finder_retry_after.get(key, 0.0))
         now = perf_counter()
         if retry_after > now:
             secs = max(1, int(round(retry_after - now)))
-            self._set_finder_status(f"Finder: retry in {secs}s", busy=False)
-            self._show_finder_aladin_fallback(key, f"Finder chart unavailable ({secs}s)")
+            if not background:
+                self._set_finder_status(f"Finder: retry in {secs}s", busy=False)
+                self._show_finder_aladin_fallback(key, f"Finder chart unavailable ({secs}s)")
             return
 
-        self.finder_image_label.setPixmap(QPixmap())
-        self.finder_image_label.setText("Loading finder chart...")
+        if not background:
+            self.finder_image_label.setPixmap(QPixmap())
+            self.finder_image_label.setText("Loading finder chart…")
+            self._set_cutout_image_loading("finder", f"Loading finder chart for {target.name}…", visible=True)
 
         self._finder_request_id += 1
         req_id = self._finder_request_id
         self._finder_pending_key = key
+        self._finder_pending_name = target.name
+        self._finder_pending_background = background
         render_w, render_h = self._cutout_render_dimensions_px(getattr(self, "finder_image_label", None))
         old_worker = self._finder_worker
-        if old_worker is not None:
+        if (not background) and old_worker is not None:
             try:
                 if old_worker.isRunning():
                     old_worker.requestInterruption()
@@ -3810,60 +14458,134 @@ class MainWindow(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         self._finder_workers.append(worker)
         self._finder_worker = worker
-        self._set_finder_status("Finder: loading...", busy=True)
+        if not background:
+            self._set_finder_status(f"Finder: loading {target.name}...", busy=True)
+        else:
+            total = max(int(getattr(self, "_finder_prefetch_total", 0)), 1)
+            done = int(getattr(self, "_finder_prefetch_completed", 0))
+            cached = int(getattr(self, "_finder_prefetch_cached", 0))
+            current_idx = min(total, max(1, done + 1))
+            queued_left = len(getattr(self, "_finder_prefetch_queue", []))
+            self._set_finder_status(
+                f"Finder: prefetch {current_idx}/{total} ({cached} cached) {target.name} (queue {queued_left})",
+                busy=True,
+            )
         worker.start()
         if hasattr(self, "_finder_timeout_timer"):
             self._finder_timeout_timer.start()
 
-    def _update_cutout_preview_for_target(self, target: Optional[Target]):
-        if not hasattr(self, "cutout_image_label"):
+    def _enqueue_finder_prefetch(self, target: Optional[Target], key: str) -> str:
+        if target is None or not key:
+            return "skipped"
+        cached = self._finder_cache.get(key)
+        if cached is not None and not cached.isNull():
+            return "cached"
+        cached_variant = self._find_finder_cache_variant(target)
+        if cached_variant is not None:
+            _variant_key, variant_pix = cached_variant
+            # Alias current exact key to cached variant to prevent duplicate fetches.
+            self._cache_finder_pixmap(key, variant_pix)
+            return "cached"
+        if key == self._finder_pending_key:
+            return "skipped"
+        if key in self._finder_prefetch_enqueued_keys:
+            return "skipped"
+        retry_after = float(self._finder_retry_after.get(key, 0.0))
+        if retry_after > perf_counter():
+            return "skipped"
+        self._finder_prefetch_queue.append((target, key))
+        self._finder_prefetch_enqueued_keys.add(key)
+        return "queued"
+
+    def _drain_finder_prefetch_queue(self) -> None:
+        if self._finder_pending_key:
+            return
+        while self._finder_prefetch_queue and not self._finder_pending_key:
+            target, key = self._finder_prefetch_queue.pop(0)
+            self._finder_prefetch_enqueued_keys.discard(key)
+            if target not in self.targets:
+                continue
+            self._update_finder_chart_for_target(target, key, background=True)
+
+    def _prefetch_finder_charts_for_all_targets(self, prioritize: Optional[Target] = None) -> None:
+        if not self.targets:
+            return
+        # Keep one stable batch at a time to avoid progress inflation.
+        if self._finder_prefetch_active and (self._finder_pending_key or self._finder_prefetch_queue):
+            return
+        if self._finder_pending_key or self._finder_prefetch_queue:
+            return
+        candidates: list[Target] = []
+        if prioritize is not None:
+            candidates.append(prioritize)
+        for candidate in self.targets:
+            if prioritize is not None and candidate is prioritize:
+                continue
+            candidates.append(candidate)
+        if not candidates:
             return
 
-        if target is None:
-            if self._cutout_reply is not None and not self._cutout_reply.isFinished():
-                self._cutout_reply.abort()
-            self._cutout_reply = None
-            self._cutout_pending_key = ""
-            self._cutout_pending_name = ""
-            self._cutout_displayed_key = ""
-            self._set_cutout_placeholder("Select a target")
-            self._set_finder_status("Finder: idle", busy=False)
+        self._finder_prefetch_total = len(candidates)
+        self._finder_prefetch_completed = 0
+        self._finder_prefetch_cached = 0
+        self._finder_prefetch_active = True
+
+        render_w, render_h = self._cutout_render_dimensions_px(getattr(self, "finder_image_label", None))
+        for candidate in candidates:
+            key = self._cutout_key_for_target(candidate, render_w, render_h)
+            enqueue_state = self._enqueue_finder_prefetch(candidate, key)
+            if enqueue_state == "queued":
+                pass
+            else:
+                self._finder_prefetch_completed += 1
+                if enqueue_state == "cached":
+                    self._finder_prefetch_cached += 1
+
+        if self._finder_prefetch_completed >= self._finder_prefetch_total:
+            self._finder_prefetch_done_status()
+            self._finder_prefetch_active = False
             return
+        self._drain_finder_prefetch_queue()
 
-        render_w, render_h = self._cutout_render_dimensions_px(getattr(self, "aladin_image_label", None))
-        key = self._cutout_key_for_target(target, render_w, render_h)
-        self._cutout_last_resize_signature = self._cutout_resize_signature_for_target(target)
-        show_finder = getattr(self, "_cutout_view_key", "aladin") == "finderchart"
-        if show_finder:
-            self._update_finder_chart_for_target(target, key)
-
-        if key in self._cutout_cache:
-            aladin_pix = self._cutout_cache[key]
-            self.aladin_image_label.setText("")
-            self.aladin_image_label.setPixmap(self._build_aladin_overlay_pixmap(aladin_pix))
-            self._cutout_displayed_key = key
-            return
-
-        if key == self._cutout_pending_key and self._cutout_reply is not None and not self._cutout_reply.isFinished():
-            return
-
-        if self._cutout_reply is not None and not self._cutout_reply.isFinished():
-            self._cutout_reply.abort()
-        self._cutout_reply = None
-
-        self._set_cutout_placeholder("Loading...")
+    def _start_cutout_request(
+        self,
+        target: Target,
+        key: str,
+        *,
+        render_w: int,
+        render_h: int,
+        fetch_w: int,
+        fetch_h: int,
+        background: bool = False,
+    ) -> None:
         self._cutout_request_id += 1
         self._cutout_pending_key = key
         self._cutout_pending_name = target.name
+        self._cutout_pending_background = background
+        if not background:
+            self.aladin_image_label.setPixmap(QPixmap())
+            self.aladin_image_label.setText("Loading…")
+            self._set_cutout_image_loading("aladin", f"Loading Aladin preview for {target.name}…", visible=True)
+            self._set_aladin_status(f"Aladin: loading {target.name}...", busy=True)
+        else:
+            total = max(int(getattr(self, "_cutout_prefetch_total", 0)), 1)
+            done = int(getattr(self, "_cutout_prefetch_completed", 0))
+            cached = int(getattr(self, "_cutout_prefetch_cached", 0))
+            current_idx = min(total, max(1, done + 1))
+            queued_left = len(getattr(self, "_cutout_prefetch_queue", []))
+            self._set_aladin_status(
+                f"Aladin: prefetch {current_idx}/{total} ({cached} cached) {target.name} (queue {queued_left})",
+                busy=True,
+            )
 
         query = QUrlQuery()
         query.addQueryItem("hips", _cutout_survey_hips(self._cutout_survey_key))
         query.addQueryItem("ra", f"{target.ra:.8f}")
         query.addQueryItem("dec", f"{target.dec:.8f}")
-        fov_x_arcmin, _ = self._cutout_fov_axes_arcmin(render_w, render_h)
+        fov_x_arcmin, _ = self._aladin_fetch_fov_axes_arcmin(fetch_w, fetch_h)
         query.addQueryItem("fov", f"{(fov_x_arcmin / 60.0):.6f}")
-        query.addQueryItem("width", str(render_w))
-        query.addQueryItem("height", str(render_h))
+        query.addQueryItem("width", str(fetch_w))
+        query.addQueryItem("height", str(fetch_h))
         query.addQueryItem("projection", "TAN")
         query.addQueryItem("coordsys", "icrs")
         query.addQueryItem("format", "png")
@@ -3880,13 +14602,209 @@ class MainWindow(QMainWindow):
         reply.setProperty("cutout_request_id", self._cutout_request_id)
         reply.setProperty("cutout_key", key)
         reply.setProperty("cutout_name", target.name)
+        reply.setProperty("cutout_background", 1 if background else 0)
         self._cutout_reply = reply
+
+    def _enqueue_cutout_prefetch(
+        self,
+        target: Optional[Target],
+        key: str,
+        *,
+        render_w: int,
+        render_h: int,
+        fetch_w: int,
+        fetch_h: int,
+    ) -> str:
+        if target is None or not key:
+            return "skipped"
+        cached = self._cutout_cache.get(key)
+        if cached is not None and not cached.isNull():
+            return "cached"
+        cached_variant = self._find_cutout_cache_variant(target)
+        if cached_variant is not None:
+            _variant_key, variant_pix = cached_variant
+            # Alias current exact key to cached variant to prevent duplicate fetches.
+            self._cache_cutout_pixmap(key, variant_pix)
+            return "cached"
+        if key == self._cutout_pending_key:
+            return "skipped"
+        if key in self._cutout_prefetch_enqueued_keys:
+            return "skipped"
+        self._cutout_prefetch_queue.append((target, key, int(render_w), int(render_h), int(fetch_w), int(fetch_h)))
+        self._cutout_prefetch_enqueued_keys.add(key)
+        return "queued"
+
+    def _drain_cutout_prefetch_queue(self) -> None:
+        if self._cutout_pending_key:
+            return
+        while self._cutout_prefetch_queue and not self._cutout_pending_key:
+            target, key, render_w, render_h, fetch_w, fetch_h = self._cutout_prefetch_queue.pop(0)
+            self._cutout_prefetch_enqueued_keys.discard(key)
+            if target not in self.targets:
+                if self._cutout_prefetch_active:
+                    self._cutout_prefetch_completed += 1
+                continue
+            self._start_cutout_request(
+                target,
+                key,
+                render_w=render_w,
+                render_h=render_h,
+                fetch_w=fetch_w,
+                fetch_h=fetch_h,
+                background=True,
+            )
+
+    def _prefetch_cutouts_for_all_targets(self, prioritize: Optional[Target] = None) -> None:
+        if not self.targets:
+            return
+        # Keep one stable batch at a time to avoid progress inflation.
+        if self._cutout_prefetch_active and (self._cutout_pending_key or self._cutout_prefetch_queue):
+            return
+        if self._cutout_pending_key or self._cutout_prefetch_queue:
+            return
+        candidates: list[Target] = []
+        if prioritize is not None:
+            candidates.append(prioritize)
+        for candidate in self.targets:
+            if prioritize is not None and candidate is prioritize:
+                continue
+            candidates.append(candidate)
+        if not candidates:
+            return
+
+        self._cutout_prefetch_total = len(candidates)
+        self._cutout_prefetch_completed = 0
+        self._cutout_prefetch_cached = 0
+        self._cutout_prefetch_active = True
+
+        render_w, render_h = self._cutout_render_dimensions_px(getattr(self, "aladin_image_label", None))
+        fetch_w, fetch_h = self._aladin_fetch_dimensions_px(render_w, render_h)
+        for candidate in candidates:
+            key = self._cutout_key_for_target(candidate, render_w, render_h)
+            enqueue_state = self._enqueue_cutout_prefetch(
+                candidate,
+                key,
+                render_w=render_w,
+                render_h=render_h,
+                fetch_w=fetch_w,
+                fetch_h=fetch_h,
+            )
+            if enqueue_state == "queued":
+                pass
+            else:
+                self._cutout_prefetch_completed += 1
+                if enqueue_state == "cached":
+                    self._cutout_prefetch_cached += 1
+
+        if self._cutout_prefetch_completed >= self._cutout_prefetch_total:
+            self._aladin_prefetch_done_status()
+            self._cutout_prefetch_active = False
+            return
+        self._drain_cutout_prefetch_queue()
+
+    def _update_cutout_preview_for_target(self, target: Optional[Target]):
+        if not hasattr(self, "cutout_image_label"):
+            return
+
+        if target is None:
+            if self._cutout_reply is not None and not self._cutout_reply.isFinished():
+                self._cutout_reply.abort()
+            self._cutout_reply = None
+            self._cutout_pending_key = ""
+            self._cutout_pending_name = ""
+            self._cutout_pending_background = False
+            self._cutout_displayed_key = ""
+            self._finder_displayed_key = ""
+            self._set_cutout_placeholder("Select a target")
+            self._set_aladin_status("Aladin: idle", busy=False)
+            self._set_finder_status("Finder: idle", busy=False)
+            return
+
+        self._sync_cutout_fov_to_site()
+        render_w, render_h = self._cutout_render_dimensions_px(getattr(self, "aladin_image_label", None))
+        fetch_w, fetch_h = self._aladin_fetch_dimensions_px(render_w, render_h)
+        key = self._cutout_key_for_target(target, render_w, render_h)
+        self._cutout_last_resize_signature = self._cutout_resize_signature_for_target(target)
+        show_finder = getattr(self, "_cutout_view_key", "aladin") == "finderchart"
+        finder_already_displayed = (not show_finder) or (
+            key == getattr(self, "_finder_displayed_key", "")
+            and not self._finder_pending_key
+        )
+        if (
+            key == getattr(self, "_cutout_displayed_key", "")
+            and not self._cutout_pending_key
+            and finder_already_displayed
+        ):
+            return
+        if show_finder:
+            self._update_finder_chart_for_target(target, key)
+
+        if key in self._cutout_cache:
+            aladin_pix = self._cutout_cache[key]
+            self.aladin_image_label.setText("")
+            self.aladin_image_label.setPixmap(aladin_pix)
+            self._set_cutout_image_loading("aladin", "", visible=False)
+            self._ensure_aladin_pan_ready()
+            self._set_aladin_status(f"Aladin: cached ({target.name})", busy=False)
+            self._prefetch_cutouts_for_all_targets(prioritize=target)
+            if show_finder:
+                self._update_finder_chart_for_target(target, key)
+            else:
+                self._prefetch_finder_charts_for_all_targets(prioritize=target)
+            self._cutout_displayed_key = key
+            return
+
+        cached_variant = self._find_cutout_cache_variant(target)
+        if cached_variant is not None:
+            cached_key, cached_pix = cached_variant
+            self.aladin_image_label.setText("")
+            self.aladin_image_label.setPixmap(cached_pix)
+            self._set_cutout_image_loading("aladin", "", visible=False)
+            self._ensure_aladin_pan_ready()
+            self._set_aladin_status(f"Aladin: cached ({target.name})", busy=False)
+            self._prefetch_cutouts_for_all_targets(prioritize=target)
+            if show_finder:
+                self._update_finder_chart_for_target(target, key)
+            else:
+                self._prefetch_finder_charts_for_all_targets(prioritize=target)
+            self._cutout_displayed_key = cached_key
+            return
+
+        if key == self._cutout_pending_key and self._cutout_reply is not None and not self._cutout_reply.isFinished():
+            pending_name = str(getattr(self, "_cutout_pending_name", "") or "").strip()
+            if pending_name:
+                self._set_aladin_status(f"Aladin: loading {pending_name}...", busy=True)
+                self._set_cutout_image_loading("aladin", f"Loading Aladin preview for {pending_name}…", visible=True)
+            else:
+                self._set_aladin_status("Aladin: loading...", busy=True)
+                self._set_cutout_image_loading("aladin", "Loading Aladin preview…", visible=True)
+            return
+
+        if self._cutout_reply is not None and not self._cutout_reply.isFinished():
+            if self._cutout_pending_background and self._cutout_prefetch_active:
+                self._cutout_prefetch_completed += 1
+            self._cutout_reply.abort()
+        self._cutout_reply = None
+        self._cutout_pending_key = ""
+        self._cutout_pending_name = ""
+        self._cutout_pending_background = False
+
+        self._start_cutout_request(
+            target,
+            key,
+            render_w=render_w,
+            render_h=render_h,
+            fetch_w=fetch_w,
+            fetch_h=fetch_h,
+            background=False,
+        )
 
     @Slot(QNetworkReply)
     def _on_cutout_reply(self, reply: QNetworkReply):
         req_id = int(reply.property("cutout_request_id") or 0)
         key = str(reply.property("cutout_key") or "")
         target_name = str(reply.property("cutout_name") or "").strip()
+        is_background = bool(int(reply.property("cutout_background") or 0))
 
         # Ignore stale or unrelated replies.
         if req_id != self._cutout_request_id or key != self._cutout_pending_key:
@@ -3896,38 +14814,77 @@ class MainWindow(QMainWindow):
         self._cutout_reply = None
         self._cutout_pending_key = ""
         self._cutout_pending_name = ""
+        self._cutout_pending_background = False
 
         if reply.error() != QNetworkReply.NoError:
             err = reply.error()
             if err != QNetworkReply.OperationCanceledError:
                 logger.warning("Cutout fetch failed for '%s': %s", target_name or key, reply.errorString())
-                self._set_cutout_placeholder("Preview unavailable")
+                if not is_background:
+                    self._set_cutout_placeholder("Preview unavailable")
+                    label = target_name or "target"
+                    self._set_aladin_status(f"Aladin: unavailable ({label})", busy=False)
+            if is_background:
+                self._cutout_prefetch_completed += 1
             reply.deleteLater()
+            self._drain_cutout_prefetch_queue()
+            if is_background and not self._cutout_pending_key and not self._cutout_prefetch_queue:
+                self._aladin_prefetch_done_status()
+                self._cutout_prefetch_active = False
             return
 
         payload = bytes(reply.readAll())
         reply.deleteLater()
         pixmap = QPixmap()
         if not payload or not pixmap.loadFromData(payload):
-            self._set_cutout_placeholder("Preview decode failed")
+            if not is_background:
+                self._set_cutout_placeholder("Preview decode failed")
+                label = target_name or "target"
+                self._set_aladin_status(f"Aladin: decode failed ({label})", busy=False)
+            else:
+                self._cutout_prefetch_completed += 1
+                self._drain_cutout_prefetch_queue()
+                if not self._cutout_pending_key and not self._cutout_prefetch_queue:
+                    self._aladin_prefetch_done_status()
+                    self._cutout_prefetch_active = False
             return
 
         self._cache_cutout_pixmap(key, pixmap)
-        self.aladin_image_label.setText("")
-        self.aladin_image_label.setPixmap(self._build_aladin_overlay_pixmap(pixmap))
         target_lc = target_name.strip().lower()
         target = next((t for t in self.targets if t.name.strip().lower() == target_lc), None)
-        if target is not None and hasattr(self, "finder_image_label"):
-            should_render_finder = getattr(self, "_cutout_view_key", "aladin") == "finderchart"
-            if should_render_finder:
-                self._update_finder_chart_for_target(target, key)
-        self._cutout_displayed_key = key
+        if not is_background:
+            self.aladin_image_label.setText("")
+            self.aladin_image_label.setPixmap(pixmap)
+            self._set_cutout_image_loading("aladin", "", visible=False)
+            self._ensure_aladin_pan_ready()
+            label = target_name or "target"
+            self._set_aladin_status(f"Aladin: ready ({label})", busy=False)
+            self._cutout_displayed_key = key
+            if target is not None and hasattr(self, "finder_image_label"):
+                should_render_finder = getattr(self, "_cutout_view_key", "aladin") == "finderchart"
+                if should_render_finder:
+                    self._update_finder_chart_for_target(target, key)
+                else:
+                    self._prefetch_finder_charts_for_all_targets(prioritize=target)
+            self._prefetch_cutouts_for_all_targets(prioritize=target)
+        else:
+            self._cutout_prefetch_completed += 1
+        self._drain_cutout_prefetch_queue()
+        if is_background and not self._cutout_pending_key and not self._cutout_prefetch_queue:
+            self._aladin_prefetch_done_status()
+            self._cutout_prefetch_active = False
 
     def _clear_cutout_cache(self):
         if self._cutout_reply is not None and not self._cutout_reply.isFinished():
             self._cutout_reply.abort()
         self._cancel_finder_chart_worker()
         self._cutout_reply = None
+        self._cutout_prefetch_queue.clear()
+        self._cutout_prefetch_enqueued_keys.clear()
+        self._cutout_prefetch_total = 0
+        self._cutout_prefetch_completed = 0
+        self._cutout_prefetch_cached = 0
+        self._cutout_prefetch_active = False
         self._cutout_cache.clear()
         self._cutout_cache_order.clear()
         self._finder_cache.clear()
@@ -3935,8 +14892,11 @@ class MainWindow(QMainWindow):
         self._finder_retry_after.clear()
         self._cutout_last_resize_signature = None
         self._cutout_displayed_key = ""
+        self._finder_displayed_key = ""
         self._cutout_pending_key = ""
         self._cutout_pending_name = ""
+        self._cutout_pending_background = False
+        self._set_aladin_status("Aladin: idle", busy=False)
 
     def _selected_target_or_none(self) -> Optional[Target]:
         rows = self._selected_rows() if hasattr(self, "table_view") else []
@@ -3951,6 +14911,42 @@ class MainWindow(QMainWindow):
         if self._cutout_view_key != "finderchart":
             self._cancel_finder_chart_worker()
         self._update_cutout_preview_for_target(self._selected_target_or_none())
+
+    @Slot()
+    def _aladin_zoom_in(self):
+        if not hasattr(self, "aladin_image_label"):
+            return
+        self.aladin_image_label.set_zoom(self.aladin_image_label.zoom_factor() * 1.15)
+
+    def _aladin_expand_context(self) -> None:
+        context_now = max(1.0, float(getattr(self, "_aladin_context_factor", 1.0)))
+        step = max(1.05, float(CUTOUT_ALADIN_CONTEXT_STEP))
+        context_next = min(8.0, context_now * step)
+        if context_next <= context_now + 1e-4:
+            return
+        self._aladin_context_factor = context_next
+        self._update_cutout_preview_for_target(self._selected_target_or_none())
+
+    @Slot()
+    def _aladin_zoom_out(self):
+        if not hasattr(self, "aladin_image_label"):
+            return
+        label = self.aladin_image_label
+        current = float(label.zoom_factor())
+        if current > 1.02:
+            label.set_zoom(current / 1.15)
+            return
+        # Already at base scale: widen fetched Aladin context.
+        self._aladin_expand_context()
+
+    @Slot()
+    def _aladin_zoom_reset(self):
+        if not hasattr(self, "aladin_image_label"):
+            return
+        # Reset only viewport state (zoom/pan) in current image.
+        # Do not change context factor and do not refetch cutout.
+        self.aladin_image_label.reset_zoom()
+        self.aladin_image_label.set_zoom(float(CUTOUT_ALADIN_INITIAL_PAN_ZOOM))
 
     @Slot(str)
     def _on_obs_change(self, name: str):
@@ -3967,14 +14963,502 @@ class MainWindow(QMainWindow):
         self._clear_table_dynamic_cache()
         self.target_metrics.clear()
         self.target_windows.clear()
+        self.last_payload = None
         # Reset color mapping until new calculation assigns fresh colors
         self.table_model.color_map.clear()
         self.table_model.layoutChanged.emit()
         self._validate_site_inputs()
-        if hasattr(self, "progress"):
-            self._replot_timer.start()
-        # Restart clock worker to update real-time altitudes for the new site
+        self._begin_visibility_refresh(f"Updating view for {name}…")
+        self._replot_timer.start()
+        if hasattr(self, "aladin_image_label"):
+            self._set_cutout_image_loading("aladin", f"Loading Aladin preview for {name}…", visible=True)
+        if hasattr(self, "finder_image_label"):
+            self._set_cutout_image_loading("finder", f"Loading finder chart for {name}…", visible=True)
+        weather_window = getattr(self, "weather_window", None)
+        if isinstance(weather_window, WeatherDialog):
+            weather_window._set_weather_plot_loading("conditions", "Updating conditions…", visible=True)
+            weather_window._set_weather_plot_loading("meteogram", "Updating meteogram…", visible=True)
+            weather_window._set_weather_image_loading("cloud_map", "Updating cloud climatology…", visible=True)
+            weather_window._set_weather_image_loading("satellite", "Updating satellite preview…", visible=True)
+        self._obs_change_finalize_pending = True
+        QTimer.singleShot(0, lambda n=str(name): self._finalize_observatory_change(n))
+
+    def _finalize_observatory_change(self, name: str) -> None:
+        if not hasattr(self, "obs_combo") or self.obs_combo.currentText() != name:
+            return
+        site = self.observatories.get(name)
+        if site is None:
+            return
+        self._obs_change_finalize_pending = False
+        # Start the lightweight realtime worker first so the UI can repaint
+        # immediately; heavier panel rebuilds are deferred one more tick.
         self._start_clock_worker()
+        QTimer.singleShot(0, lambda n=str(name): self._refresh_observatory_dependent_views(n))
+
+    def _refresh_observatory_dependent_views(self, name: str) -> None:
+        if not hasattr(self, "obs_combo") or self.obs_combo.currentText() != name:
+            return
+        site = self.observatories.get(name)
+        if site is None:
+            return
+        self._sync_cutout_fov_to_site(site)
+        self._update_cutout_preview_for_target(self._selected_target_or_none())
+        self._refresh_weather_window_context()
+
+    def _current_limiting_magnitude(self) -> float:
+        site = None
+        if hasattr(self, "obs_combo") and hasattr(self, "observatories"):
+            site = self.observatories.get(self.obs_combo.currentText())
+        if site is None and hasattr(self, "table_model"):
+            site = self.table_model.site
+        if site is not None:
+            value = _safe_float(getattr(site, "limiting_magnitude", None))
+            if value is not None and math.isfinite(value):
+                return float(value)
+        return DEFAULT_LIMITING_MAGNITUDE
+
+    def _quick_targets_config(self) -> dict[str, object]:
+        count = self.settings.value("general/quickTargetsCount", QUICK_TARGETS_DEFAULT_COUNT, type=int)
+        min_importance = self.settings.value(
+            "general/quickTargetsMinImportance",
+            BHTOM_SUGGESTION_MIN_IMPORTANCE,
+            type=float,
+        )
+        try:
+            count = int(count)
+        except Exception:
+            count = QUICK_TARGETS_DEFAULT_COUNT
+        count = max(QUICK_TARGETS_MIN_COUNT, min(QUICK_TARGETS_MAX_COUNT, count))
+        try:
+            min_importance = float(min_importance)
+        except Exception:
+            min_importance = float(BHTOM_SUGGESTION_MIN_IMPORTANCE)
+        if not math.isfinite(min_importance) or min_importance < 0.0:
+            min_importance = float(BHTOM_SUGGESTION_MIN_IMPORTANCE)
+        return {
+            "count": count,
+            "min_importance": min_importance,
+            "use_score_filter": self.settings.value("general/quickTargetsUseScoreFilter", True, type=bool),
+            "use_moon_filter": self.settings.value("general/quickTargetsUseMoonFilter", True, type=bool),
+            "use_limiting_mag": self.settings.value("general/quickTargetsUseLimitingMag", True, type=bool),
+        }
+
+    def _update_quick_targets_button_tooltip(self) -> None:
+        if not hasattr(self, "quick_targets_btn"):
+            return
+        cfg = self._quick_targets_config()
+        count = int(cfg["count"])
+        use_score = bool(cfg["use_score_filter"])
+        use_moon = bool(cfg["use_moon_filter"])
+        use_lim_mag = bool(cfg["use_limiting_mag"])
+        parts: list[str] = []
+        if use_score:
+            parts.append("Score")
+        if use_moon:
+            parts.append("Moon Sep")
+        if use_lim_mag:
+            parts.append("Limiting mag")
+        filters_txt = ", ".join(parts) if parts else "no extra filters"
+        self.quick_targets_btn.setToolTip(
+            f"Add top {count} suggested targets sorted by score ({filters_txt})."
+        )
+
+    def _seestar_config(self) -> dict[str, object]:
+        method = str(self.settings.value("general/seestarMethod", SEESTAR_METHOD_GUIDED, type=str) or SEESTAR_METHOD_GUIDED).strip().lower()
+        if method not in {SEESTAR_METHOD_GUIDED, SEESTAR_METHOD_ALP}:
+            method = SEESTAR_METHOD_GUIDED
+        alp_base_url = (
+            str(self.settings.value("general/seestarAlpBaseUrl", SEESTAR_ALP_DEFAULT_BASE_URL, type=str) or SEESTAR_ALP_DEFAULT_BASE_URL)
+            .strip()
+            .rstrip("/")
+        ) or SEESTAR_ALP_DEFAULT_BASE_URL
+        alp_device_num = self.settings.value("general/seestarAlpDeviceNum", SEESTAR_ALP_DEFAULT_DEVICE_NUM, type=int)
+        alp_client_id = self.settings.value("general/seestarAlpClientId", SEESTAR_ALP_DEFAULT_CLIENT_ID, type=int)
+        alp_timeout_s = self.settings.value("general/seestarAlpTimeoutSec", SEESTAR_ALP_DEFAULT_TIMEOUT_S, type=float)
+        alp_gain = self.settings.value("general/seestarAlpGain", SEESTAR_ALP_DEFAULT_GAIN, type=int)
+        alp_panel_overlap = self.settings.value(
+            "general/seestarAlpPanelOverlapPercent",
+            SEESTAR_ALP_DEFAULT_PANEL_OVERLAP_PERCENT,
+            type=int,
+        )
+        alp_use_autofocus = self.settings.value(
+            "general/seestarAlpUseAutofocus",
+            SEESTAR_ALP_DEFAULT_USE_AUTOFOCUS,
+            type=bool,
+        )
+        alp_num_tries = self.settings.value("general/seestarAlpNumTries", SEESTAR_ALP_DEFAULT_NUM_TRIES, type=int)
+        alp_retry_wait_s = self.settings.value(
+            "general/seestarAlpRetryWaitSec",
+            SEESTAR_ALP_DEFAULT_RETRY_WAIT_S,
+            type=int,
+        )
+        alp_stack_exposure_ms = self.settings.value(
+            "general/seestarAlpStackExposureMs",
+            SEESTAR_ALP_DEFAULT_STACK_EXPOSURE_MS,
+            type=int,
+        )
+        alp_lp_filter_mode = self.settings.value(
+            "general/seestarAlpLpFilterMode",
+            SEESTAR_ALP_LP_FILTER_AUTO,
+            type=str,
+        )
+        alp_honor_queue_times = self.settings.value(
+            "general/seestarAlpHonorQueueTimes",
+            SEESTAR_ALP_DEFAULT_HONOR_QUEUE_TIMES,
+            type=bool,
+        )
+        alp_wait_until_local_time = self.settings.value(
+            "general/seestarAlpWaitUntilLocalTime",
+            SEESTAR_ALP_DEFAULT_WAIT_UNTIL_LOCAL_TIME,
+            type=str,
+        )
+        alp_startup_enabled = self.settings.value(
+            "general/seestarAlpStartupEnabled",
+            SEESTAR_ALP_DEFAULT_STARTUP_SEQUENCE,
+            type=bool,
+        )
+        alp_startup_polar_align = self.settings.value(
+            "general/seestarAlpStartupPolarAlign",
+            SEESTAR_ALP_DEFAULT_STARTUP_POLAR_ALIGN,
+            type=bool,
+        )
+        alp_startup_auto_focus = self.settings.value(
+            "general/seestarAlpStartupAutoFocus",
+            SEESTAR_ALP_DEFAULT_STARTUP_AUTO_FOCUS,
+            type=bool,
+        )
+        alp_startup_dark_frames = self.settings.value(
+            "general/seestarAlpStartupDarkFrames",
+            SEESTAR_ALP_DEFAULT_STARTUP_DARK_FRAMES,
+            type=bool,
+        )
+        alp_capture_flats = self.settings.value(
+            "general/seestarAlpCaptureFlatsBeforeSession",
+            SEESTAR_ALP_DEFAULT_CAPTURE_FLATS,
+            type=bool,
+        )
+        alp_flats_wait_s = self.settings.value(
+            "general/seestarAlpFlatsWaitSec",
+            SEESTAR_ALP_DEFAULT_FLATS_WAIT_S,
+            type=int,
+        )
+        alp_schedule_autofocus_legacy = self.settings.value(
+            "general/seestarAlpScheduleAutofocusBeforeEachTarget",
+            SEESTAR_ALP_DEFAULT_SCHEDULE_AUTOFOCUS,
+            type=bool,
+        )
+        alp_schedule_autofocus_mode = normalize_seestar_alp_schedule_autofocus_mode(
+            self.settings.value(
+                "general/seestarAlpScheduleAutofocusMode",
+                SEESTAR_ALP_DEFAULT_SCHEDULE_AUTOFOCUS_MODE,
+                type=str,
+            ),
+            legacy_enabled=bool(alp_schedule_autofocus_legacy),
+        )
+        alp_schedule_autofocus_try_count = self.settings.value(
+            "general/seestarAlpScheduleAutofocusTryCount",
+            SEESTAR_ALP_DEFAULT_AUTOFOCUS_TRY_COUNT,
+            type=int,
+        )
+        alp_dew_heater_value = self.settings.value(
+            "general/seestarAlpDewHeaterValue",
+            SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE,
+            type=int,
+        )
+        alp_park_after_session = self.settings.value(
+            "general/seestarAlpParkAfterSession",
+            SEESTAR_ALP_DEFAULT_PARK_AFTER_SESSION,
+            type=bool,
+        )
+        alp_shutdown_after_session = self.settings.value(
+            "general/seestarAlpShutdownAfterSession",
+            SEESTAR_ALP_DEFAULT_SHUTDOWN_AFTER_SESSION,
+            type=bool,
+        )
+        session_template_key = self.settings.value(
+            "general/seestarSessionTemplateKey",
+            "",
+            type=str,
+        )
+        session_repeat_count = self.settings.value(
+            "general/seestarSessionRepeatCount",
+            1,
+            type=int,
+        )
+        session_minutes_per_run = self.settings.value(
+            "general/seestarSessionMinutesPerRun",
+            SEESTAR_DEFAULT_BLOCK_MINUTES,
+            type=int,
+        )
+        session_gap_seconds = self.settings.value(
+            "general/seestarSessionGapSeconds",
+            0,
+            type=int,
+        )
+        session_require_checklist = self.settings.value(
+            "general/seestarSessionRequireChecklist",
+            False,
+            type=bool,
+        )
+        session_checklist_text = self.settings.value(
+            "general/seestarSessionChecklistText",
+            "",
+            type=str,
+        )
+        session_notes = self.settings.value("general/seestarSessionTemplateNotes", "", type=str)
+        try:
+            alp_device_num = int(alp_device_num)
+        except Exception:
+            alp_device_num = SEESTAR_ALP_DEFAULT_DEVICE_NUM
+        try:
+            alp_client_id = int(alp_client_id)
+        except Exception:
+            alp_client_id = SEESTAR_ALP_DEFAULT_CLIENT_ID
+        try:
+            alp_timeout_s = float(alp_timeout_s)
+        except Exception:
+            alp_timeout_s = SEESTAR_ALP_DEFAULT_TIMEOUT_S
+        try:
+            alp_gain = int(alp_gain)
+        except Exception:
+            alp_gain = SEESTAR_ALP_DEFAULT_GAIN
+        try:
+            alp_panel_overlap = int(alp_panel_overlap)
+        except Exception:
+            alp_panel_overlap = SEESTAR_ALP_DEFAULT_PANEL_OVERLAP_PERCENT
+        try:
+            alp_num_tries = int(alp_num_tries)
+        except Exception:
+            alp_num_tries = SEESTAR_ALP_DEFAULT_NUM_TRIES
+        try:
+            alp_retry_wait_s = int(alp_retry_wait_s)
+        except Exception:
+            alp_retry_wait_s = SEESTAR_ALP_DEFAULT_RETRY_WAIT_S
+        try:
+            alp_stack_exposure_ms = int(alp_stack_exposure_ms)
+        except Exception:
+            alp_stack_exposure_ms = SEESTAR_ALP_DEFAULT_STACK_EXPOSURE_MS
+        try:
+            alp_flats_wait_s = int(alp_flats_wait_s)
+        except Exception:
+            alp_flats_wait_s = SEESTAR_ALP_DEFAULT_FLATS_WAIT_S
+        try:
+            alp_schedule_autofocus_try_count = int(alp_schedule_autofocus_try_count)
+        except Exception:
+            alp_schedule_autofocus_try_count = SEESTAR_ALP_DEFAULT_AUTOFOCUS_TRY_COUNT
+        try:
+            alp_dew_heater_value = int(alp_dew_heater_value)
+        except Exception:
+            alp_dew_heater_value = SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE
+        try:
+            session_repeat_count = int(session_repeat_count)
+        except Exception:
+            session_repeat_count = 1
+        try:
+            session_minutes_per_run = int(session_minutes_per_run)
+        except Exception:
+            session_minutes_per_run = SEESTAR_DEFAULT_BLOCK_MINUTES
+        try:
+            session_gap_seconds = int(session_gap_seconds)
+        except Exception:
+            session_gap_seconds = 0
+        return {
+            "method": method,
+            "alp": SeestarAlpConfig(
+                base_url=alp_base_url,
+                device_num=max(0, alp_device_num),
+                client_id=max(1, alp_client_id),
+                timeout_s=max(1.0, alp_timeout_s),
+                gain=max(0, alp_gain),
+                panel_overlap_percent=max(0, alp_panel_overlap),
+                use_autofocus=bool(alp_use_autofocus),
+                num_tries=max(1, alp_num_tries),
+                retry_wait_s=max(0, alp_retry_wait_s),
+                target_integration_override_min=0,
+                stack_exposure_ms=max(0, alp_stack_exposure_ms),
+                lp_filter_mode=str(alp_lp_filter_mode or SEESTAR_ALP_LP_FILTER_AUTO).strip().lower(),
+                honor_queue_times=bool(alp_honor_queue_times),
+                wait_until_local_time=str(alp_wait_until_local_time or "").strip(),
+                startup_enabled=bool(alp_startup_enabled),
+                startup_polar_align=bool(alp_startup_polar_align),
+                startup_auto_focus=bool(alp_startup_auto_focus),
+                startup_dark_frames=bool(alp_startup_dark_frames),
+                capture_flats_before_session=bool(alp_capture_flats),
+                flats_wait_s=max(0, alp_flats_wait_s),
+                schedule_autofocus_mode=alp_schedule_autofocus_mode,
+                schedule_autofocus_before_each_target=(alp_schedule_autofocus_mode == SEESTAR_ALP_AF_MODE_PER_RUN),
+                schedule_autofocus_try_count=max(1, alp_schedule_autofocus_try_count),
+                dew_heater_value=alp_dew_heater_value if alp_dew_heater_value >= 0 else SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE,
+                park_after_session=bool(alp_park_after_session),
+                shutdown_after_session=bool(alp_shutdown_after_session),
+            ),
+            "template": SeestarSessionTemplate(
+                key=str(session_template_key or "").strip(),
+                name="",
+                scope=SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET,
+                repeat_count=max(1, session_repeat_count),
+                minutes_per_run=max(1, session_minutes_per_run),
+                gap_seconds=max(0, session_gap_seconds),
+                require_science_checklist=bool(session_require_checklist),
+                science_checklist_items=[
+                    line.strip()
+                    for line in str(session_checklist_text or "").splitlines()
+                    if line.strip()
+                ],
+                template_notes=str(session_notes or "").strip(),
+                lp_filter_mode=str(alp_lp_filter_mode or SEESTAR_ALP_LP_FILTER_AUTO).strip().lower(),
+                gain=max(0, alp_gain),
+                panel_overlap_percent=max(0, alp_panel_overlap),
+                use_autofocus=bool(alp_use_autofocus),
+                num_tries=max(1, alp_num_tries),
+                retry_wait_s=max(0, alp_retry_wait_s),
+                target_integration_override_min=0,
+                stack_exposure_ms=max(0, alp_stack_exposure_ms),
+                honor_queue_times=bool(alp_honor_queue_times),
+                wait_until_local_time=str(alp_wait_until_local_time or "").strip(),
+                startup_enabled=bool(alp_startup_enabled),
+                startup_polar_align=bool(alp_startup_polar_align),
+                startup_auto_focus=bool(alp_startup_auto_focus),
+                startup_dark_frames=bool(alp_startup_dark_frames),
+                capture_flats_before_session=bool(alp_capture_flats),
+                flats_wait_s=max(0, alp_flats_wait_s),
+                schedule_autofocus_mode=alp_schedule_autofocus_mode,
+                schedule_autofocus_before_each_target=(alp_schedule_autofocus_mode == SEESTAR_ALP_AF_MODE_PER_RUN),
+                schedule_autofocus_try_count=max(1, alp_schedule_autofocus_try_count),
+                dew_heater_value=alp_dew_heater_value if alp_dew_heater_value >= 0 else SEESTAR_ALP_DEFAULT_DEW_HEATER_VALUE,
+                park_after_session=bool(alp_park_after_session),
+                shutdown_after_session=bool(alp_shutdown_after_session),
+            ),
+        }
+
+    def _update_seestar_button_tooltip(self) -> None:
+        if not hasattr(self, "seestar_session_btn"):
+            return
+        cfg = self._seestar_config()
+        backend_label = "ALP service" if str(cfg["method"]) == SEESTAR_METHOD_ALP else "guided handoff"
+        template = cfg["template"]
+        tooltip = (
+            "Build a Seestar S50 session from the current Targets table order. "
+            f"Backend: {backend_label}, defaults: {int(template.repeat_count)}x {int(template.minutes_per_run)} min, "
+            f"gap {int(template.gap_seconds)} s."
+        )
+        self.seestar_session_btn.setToolTip(tooltip)
+        if hasattr(self, "seestar_session_act"):
+            self.seestar_session_act.setToolTip(tooltip)
+            self.seestar_session_act.setStatusTip(tooltip)
+
+    def _current_site_snapshot(self) -> NightQueueSiteSnapshot:
+        selected_name = self.obs_combo.currentText() if hasattr(self, "obs_combo") else ""
+        preset_site = self.observatories.get(selected_name) if hasattr(self, "observatories") else None
+        tz_name = "UTC"
+        if isinstance(getattr(self, "last_payload", None), dict):
+            tz_name = str(self.last_payload.get("tz", "UTC"))
+        elif preset_site is not None:
+            tz_name = preset_site.timezone_name
+        return NightQueueSiteSnapshot(
+            name=selected_name or getattr(preset_site, "name", "") or "Current site",
+            latitude=self._read_site_float(self.lat_edit),
+            longitude=self._read_site_float(self.lon_edit),
+            elevation=self._read_site_float(self.elev_edit),
+            timezone=tz_name,
+            limiting_magnitude=self._current_limiting_magnitude(),
+            telescope_diameter_mm=float(getattr(preset_site, "telescope_diameter_mm", 0.0) or 0.0),
+            focal_length_mm=float(getattr(preset_site, "focal_length_mm", 0.0) or 0.0),
+            pixel_size_um=float(getattr(preset_site, "pixel_size_um", 0.0) or 0.0),
+            detector_width_px=int(getattr(preset_site, "detector_width_px", 0) or 0),
+            detector_height_px=int(getattr(preset_site, "detector_height_px", 0) or 0),
+        )
+
+    def _seestar_night_bounds(self) -> Optional[tuple[datetime, datetime, str]]:
+        payload = self.last_payload if isinstance(getattr(self, "last_payload", None), dict) else None
+        if payload is None or "times" not in payload:
+            return None
+        tz_name = str(payload.get("tz", "UTC"))
+        try:
+            tz = pytz.timezone(tz_name)
+        except Exception:
+            tz = pytz.UTC
+            tz_name = "UTC"
+        try:
+            times = [t.astimezone(tz) for t in mdates.num2date(payload["times"])]
+        except Exception:
+            return None
+        if not times:
+            return None
+        sun_alt_series = np.array(payload.get("sun_alt", np.full(len(times), np.nan)), dtype=float)
+        if sun_alt_series.shape[0] != len(times):
+            return None
+        sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= self._sun_alt_limit())
+        if not sun_mask.any():
+            return None
+        indices = np.where(sun_mask)[0]
+        start_idx = int(indices[0])
+        end_idx = min(int(indices[-1]) + 1, len(times) - 1)
+        start_dt = times[start_idx]
+        end_dt = times[end_idx]
+        if end_dt <= start_dt:
+            return None
+        return start_dt, end_dt, tz_name
+
+    @Slot()
+    def _open_seestar_session(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Seestar Session", "Wait for the current visibility calculation to finish.")
+            return
+        night_bounds = self._seestar_night_bounds()
+        if night_bounds is None:
+            QMessageBox.information(
+                self,
+                "Seestar Session",
+                "Run a visibility calculation first so the Seestar queue uses the current night bounds.",
+            )
+            return
+        session_dialog = SeestarSessionPlanDialog(self)
+        if session_dialog.exec() != int(QDialog.Accepted):
+            return
+        self._update_seestar_button_tooltip()
+        night_start, night_end, tz_name = night_bounds
+        method = str(session_dialog.method() or SEESTAR_METHOD_GUIDED).strip().lower()
+        session_template = session_dialog.session_template()
+        session_items = [item for item in session_dialog.session_items() if item.enabled]
+        alp_config = session_dialog.alp_config()
+        if not session_items:
+            QMessageBox.information(self, "Seestar Session", "Enable at least one target in the session table.")
+            return
+        device_profile = SEESTAR_DEVICE_PROFILE_ALP if method == SEESTAR_METHOD_ALP else SEESTAR_DEVICE_PROFILE
+        site_snapshot = self._current_site_snapshot()
+        if (
+            str(session_template.scope or SEESTAR_TEMPLATE_SCOPE_MULTI_TARGET) == SEESTAR_TEMPLATE_SCOPE_SINGLE_TARGET
+            and len(session_items) != 1
+        ):
+            QMessageBox.information(
+                self,
+                "Seestar Session",
+                "The selected template is single-target. Enable exactly one target in the session table.",
+            )
+            return
+        if session_template.require_science_checklist and not session_template.science_checklist_items:
+            session_template = session_template.model_copy(update={"science_checklist_items": default_science_checklist_items()})
+        queue = build_session_queue(
+            session_items,
+            session_template=session_template,
+            site_snapshot=site_snapshot,
+            night_start_local=night_start,
+            night_end_local=night_end,
+            timezone=tz_name,
+            device_profile=device_profile,
+            start_cursor_local=datetime.now(night_start.tzinfo) if night_start.tzinfo is not None else datetime.now(),
+        )
+        if not queue.blocks:
+            QMessageBox.information(self, "Seestar Session", "No session blocks were generated from the current Targets table.")
+            return
+        adapter = (
+            SeestarAlpAdapter(alp_config)
+            if method == SEESTAR_METHOD_ALP
+            else SeestarGuidedAdapter()
+        )
+        bundle = adapter.build_handoff_bundle(queue)
+        adapter.open_handoff_dialog(bundle, parent=self)
 
     def _observatories_config_path(self) -> Path:
         return Path(__file__).resolve().parent / "config" / "observatories.json"
@@ -3994,7 +15478,7 @@ class MainWindow(QMainWindow):
             view.setMinimumWidth(popup_w)
             view.setTextElideMode(Qt.ElideNone)
 
-    def _parse_custom_observatories_payload(self, payload: object) -> dict[str, Site]:
+    def _parse_custom_observatories_payload(self, payload: object) -> tuple[dict[str, Site], dict[str, str]]:
         items: list[dict[str, object]] = []
         if isinstance(payload, dict) and isinstance(payload.get("observatories"), list):
             payload = payload["observatories"]
@@ -4008,69 +15492,120 @@ class MainWindow(QMainWindow):
                     items.append(entry)
 
         loaded: dict[str, Site] = {}
+        preset_keys: dict[str, str] = {}
         for item in items:
             name = str(item.get("name", "")).strip()
             if not name:
                 continue
             try:
+                lim_mag = _safe_float(item.get("limiting_magnitude", item.get("limitingMagnitude", DEFAULT_LIMITING_MAGNITUDE)))
+                diameter_mm = _safe_float(
+                    item.get("telescope_diameter_mm", item.get("telescopeDiameterMm", item.get("diameter_mm", 0.0)))
+                )
+                if diameter_mm is None:
+                    diameter_m = _safe_float(item.get("telescope_diameter_m", item.get("telescopeDiameterM", 0.0)))
+                    if diameter_m is not None:
+                        diameter_mm = float(diameter_m) * 1000.0
+                focal_mm = _safe_float(item.get("focal_length_mm", item.get("focalLengthMm", 0.0)))
+                pixel_um = _safe_float(item.get("pixel_size_um", item.get("pixelSizeUm", item.get("pixel_um", 0.0))))
+                detector_w = _safe_int(
+                    item.get("detector_width_px", item.get("detectorWidthPx", item.get("detector_width", 0)))
+                )
+                detector_h = _safe_int(
+                    item.get("detector_height_px", item.get("detectorHeightPx", item.get("detector_height", 0)))
+                )
                 loaded[name] = Site(
                     name=name,
                     latitude=float(item.get("latitude", 0.0)),
                     longitude=float(item.get("longitude", 0.0)),
                     elevation=float(item.get("elevation", 0.0)),
+                    limiting_magnitude=float(lim_mag if lim_mag is not None else DEFAULT_LIMITING_MAGNITUDE),
+                    telescope_diameter_mm=float(diameter_mm if diameter_mm is not None else 0.0),
+                    focal_length_mm=float(focal_mm if focal_mm is not None else 0.0),
+                    pixel_size_um=float(pixel_um if pixel_um is not None else 0.0),
+                    detector_width_px=int(detector_w if detector_w is not None else 0),
+                    detector_height_px=int(detector_h if detector_h is not None else 0),
+                    custom_conditions_url=str(
+                        item.get("custom_conditions_url", item.get("customConditionsUrl", item.get("weather_custom_conditions_url", "")))
+                        or ""
+                    ).strip(),
                 )
+                preset_key_raw = item.get("preset_key", item.get("presetKey", item.get("bhtom_preset_key", "custom")))
+                preset_key = str(preset_key_raw or "custom").strip() or "custom"
+                preset_keys[name] = preset_key
             except Exception as exc:
                 logger.warning("Skipping invalid saved observatory %r: %s", name, exc)
-        return loaded
+        return loaded, preset_keys
 
-    def _load_custom_observatories(self) -> dict[str, Site]:
+    def _load_custom_observatories(self) -> tuple[dict[str, Site], dict[str, str]]:
         cfg_path = self._observatories_config_path()
         loaded: dict[str, Site] = {}
+        preset_keys: dict[str, str] = {}
         if cfg_path.exists():
             try:
                 payload = json.loads(cfg_path.read_text(encoding="utf-8"))
-                loaded = self._parse_custom_observatories_payload(payload)
+                loaded, preset_keys = self._parse_custom_observatories_payload(payload)
             except Exception as exc:
                 logger.warning("Failed to parse %s: %s", cfg_path, exc)
 
         # One-time migration from older QSettings location.
         if loaded:
-            return loaded
+            return loaded, preset_keys
         raw = self.settings.value("general/customObservatories", "", type=str)
         if not raw:
-            return {}
+            return {}, {}
         try:
-            migrated = self._parse_custom_observatories_payload(json.loads(raw))
+            migrated, migrated_preset_keys = self._parse_custom_observatories_payload(json.loads(raw))
         except Exception:
             logger.warning("Failed to parse legacy custom observatories from settings.")
-            return {}
+            return {}, {}
         if migrated:
             loaded = migrated
-            self._save_custom_observatories(migrated)
+            preset_keys = migrated_preset_keys
+            self._save_custom_observatories(migrated, preset_keys=preset_keys)
             self.settings.remove("general/customObservatories")
             logger.info("Migrated %d observatories to %s", len(migrated), cfg_path)
-        return loaded
+        return loaded, preset_keys
 
-    def _save_custom_observatories(self, custom_sites: Optional[dict[str, Site]] = None):
+    def _save_custom_observatories(
+        self,
+        custom_sites: Optional[dict[str, Site]] = None,
+        *,
+        preset_keys: Optional[dict[str, str]] = None,
+    ):
         if custom_sites is None:
             source_sites = self.observatories if hasattr(self, "observatories") else {}
         else:
             source_sites = custom_sites
+        if preset_keys is None:
+            source_preset_keys = getattr(self, "_observatory_preset_keys", {})
+        else:
+            source_preset_keys = preset_keys
         observatory_items: list[dict[str, object]] = []
         for name in sorted(source_sites.keys(), key=str.lower):
             site = source_sites[name]
+            preset_key = str(source_preset_keys.get(name, "custom") or "custom")
             observatory_items.append(
                 {
                     "name": name,
                     "latitude": float(site.latitude),
                     "longitude": float(site.longitude),
                     "elevation": float(site.elevation),
+                    "limiting_magnitude": float(site.limiting_magnitude),
+                    "telescope_diameter_mm": float(site.telescope_diameter_mm),
+                    "telescope_diameter_m": float(site.telescope_diameter_mm) / 1000.0,
+                    "focal_length_mm": float(site.focal_length_mm),
+                    "pixel_size_um": float(site.pixel_size_um),
+                    "detector_width_px": int(site.detector_width_px),
+                    "detector_height_px": int(site.detector_height_px),
+                    "custom_conditions_url": str(site.custom_conditions_url or "").strip(),
+                    "preset_key": preset_key,
                 }
             )
         cfg_path = self._observatories_config_path()
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 3,
             "observatories": observatory_items,
         }
         cfg_path.write_text(
@@ -4148,6 +15683,33 @@ class MainWindow(QMainWindow):
         return lat, lon, elevation, display_name
 
     @Slot()
+    def _open_observatory_manager(self):
+        dlg = ObservatoryManagerDialog(
+            self.observatories,
+            self,
+            preset_keys=getattr(self, "_observatory_preset_keys", {}),
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        updated = dlg.observatories()
+        updated_preset_keys = dlg.preset_keys()
+        if not updated:
+            QMessageBox.warning(self, "No Observatories", "At least one observatory must remain configured.")
+            return
+        previous = self.obs_combo.currentText() if hasattr(self, "obs_combo") else ""
+        self.observatories = updated
+        self._observatory_preset_keys = {
+            name: str(updated_preset_keys.get(name, "custom") or "custom")
+            for name in self.observatories
+        }
+        self._save_custom_observatories(self.observatories, preset_keys=self._observatory_preset_keys)
+        selected = previous if previous in self.observatories else next(iter(self.observatories.keys()), "")
+        self._refresh_observatory_combo(selected_name=selected)
+        if selected:
+            self.settings.setValue("general/defaultSite", selected)
+            self._on_obs_change(selected)
+
+    @Slot()
     def _open_add_observatory_dialog(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Add Observatory")
@@ -4158,6 +15720,8 @@ class MainWindow(QMainWindow):
         name_edit.setPlaceholderText("Name")
         lookup_btn = QPushButton("Lookup", dlg)
         lookup_btn.setToolTip("Find coordinates from place name")
+        _set_button_variant(lookup_btn, "secondary")
+        _set_button_icon_kind(lookup_btn, "lookup")
         name_row = QWidget(dlg)
         name_row_l = QHBoxLayout(name_row)
         name_row_l.setContentsMargins(0, 0, 0, 0)
@@ -4173,14 +15737,24 @@ class MainWindow(QMainWindow):
         elev_edit = QLineEdit(dlg)
         elev_edit.setPlaceholderText("Elevation (m)")
         elev_edit.setValidator(QDoubleValidator(-1000.0, 20000.0, 2, dlg))
+        limiting_mag_spin = QDoubleSpinBox(dlg)
+        limiting_mag_spin.setRange(-5.0, 30.0)
+        limiting_mag_spin.setDecimals(1)
+        limiting_mag_spin.setSingleStep(0.1)
+        limiting_mag_spin.setValue(self._current_limiting_magnitude())
+        limiting_mag_spin.setToolTip("Telescope limiting magnitude used as red-warning threshold in suggested targets.")
+        custom_conditions_url_edit = QLineEdit(dlg)
+        custom_conditions_url_edit.setPlaceholderText("https://example.com/station.json")
         lookup_info = QLabel("", dlg)
         lookup_info.setWordWrap(True)
-        lookup_info.setStyleSheet("color: #6e8cab;")
+        _set_label_tone(lookup_info, "info")
 
         layout.addRow("Name:", name_row)
         layout.addRow("Lat:", lat_edit)
         layout.addRow("Lon:", lon_edit)
         layout.addRow("Elev:", elev_edit)
+        layout.addRow("Lim. Mag:", limiting_mag_spin)
+        layout.addRow("Custom conditions URL:", custom_conditions_url_edit)
         layout.addRow("", lookup_info)
 
         def _lookup_coords():
@@ -4213,8 +15787,15 @@ class MainWindow(QMainWindow):
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
+        _style_dialog_button_box(buttons)
         layout.addWidget(buttons)
-        dlg.setMinimumWidth(max(380, dlg.sizeHint().width()))
+        _fit_dialog_to_screen(
+            dlg,
+            preferred_width=720,
+            preferred_height=520,
+            min_width=520,
+            min_height=420,
+        )
 
         while dlg.exec() == QDialog.Accepted:
             name = name_edit.text().strip()
@@ -4225,17 +15806,30 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Invalid Observatory", f"Observatory '{name}' already exists.")
                 continue
             try:
+                template_site = self.observatories.get(self.obs_combo.currentText())
                 site = Site(
                     name=name,
                     latitude=float(lat_edit.text()),
                     longitude=float(lon_edit.text()),
                     elevation=float(elev_edit.text()),
+                    limiting_magnitude=float(limiting_mag_spin.value()),
+                    custom_conditions_url=custom_conditions_url_edit.text().strip(),
+                    telescope_diameter_mm=float(getattr(template_site, "telescope_diameter_mm", 0.0) or 0.0),
+                    focal_length_mm=float(getattr(template_site, "focal_length_mm", 0.0) or 0.0),
+                    pixel_size_um=float(getattr(template_site, "pixel_size_um", 0.0) or 0.0),
+                    detector_width_px=int(getattr(template_site, "detector_width_px", 0) or 0),
+                    detector_height_px=int(getattr(template_site, "detector_height_px", 0) or 0),
                 )
             except Exception:
-                QMessageBox.warning(self, "Invalid Coordinates", "Please enter valid latitude, longitude and elevation.")
+                QMessageBox.warning(
+                    self,
+                    "Invalid Coordinates",
+                    "Please enter valid latitude, longitude, elevation and limiting magnitude.",
+                )
                 continue
 
             self.observatories[name] = site
+            self._observatory_preset_keys[name] = "custom"
             self._save_custom_observatories()
             self._refresh_observatory_combo(selected_name=name)
             return
@@ -4260,7 +15854,7 @@ class MainWindow(QMainWindow):
         # Persistent user settings
         self.settings = QSettings("YourCompany", "AstroPlanner")
         self._migrate_table_settings_schema()
-        self._dark_enabled = self.settings.value("general/darkMode", False, type=bool)
+        self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
         self._ui_font_size = max(9, min(16, self.settings.value("general/uiFontSize", 11, type=int)))
 
@@ -4271,6 +15865,8 @@ class MainWindow(QMainWindow):
         
         # state holders
         self.targets: List[Target] = []
+        self._auto_target_color_map: dict[str, str] = {}
+        self._auto_target_color_palette_signature: tuple[str, ...] = tuple()
         self.worker: Optional[AstronomyWorker] = None  # keep reference!
         self.target_metrics: dict[str, TargetNightMetrics] = {}
         self.target_windows: dict[str, tuple[datetime, datetime]] = {}
@@ -4282,9 +15878,16 @@ class MainWindow(QMainWindow):
         self._meta_request_id = 0
         self._calc_started_at = 0.0
         self._last_calc_stats = CalcRunStats(duration_s=0.0, visible_targets=0, total_targets=0)
+        self._queued_plan_run = False
+        self._pending_visibility_context_key = ""
         self._clock_polar_tick = 0
         self.color_blind_mode = self.settings.value("general/colorBlindMode", False, type=bool)
+        self._accent_secondary_override = self._load_accent_secondary_override(self._theme_name)
+        self._radar_sweep_enabled = self.settings.value("general/radarSweepAnimation", False, type=bool)
+        self._radar_sweep_speed = max(40, min(260, self.settings.value("general/radarSweepSpeed", 140, type=int)))
+        self._radar_sweep_angle = 0.0
         self._plot_airmass = self.settings.value("general/plotAirmass", False, type=bool)
+        self._plot_mode_animations: list[QPropertyAnimation] = []
         self._cutout_view_key = _normalize_cutout_view_key(
             self.settings.value("general/cutoutView", CUTOUT_DEFAULT_VIEW_KEY, type=str)
         )
@@ -4297,33 +15900,101 @@ class MainWindow(QMainWindow):
         self._cutout_size_px = _sanitize_cutout_size_px(
             self.settings.value("general/cutoutSizePx", CUTOUT_DEFAULT_SIZE_PX, type=int)
         )
+        self._aladin_context_factor = 1.0
         self.llm_config = LLMConfig(
             url=self.settings.value("llm/serverUrl", LLMConfig.DEFAULT_URL, type=str),
             model=self.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str),
-            timeout_s=LLMConfig.DEFAULT_TIMEOUT_S,
+            timeout_s=self.settings.value("llm/timeoutSec", LLMConfig.DEFAULT_TIMEOUT_S, type=int),
+            max_tokens=self.settings.value("llm/maxTokens", LLMConfig.DEFAULT_MAX_TOKENS, type=int),
+        )
+        self._llm_chat_font_size_pt = max(
+            9,
+            int(self.settings.value("llm/chatFontSizePt", LLMConfig.DEFAULT_CHAT_FONT_PT, type=int)),
+        )
+        self._ai_chat_spacing = str(
+            self.settings.value("llm/chatSpacing", LLMConfig.DEFAULT_CHAT_SPACING, type=str)
+            or LLMConfig.DEFAULT_CHAT_SPACING
+        ).strip().lower()
+        self._ai_chat_tint_strength = str(
+            self.settings.value("llm/chatTintStrength", LLMConfig.DEFAULT_CHAT_TINT_STRENGTH, type=str)
+            or LLMConfig.DEFAULT_CHAT_TINT_STRENGTH
+        ).strip().lower()
+        self._ai_chat_width = str(
+            self.settings.value("llm/chatMessageWidth", LLMConfig.DEFAULT_CHAT_WIDTH, type=str)
+            or LLMConfig.DEFAULT_CHAT_WIDTH
+        ).strip().lower()
+        self._ai_status_error_clear_s = max(
+            0,
+            int(self.settings.value("llm/statusErrorClearSec", LLMConfig.DEFAULT_STATUS_ERROR_CLEAR_S, type=int)),
         )
         self._llm_worker: Optional[LLMWorker] = None
+        self._llm_active_tag = ""
+        self._llm_warmup_silent = False
+        self._llm_startup_warmup_attempted = False
+        self._llm_last_warmup_at = 0.0
+        self._llm_last_warmup_key: tuple[str, str] = ("", "")
+        self._ai_runtime_status = ""
+        self._ai_runtime_status_tone = "info"
         self._ai_messages: list[dict[str, str]] = []
+        self._ai_message_widget_refs: list[dict[str, Any]] = []
         self._ai_stream_message_index: Optional[int] = None
+        self._ai_stream_render_timer = QTimer(self)
+        self._ai_stream_render_timer.setSingleShot(True)
+        self._ai_stream_render_timer.timeout.connect(self._flush_ai_stream_render)
+        self._ai_status_clear_timer = QTimer(self)
+        self._ai_status_clear_timer.setSingleShot(True)
+        self._ai_status_clear_timer.timeout.connect(self._clear_ai_runtime_status)
         self._cutout_manager = QNetworkAccessManager(self)
         self._cutout_manager.finished.connect(self._on_cutout_reply)
         self._cutout_request_id = 0
         self._cutout_pending_key = ""
         self._cutout_pending_name = ""
+        self._cutout_pending_background = False
         self._cutout_displayed_key = ""
         self._cutout_reply: Optional[QNetworkReply] = None
         self._cutout_cache: dict[str, QPixmap] = {}
         self._cutout_cache_order: list[str] = []
+        self._cutout_prefetch_queue: list[tuple[Target, str, int, int, int, int]] = []
+        self._cutout_prefetch_enqueued_keys: set[str] = set()
+        self._cutout_prefetch_total = 0
+        self._cutout_prefetch_completed = 0
+        self._cutout_prefetch_cached = 0
+        self._cutout_prefetch_active = False
         self._finder_cache: dict[str, QPixmap] = {}
         self._finder_cache_order: list[str] = []
         self._bhtom_candidate_cache_key: Optional[tuple[str, str]] = None
         self._bhtom_candidate_cache: Optional[list[dict[str, object]]] = None
         self._bhtom_candidate_cache_loaded_at = 0.0
+        self._bhtom_ranked_suggestions_cache: list[dict[str, object]] = []
+        self._bhtom_observatory_cache_key: Optional[tuple[str, str]] = None
+        self._bhtom_observatory_cache: Optional[list[dict[str, object]]] = None
+        self._bhtom_observatory_cache_loaded_at = 0.0
+        self._bhtom_observatory_worker: Optional[BhtomObservatoryPresetWorker] = None
+        self._bhtom_observatory_worker_request_id = 0
+        self._bhtom_observatory_loading_message = ""
+        self._observatory_preset_keys: dict[str, str] = {}
+        self._bhtom_worker: Optional[BhtomSuggestionWorker] = None
+        self._bhtom_worker_request_id = 0
+        self._bhtom_worker_mode = ""
+        self._bhtom_worker_cache_key: Optional[tuple[str, str]] = None
+        self._bhtom_dialog: Optional[SuggestedTargetsDialog] = None
         self._finder_workers: list[FinderChartWorker] = []
         self._finder_worker: Optional[FinderChartWorker] = None
         self._finder_request_id = 0
         self._finder_pending_key = ""
+        self._finder_pending_name = ""
+        self._finder_pending_background = False
+        self._finder_displayed_key = ""
+        self._finder_prefetch_queue: list[tuple[Target, str]] = []
+        self._finder_prefetch_enqueued_keys: set[str] = set()
+        self._finder_prefetch_total = 0
+        self._finder_prefetch_completed = 0
+        self._finder_prefetch_cached = 0
+        self._finder_prefetch_active = False
         self._finder_retry_after: dict[str, float] = {}
+        self._cutout_image_stacks: dict[str, QStackedLayout] = {}
+        self._cutout_image_placeholders: dict[str, QWidget] = {}
+        self._cutout_image_labels: dict[str, CoverImageLabel] = {}
         self._finder_timeout_timer = QTimer(self)
         self._finder_timeout_timer.setSingleShot(True)
         self._finder_timeout_timer.setInterval(FINDER_WORKER_TIMEOUT_MS)
@@ -4333,14 +16004,19 @@ class MainWindow(QMainWindow):
         self._cutout_resize_timer.setInterval(260)
         self._cutout_resize_timer.timeout.connect(self._on_cutout_resize_timeout)
         self._cutout_last_resize_signature: Optional[tuple] = None
+        self._table_column_width_reset_requested = False
+        self._table_column_width_timer = QTimer(self)
+        self._table_column_width_timer.setSingleShot(True)
+        self._table_column_width_timer.setInterval(0)
+        self._table_column_width_timer.timeout.connect(self._refresh_table_column_widths)
 
         # UI ------------------------------------------------
-        self.table_model = TargetTableModel(self.targets, site=None)
+        self.table_model = TargetTableModel(self.targets, site=None, parent=self)
         self.table_view = TargetTableView()
+        self.table_view.setObjectName("MainTargetsTable")
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.deleteRequested.connect(self._delete_selected_targets)
-        # Use custom delegate for Name column to preserve its background on selection
-        self.table_view.setItemDelegateForColumn(TargetTableModel.COL_NAME, NoSelectBackgroundDelegate(self.table_view))
+        self.table_view.setItemDelegate(TargetTableGlowDelegate(self.table_view))
         # Make columns only as wide as their contents
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
@@ -4349,6 +16025,13 @@ class MainWindow(QMainWindow):
         self.table_view.setModel(self.table_model)
         self.table_model.layoutChanged.connect(self._apply_table_row_visibility)
         self.table_model.modelReset.connect(self._apply_table_row_visibility)
+        self.table_model.layoutChanged.connect(lambda: self._schedule_table_column_width_refresh(reset_widths=True))
+        self.table_model.modelReset.connect(lambda: self._schedule_table_column_width_refresh(reset_widths=True))
+        self.table_model.dataChanged.connect(lambda *_: self._schedule_table_column_width_refresh(reset_widths=True))
+        self.table_model.rowsInserted.connect(lambda *_: self._schedule_table_column_width_refresh(reset_widths=True))
+        self.table_model.rowsRemoved.connect(lambda *_: self._schedule_table_column_width_refresh(reset_widths=True))
+        self.table_model.modelReset.connect(self._schedule_primary_target_selection)
+        self.table_model.rowsInserted.connect(lambda *_: self._schedule_primary_target_selection())
         # NOTE: Reapply table settings and default sort are now handled explicitly after layoutChanged.emit()
         # # Apply saved settings now that table_view exists
         # self._load_settings()
@@ -4369,6 +16052,54 @@ class MainWindow(QMainWindow):
         # Plot placeholders: targets, selected target, sun, moon
         self.polar_scatter = self.polar_ax.scatter([], [], c='blue', marker='x', s=20, label='Targets', alpha=0.5, picker=True)
         self.selected_scatter = self.polar_ax.scatter([], [], c='red', marker='x', s=40, alpha=1, label='Selected')
+        self.radar_echo_glow_scatter = self.polar_ax.scatter([], [], c='cyan', marker='x', s=40, alpha=1.0, linewidths=3.2, zorder=3)
+        self.radar_echo_scatter = self.polar_ax.scatter([], [], c='cyan', marker='x', s=18, alpha=1.0, linewidths=1.35, zorder=4)
+        self.radar_echo_glow_scatter.set_visible(False)
+        self.radar_echo_scatter.set_visible(False)
+        self._radar_echo_artists: list[Any] = []
+        self.radar_sweep_glow_line, = self.polar_ax.plot(
+            [],
+            [],
+            color='cyan',
+            linewidth=3.2,
+            alpha=0.42,
+            zorder=2,
+            solid_capstyle='round',
+            solid_joinstyle='round',
+            antialiased=True,
+        )
+        self.radar_sweep_line, = self.polar_ax.plot(
+            [],
+            [],
+            color='magenta',
+            linewidth=0.9,
+            alpha=0.0,
+            zorder=3,
+            solid_capstyle='round',
+            solid_joinstyle='round',
+            antialiased=True,
+        )
+        self.radar_sweep_core = self.polar_ax.scatter([], [], c='magenta', marker='o', s=58, alpha=0.0, linewidths=0.0, zorder=3)
+        self.radar_sweep_core.set_visible(False)
+        self._radar_sweep_theta_edges = np.linspace(0.0, 2.0 * math.pi, 721)
+        self._radar_sweep_theta_centers = (self._radar_sweep_theta_edges[:-1] + self._radar_sweep_theta_edges[1:]) * 0.5
+        self._radar_sweep_radius_edges = np.linspace(0.0, 90.0, 9)
+        self._radar_sweep_mesh_values = np.zeros(
+            (len(self._radar_sweep_radius_edges) - 1, len(self._radar_sweep_theta_edges) - 1),
+            dtype=float,
+        )
+        self.radar_sweep_mesh = self.polar_ax.pcolormesh(
+            self._radar_sweep_theta_edges,
+            self._radar_sweep_radius_edges,
+            self._radar_sweep_mesh_values,
+            shading='flat',
+            cmap=self._build_radar_sweep_cmap(),
+            vmin=0.0,
+            vmax=1.0,
+            antialiased=False,
+            zorder=1,
+        )
+        self.radar_sweep_mesh.set_visible(False)
         # Placeholder for selected-object path trace
         self.selected_trace_line = None
         # Placeholder for altitude limit circle
@@ -4417,6 +16148,16 @@ class MainWindow(QMainWindow):
         self.polar_canvas.setMaximumWidth(340)
         # Keep enough edge room so N/S labels are not clipped.
         self.polar_canvas.figure.subplots_adjust(left=0.06, right=0.94, bottom=0.12, top=0.90)
+        self._radar_target_coords = np.empty((0, 2), dtype=float)
+        self._radar_echo_strengths = np.zeros(0, dtype=float)
+        self._radar_sweep_timer = QTimer(self)
+        self._radar_sweep_timer.setInterval(16)
+        try:
+            self._radar_sweep_timer.setTimerType(Qt.PreciseTimer)
+        except Exception:
+            pass
+        self._radar_sweep_timer.timeout.connect(self._advance_radar_sweep)
+        self._radar_sweep_clock = QElapsedTimer()
 
         # Debounce frequent requests for plotting
         self._replot_timer = QTimer(self)
@@ -4455,15 +16196,40 @@ class MainWindow(QMainWindow):
 
         # Observatory selection
         self._builtin_observatories = {
-            "OCM": Site(name="OCM", latitude=-24.59, longitude=-70.19, elevation=2800),
-            "Białków": Site(name="Białków", latitude=51.474248, longitude=16.657821, elevation=128),
-            "Roque de los Muchachos": Site(name="Roque de los Muchachos", latitude=28.4522, longitude=-17.5330, elevation=2426),
+            "OCM": Site(
+                name="OCM",
+                latitude=-24.59,
+                longitude=-70.19,
+                elevation=2800,
+                limiting_magnitude=DEFAULT_LIMITING_MAGNITUDE,
+            ),
+            "Białków": Site(
+                name="Białków",
+                latitude=51.474248,
+                longitude=16.657821,
+                elevation=128,
+                limiting_magnitude=DEFAULT_LIMITING_MAGNITUDE,
+            ),
+            "Roque de los Muchachos": Site(
+                name="Roque de los Muchachos",
+                latitude=28.4522,
+                longitude=-17.5330,
+                elevation=2426,
+                limiting_magnitude=DEFAULT_LIMITING_MAGNITUDE,
+            ),
         }
-        loaded_observatories = self._load_custom_observatories()
-        self.observatories = dict(self._builtin_observatories)
-        self.observatories.update(loaded_observatories)
-        # Keep repo config in sync with current full observatory list.
-        self._save_custom_observatories(self.observatories)
+        loaded_observatories, loaded_preset_keys = self._load_custom_observatories()
+        if loaded_observatories:
+            # Config file is now the source of truth (so deletions persist between runs).
+            self.observatories = dict(loaded_observatories)
+            self._observatory_preset_keys = {
+                name: str(loaded_preset_keys.get(name, "custom") or "custom")
+                for name in self.observatories
+            }
+        else:
+            self.observatories = dict(self._builtin_observatories)
+            self._observatory_preset_keys = {name: "custom" for name in self.observatories}
+            self._save_custom_observatories(self.observatories, preset_keys=self._observatory_preset_keys)
         self.obs_combo = QComboBox()
         self.obs_combo.addItems(self.observatories.keys())
         init_site = self.settings.value("general/defaultSite", "OCM", type=str)
@@ -4482,12 +16248,13 @@ class MainWindow(QMainWindow):
         self._update_obs_combo_widths()
         self.add_obs_btn = QToolButton()
         self.add_obs_btn.setText("+")
-        self.add_obs_btn.setToolTip("Add custom observatory")
+        self.add_obs_btn.setToolTip("Open observatory manager")
         self.add_obs_btn.setFixedSize(24, 24)
-        self.add_obs_btn.clicked.connect(self._open_add_observatory_dialog)
+        self.add_obs_btn.clicked.connect(self._open_observatory_manager)
 
         # Debounced connections for date and limit spin
         self.date_edit.dateChanged.connect(lambda _: self._replot_timer.start())
+        self.date_edit.dateChanged.connect(lambda _: self._refresh_weather_window_context())
         self.limit_spin.valueChanged.connect(self._update_limit)
         self.sun_alt_limit_spin.valueChanged.connect(self._on_sun_alt_limit_changed)
         # Re-plot when latitude, longitude, or elevation is changed
@@ -4499,62 +16266,83 @@ class MainWindow(QMainWindow):
         self.plot_canvas.setContentsMargins(0, 0, 0, 0)
         self.ax_alt = self.plot_canvas.figure.subplots()
         self.ax_alt.margins(x=0, y=0)
+        self._use_visibility_web = bool(_HAS_QTWEBENGINE and _HAS_PLOTLY and QWebEngineView is not None)
+        self._visibility_web_minute_key = ""
+        self._visibility_web_has_content = False
+        if self._use_visibility_web and QWebEngineView is not None:
+            self.visibility_web = QWebEngineView(self)
+            self.visibility_web.setMinimumHeight(320)
+            self.visibility_web.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.visibility_web.setStyleSheet(f"background:{self._theme_color('plot_bg', '#121b29')};")
+            self.visibility_web.setToolTip("Interactive visibility chart. Use Plotly controls in the top-right to zoom, pan and reset.")
+            self.visibility_loading_widget = self._build_web_loading_placeholder(
+                "Visibility Plot",
+                "Computing night tracks…",
+            )
+            self.visibility_plot_stack = QStackedLayout()
+            self.visibility_plot_stack.setContentsMargins(0, 0, 0, 0)
+            self.visibility_plot_host = QWidget(self)
+            self.visibility_plot_host.setAttribute(Qt.WA_StyledBackground, True)
+            self.visibility_plot_host.setStyleSheet(f"background:{self._theme_color('plot_bg', '#121b29')};")
+            self.visibility_plot_host.setLayout(self.visibility_plot_stack)
+            self.visibility_plot_stack.addWidget(self.visibility_loading_widget)
+            self.visibility_plot_stack.addWidget(self.visibility_web)
+            self.visibility_plot_stack.setCurrentWidget(self.visibility_loading_widget)
+            self.visibility_web.loadFinished.connect(self._on_visibility_web_load_finished)
+        else:
+            self.visibility_web = None
+            self.visibility_loading_widget = None
+            self.visibility_plot_stack = None
+            self.visibility_plot_host = None
 
-        # Matplotlib toolbar
-        self.plot_toolbar = NavigationToolbar(self.plot_canvas, self)
-        # Minimize toolbar padding and height
-        self.plot_toolbar.setIconSize(QSize(16, 16))
-        self.plot_toolbar.layout().setContentsMargins(0, 0, 0, 0)
-        self.plot_toolbar.layout().setSpacing(0)
-        self.plot_mode_widget = QWidget(self.plot_toolbar)
+        self.plot_mode_widget = QWidget(self)
         self.plot_mode_widget.setObjectName("PlotModeWidget")
+        self.plot_mode_widget.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         plot_mode_layout = QHBoxLayout(self.plot_mode_widget)
-        plot_mode_layout.setContentsMargins(4, 0, 4, 0)
-        plot_mode_layout.setSpacing(6)
+        plot_mode_layout.setContentsMargins(12, 2, 12, 2)
+        plot_mode_layout.setSpacing(12)
         self.plot_mode_alt_label = QLabel("Altitude", self.plot_mode_widget)
         self.plot_mode_airmass_label = QLabel("Airmass", self.plot_mode_widget)
-        self.airmass_toggle_btn = QSlider(Qt.Orientation.Horizontal, self.plot_mode_widget)
+        for label in (self.plot_mode_alt_label, self.plot_mode_airmass_label):
+            effect = QGraphicsOpacityEffect(label)
+            effect.setOpacity(1.0)
+            label.setGraphicsEffect(effect)
+            label._opacity_effect = effect  # type: ignore[attr-defined]
+        self.airmass_toggle_btn = NeonToggleSwitch(self.plot_mode_widget)
         self.airmass_toggle_btn.setObjectName("PlotModeSwitch")
         self.airmass_toggle_btn.setToolTip("Switch the main plot Y-axis between altitude and airmass")
-        self.airmass_toggle_btn.setRange(0, 1)
-        self.airmass_toggle_btn.setSingleStep(1)
-        self.airmass_toggle_btn.setPageStep(1)
-        self.airmass_toggle_btn.setFixedWidth(34)
-        self.airmass_toggle_btn.setFixedHeight(18)
-        self.airmass_toggle_btn.setValue(1 if self._plot_airmass else 0)
-        self.airmass_toggle_btn.valueChanged.connect(self._on_plot_mode_switch_changed)
-        self.airmass_toggle_btn.setStyleSheet(
-            """
-            QSlider::groove:horizontal {
-                height: 18px;
-                border-radius: 9px;
-                background: rgba(120, 120, 120, 0.30);
-                border: 1px solid rgba(120, 120, 120, 0.55);
-            }
-            QSlider::sub-page:horizontal {
-                background: rgba(67, 145, 214, 0.48);
-                border-radius: 9px;
-            }
-            QSlider::add-page:horizontal {
-                background: transparent;
-                border-radius: 9px;
-            }
-            QSlider::handle:horizontal {
-                width: 14px;
-                margin: 1px;
-                border-radius: 7px;
-                background: rgb(244, 247, 250);
-                border: 1px solid rgba(30, 41, 59, 0.22);
-            }
-            """
-        )
+        self.airmass_toggle_btn.setChecked(bool(self._plot_airmass))
+        self.airmass_toggle_btn.toggled.connect(self._on_plot_mode_switch_changed)
         plot_mode_layout.addWidget(self.plot_mode_alt_label)
         plot_mode_layout.addWidget(self.airmass_toggle_btn)
         plot_mode_layout.addWidget(self.plot_mode_airmass_label)
         self._refresh_plot_mode_switch()
-        self.plot_toolbar.addSeparator()
-        self.plot_toolbar.addWidget(self.plot_mode_widget)
-        self.plot_toolbar.setMaximumHeight(self.plot_toolbar.sizeHint().height())
+        self._update_plot_mode_label_metrics()
+        if self._use_visibility_web:
+            self.plot_toolbar = None
+            self.plot_controls_bar = QWidget(self)
+            self.plot_controls_bar.setObjectName("PlotControlsBar")
+            plot_controls_layout = QHBoxLayout(self.plot_controls_bar)
+            plot_controls_layout.setContentsMargins(6, 2, 6, 2)
+            plot_controls_layout.setSpacing(8)
+            self.plot_hint_label = QLabel(
+                "Interactive visibility chart. Use Plotly controls in the top-right for zoom and pan.",
+                self.plot_controls_bar,
+            )
+            self.plot_hint_label.setObjectName("SectionHint")
+            plot_controls_layout.addWidget(self.plot_hint_label, 1)
+            plot_controls_layout.addWidget(self.plot_mode_widget, 0, Qt.AlignRight)
+        else:
+            self.plot_controls_bar = None
+            self.plot_hint_label = None
+            # Matplotlib toolbar
+            self.plot_toolbar = NavigationToolbar(self.plot_canvas, self)
+            self.plot_toolbar.setIconSize(QSize(16, 16))
+            self.plot_toolbar.layout().setContentsMargins(0, 0, 0, 0)
+            self.plot_toolbar.layout().setSpacing(0)
+            self.plot_toolbar.addSeparator()
+            self.plot_toolbar.addWidget(self.plot_mode_widget)
+            self.plot_toolbar.setMaximumHeight(self.plot_toolbar.sizeHint().height())
 
         # top controls
         # Date selector with previous/next day buttons
@@ -4595,8 +16383,8 @@ class MainWindow(QMainWindow):
         date_widget.setLayout(date_layout)
 
         self.coord_error_label = QLabel("")
-        self.coord_error_label.setStyleSheet("color: #cc2f2f;")
         self.coord_error_label.setWordWrap(True)
+        _set_label_tone(self.coord_error_label, "error")
 
         session_layout = QVBoxLayout()
         session_layout.setContentsMargins(2, 2, 2, 2)
@@ -4677,44 +16465,63 @@ class MainWindow(QMainWindow):
         filters_layout.addLayout(filters_row_bottom)
 
         add_btn = QPushButton("Add Target…")
-        add_btn.setMinimumHeight(28)
-        add_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
+        add_btn.setMinimumHeight(24)
         add_btn.clicked.connect(self._add_target_dialog)
+        _set_button_variant(add_btn, "primary")
+        _set_button_icon_kind(add_btn, "add")
 
         toggle_obs_btn = QPushButton("Toggle Observed")
-        toggle_obs_btn.setMinimumHeight(28)
+        toggle_obs_btn.setMinimumHeight(24)
         toggle_obs_btn.clicked.connect(self._toggle_observed_selected)
+        _set_button_variant(toggle_obs_btn, "neutral")
+        _set_button_icon_kind(toggle_obs_btn, "toggle")
         self.edit_object_btn = QPushButton("Edit Object…")
-        self.edit_object_btn.setMinimumHeight(28)
-        self.edit_object_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.edit_object_btn.setMinimumHeight(24)
         self.edit_object_btn.clicked.connect(self._edit_object_for_selected)
         self.edit_object_btn.setEnabled(False)
+        _set_button_variant(self.edit_object_btn, "neutral")
+        _set_button_icon_kind(self.edit_object_btn, "edit")
 
         load_plan_btn = QPushButton("Load Plan…")
-        load_plan_btn.setMinimumHeight(28)
-        load_plan_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        load_plan_btn.setMinimumHeight(24)
         load_plan_btn.clicked.connect(self._load_plan)
+        _set_button_variant(load_plan_btn, "secondary")
+        _set_button_icon_kind(load_plan_btn, "load")
         save_btn = QPushButton("Save Plan…")
-        save_btn.setMinimumHeight(28)
-        save_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        save_btn.setMinimumHeight(24)
         save_btn.clicked.connect(self._export_plan)
-        settings_btn = QPushButton("Settings…")
-        settings_btn.setMinimumHeight(28)
-        settings_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        settings_btn.clicked.connect(self.open_general_settings)
-        table_settings_btn = QPushButton("Table Settings…")
-        table_settings_btn.setMinimumHeight(28)
-        table_settings_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogListView))
-        table_settings_btn.clicked.connect(self.open_table_settings)
+        _set_button_variant(save_btn, "secondary")
+        _set_button_icon_kind(save_btn, "save")
         suggest_targets_btn = QPushButton("Suggest Targets")
-        suggest_targets_btn.setMinimumHeight(28)
+        suggest_targets_btn.setMinimumHeight(24)
         suggest_targets_btn.clicked.connect(self._ai_suggest_targets)
+        _set_button_variant(suggest_targets_btn, "primary")
+        _set_button_icon_kind(suggest_targets_btn, "suggest")
+        self.quick_targets_btn = QPushButton("Quick Targets")
+        self.quick_targets_btn.setMinimumHeight(24)
+        self.quick_targets_btn.clicked.connect(self._quick_add_suggested_targets)
+        self._update_quick_targets_button_tooltip()
+        _set_button_variant(self.quick_targets_btn, "primary")
+        _set_button_icon_kind(self.quick_targets_btn, "quick")
+        self.seestar_session_btn = QPushButton("Seestar Session…")
+        self.seestar_session_btn.setMinimumHeight(24)
+        self.seestar_session_btn.clicked.connect(self._open_seestar_session)
+        _set_button_variant(self.seestar_session_btn, "neutral")
+        _set_button_icon_kind(self.seestar_session_btn, "seestar")
+        self.weather_btn = QPushButton("Weather")
+        self.weather_btn.setMinimumHeight(24)
+        self.weather_btn.setToolTip("Open weather workspace (forecast/conditions/cloud/satellite tabs)")
+        self.weather_btn.clicked.connect(self._open_weather_window)
+        _set_button_variant(self.weather_btn, "secondary")
+        _set_button_icon_kind(self.weather_btn, "weather")
         self.ai_toggle_btn = QPushButton("AI Assistant")
-        self.ai_toggle_btn.setMinimumHeight(28)
+        self.ai_toggle_btn.setMinimumHeight(24)
         self.ai_toggle_btn.setCheckable(True)
         self.ai_toggle_btn.setChecked(False)
-        self.ai_toggle_btn.setToolTip("Toggle the local AI assistant panel")
+        self.ai_toggle_btn.setToolTip("Show or hide the AI assistant window")
         self.ai_toggle_btn.toggled.connect(self._toggle_ai_panel)
+        _set_button_variant(self.ai_toggle_btn, "secondary")
+        _set_button_icon_kind(self.ai_toggle_btn, "ai")
 
         session_strip = QWidget()
         session_strip.setObjectName("SessionStrip")
@@ -4737,34 +16544,45 @@ class MainWindow(QMainWindow):
         top_controls.setLayout(top_controls_l)
         top_controls.setMinimumHeight(70)
         top_controls.setMaximumHeight(140)
+        _set_dynamic_property(top_controls, "accented", True)
 
         actions_bar = QFrame()
         actions_bar.setObjectName("ActionsBar")
         actions_l = QHBoxLayout()
-        actions_l.setContentsMargins(10, 6, 10, 6)
+        actions_l.setContentsMargins(10, 4, 10, 4)
         actions_l.setSpacing(8)
         actions_l.addWidget(add_btn)
         actions_l.addWidget(suggest_targets_btn)
+        actions_l.addWidget(self.quick_targets_btn)
+        actions_l.addWidget(self.seestar_session_btn)
+        actions_l.addWidget(self.weather_btn)
         actions_l.addWidget(toggle_obs_btn)
         actions_l.addWidget(self.edit_object_btn)
         actions_l.addWidget(load_plan_btn)
         actions_l.addWidget(save_btn)
-        actions_l.addWidget(settings_btn)
-        actions_l.addWidget(table_settings_btn)
         actions_l.addWidget(self.ai_toggle_btn)
         actions_l.addStretch(1)
         actions_bar.setLayout(actions_l)
-        actions_bar.setMinimumHeight(46)
-        actions_bar.setMaximumHeight(58)
+        actions_bar.setMinimumHeight(40)
+        actions_bar.setMaximumHeight(50)
+        self._update_seestar_button_tooltip()
+        _set_dynamic_property(actions_bar, "accented", True)
 
         plot_card = QFrame()
         plot_card.setObjectName("PlotCard")
         plot_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        _set_dynamic_property(plot_card, "accented", True)
         plot_l = QVBoxLayout()
         plot_l.setContentsMargins(2, 2, 2, 2)
         plot_l.setSpacing(2)
-        plot_l.addWidget(self.plot_toolbar)
-        plot_l.addWidget(self.plot_canvas)
+        if self._use_visibility_web and self.visibility_web is not None:
+            if self.plot_controls_bar is not None:
+                plot_l.addWidget(self.plot_controls_bar)
+            plot_l.addWidget(self.visibility_plot_host, 1)
+        else:
+            if self.plot_toolbar is not None:
+                plot_l.addWidget(self.plot_toolbar)
+            plot_l.addWidget(self.plot_canvas)
         plot_card.setLayout(plot_l)
         self.plot_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -4876,6 +16694,7 @@ class MainWindow(QMainWindow):
         table_card = QFrame()
         table_card.setObjectName("TableCard")
         table_card.setMinimumHeight(180)
+        _set_dynamic_property(table_card, "accented", True)
         table_l = QVBoxLayout()
         table_l.setContentsMargins(2, 2, 2, 2)
         table_l.setSpacing(2)
@@ -4896,6 +16715,7 @@ class MainWindow(QMainWindow):
 
         polar_card = QFrame()
         polar_card.setObjectName("PolarCard")
+        _set_dynamic_property(polar_card, "accented", True)
         polar_l = QVBoxLayout()
         polar_l.setContentsMargins(2, 2, 2, 2)
         polar_l.setSpacing(1)
@@ -4905,47 +16725,80 @@ class MainWindow(QMainWindow):
 
         cutout_frame = QFrame()
         cutout_frame.setObjectName("CutoutFrame")
+        _set_dynamic_property(cutout_frame, "accented", True)
         cutout_frame.setMinimumWidth(220)
         cutout_frame.setMaximumWidth(560)
         cutout_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         cutout_l = QVBoxLayout()
         cutout_l.setContentsMargins(0, 0, 0, 0)
         cutout_l.setSpacing(0)
-        self.cutout_tabs = QTabWidget(self)
-        self.cutout_tabs.setDocumentMode(True)
+        self.cutout_tabs = _configure_tab_widget(QTabWidget(self))
         self.cutout_tabs.setTabPosition(QTabWidget.North)
         self.cutout_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.aladin_image_label = CoverImageLabel("Select a target")
-        self.aladin_image_label.setObjectName("CutoutImage")
-        self.aladin_image_label.setAlignment(Qt.AlignCenter)
-        self.aladin_image_label.setWordWrap(True)
-        self.aladin_image_label.setScaledContents(False)
-        self.aladin_image_label.setMinimumSize(1, 1)
-        self.aladin_image_label.setMaximumSize(16777215, 16777215)
-        self.aladin_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        aladin_host, self.aladin_image_label = self._create_cutout_image_stack(
+            self.cutout_tabs,
+            kind="aladin",
+            title="Aladin",
+        )
+        self.aladin_image_label.set_zoom_enabled(True)
+        self.aladin_image_label.set_overlay_painter(self._paint_aladin_static_overlay)
+        self.aladin_image_label.setToolTip(
+            "Mouse wheel: zoom (wheel down at 1x loads wider field) | Drag: pan | Double left-click: reset zoom"
+        )
+        self.aladin_image_label.zoomOutLimitReached.connect(self._aladin_expand_context)
         self.aladin_image_label.resized.connect(self._schedule_cutout_resize_refresh)
         # Backward-compatible alias used by existing cutout helpers.
         self.cutout_image_label = self.aladin_image_label
 
-        self.finder_image_label = CoverImageLabel("Select a target")
-        self.finder_image_label.setObjectName("CutoutImage")
-        self.finder_image_label.setAlignment(Qt.AlignCenter)
-        self.finder_image_label.setWordWrap(True)
-        self.finder_image_label.setScaledContents(False)
-        self.finder_image_label.setMinimumSize(1, 1)
-        self.finder_image_label.setMaximumSize(16777215, 16777215)
-        self.finder_image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        finder_host, self.finder_image_label = self._create_cutout_image_stack(
+            self.cutout_tabs,
+            kind="finder",
+            title="Finder Chart",
+        )
         self.finder_image_label.resized.connect(self._schedule_cutout_resize_refresh)
 
         aladin_tab = QWidget(self.cutout_tabs)
-        aladin_tab_l = QVBoxLayout(aladin_tab)
+        aladin_tab.setProperty("cutout_page", True)
+        aladin_tab.setAttribute(Qt.WA_StyledBackground, True)
+        aladin_tab_l = QHBoxLayout(aladin_tab)
         aladin_tab_l.setContentsMargins(0, 0, 0, 0)
-        aladin_tab_l.addWidget(self.aladin_image_label, 1)
+        aladin_tab_l.setSpacing(2)
+        aladin_tab_l.addWidget(aladin_host, 1)
+        aladin_zoom_col = QWidget(aladin_tab)
+        aladin_zoom_col.setProperty("cutout_tool_col", True)
+        aladin_zoom_col.setAttribute(Qt.WA_StyledBackground, True)
+        aladin_zoom_col_l = QVBoxLayout(aladin_zoom_col)
+        aladin_zoom_col_l.setContentsMargins(2, 2, 2, 2)
+        aladin_zoom_col_l.setSpacing(4)
+        zoom_btn_size = 30
+        aladin_zoom_in_btn = QToolButton(aladin_zoom_col)
+        aladin_zoom_in_btn.setText("+")
+        aladin_zoom_in_btn.setToolTip("Zoom in")
+        aladin_zoom_in_btn.setFixedSize(zoom_btn_size, zoom_btn_size)
+        aladin_zoom_in_btn.clicked.connect(self._aladin_zoom_in)
+        aladin_zoom_out_btn = QToolButton(aladin_zoom_col)
+        aladin_zoom_out_btn.setText("−")
+        aladin_zoom_out_btn.setToolTip("Zoom out")
+        aladin_zoom_out_btn.setFixedSize(zoom_btn_size, zoom_btn_size)
+        aladin_zoom_out_btn.clicked.connect(self._aladin_zoom_out)
+        aladin_zoom_reset_btn = QToolButton(aladin_zoom_col)
+        aladin_zoom_reset_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        aladin_zoom_reset_btn.setIconSize(QSize(14, 14))
+        aladin_zoom_reset_btn.setToolTip("Reset zoom to 1:1")
+        aladin_zoom_reset_btn.setFixedSize(zoom_btn_size, zoom_btn_size)
+        aladin_zoom_reset_btn.clicked.connect(self._aladin_zoom_reset)
+        aladin_zoom_col_l.addWidget(aladin_zoom_in_btn)
+        aladin_zoom_col_l.addWidget(aladin_zoom_out_btn)
+        aladin_zoom_col_l.addWidget(aladin_zoom_reset_btn)
+        aladin_zoom_col_l.addStretch(1)
+        aladin_tab_l.addWidget(aladin_zoom_col, 0, Qt.AlignTop)
         finder_tab = QWidget(self.cutout_tabs)
+        finder_tab.setProperty("cutout_page", True)
+        finder_tab.setAttribute(Qt.WA_StyledBackground, True)
         finder_tab_l = QVBoxLayout(finder_tab)
         finder_tab_l.setContentsMargins(0, 0, 0, 0)
-        finder_tab_l.addWidget(self.finder_image_label, 1)
+        finder_tab_l.addWidget(finder_host, 1)
         self.cutout_tabs.addTab(aladin_tab, "Aladin")
         self.cutout_tabs.addTab(finder_tab, "Finder chart")
         self.cutout_tabs.currentChanged.connect(self._on_cutout_tab_changed)
@@ -4963,6 +16816,7 @@ class MainWindow(QMainWindow):
 
         info_card = QFrame()
         info_card.setObjectName("InfoCard")
+        _set_dynamic_property(info_card, "accented", True)
         info_l = QVBoxLayout()
         info_l.setContentsMargins(2, 2, 2, 2)
         info_l.setSpacing(2)
@@ -5019,8 +16873,9 @@ class MainWindow(QMainWindow):
         main_l.setSpacing(0)
         main_l.addWidget(main_vertical)
         main_area.setLayout(main_l)
-        self.ai_panel = self._build_ai_panel()
-        self.ai_panel.setVisible(False)
+        self.ai_window = self._build_ai_window()
+        self.ai_window.hide()
+        self.weather_window: Optional[WeatherDialog] = None
 
         container = QWidget()
         container.setObjectName("RootContainer")
@@ -5029,7 +16884,6 @@ class MainWindow(QMainWindow):
         container_l.setSpacing(2)
         container_l.addWidget(top_controls)
         container_l.addWidget(main_area, 1)
-        container_l.addWidget(self.ai_panel)
         container_l.addWidget(actions_bar)
         container.setLayout(container_l)
         self.setCentralWidget(container)
@@ -5043,6 +16897,20 @@ class MainWindow(QMainWindow):
         # Build the menu bar and shortcuts
         self._build_actions()
         self.status_filters_label = QLabel("Filters: 0")
+        self.status_bhtom_label = QLabel("BHTOM: idle")
+        self.status_bhtom_progress = QProgressBar(self)
+        self.status_bhtom_progress.setMinimumWidth(96)
+        self.status_bhtom_progress.setMaximumWidth(140)
+        self.status_bhtom_progress.setTextVisible(False)
+        self.status_bhtom_progress.setRange(0, 0)
+        self.status_bhtom_progress.hide()
+        self.status_aladin_label = QLabel("Aladin: idle")
+        self.status_aladin_progress = QProgressBar(self)
+        self.status_aladin_progress.setMinimumWidth(96)
+        self.status_aladin_progress.setMaximumWidth(140)
+        self.status_aladin_progress.setTextVisible(False)
+        self.status_aladin_progress.setRange(0, 0)
+        self.status_aladin_progress.hide()
         self.status_finder_label = QLabel("Finder: idle")
         self.status_finder_progress = QProgressBar(self)
         self.status_finder_progress.setMinimumWidth(96)
@@ -5052,6 +16920,10 @@ class MainWindow(QMainWindow):
         self.status_finder_progress.hide()
         self.status_calc_label = QLabel("Last calc: -")
         self.statusBar().addPermanentWidget(self.status_filters_label)
+        self.statusBar().addPermanentWidget(self.status_bhtom_label)
+        self.statusBar().addPermanentWidget(self.status_bhtom_progress)
+        self.statusBar().addPermanentWidget(self.status_aladin_label)
+        self.statusBar().addPermanentWidget(self.status_aladin_progress)
         self.statusBar().addPermanentWidget(self.status_finder_label)
         self.statusBar().addPermanentWidget(self.status_finder_progress)
         self.statusBar().addPermanentWidget(self.status_calc_label)
@@ -5060,18 +16932,9 @@ class MainWindow(QMainWindow):
         if app:
             app.aboutToQuit.connect(self._cleanup_threads)
 
-        # Progress indicator for calculations
-        self.progress = QProgressDialog("Calculating visibility...", "", 0, 0, self)
-        self.progress.setWindowTitle("Please wait")
-        self.progress.setWindowModality(Qt.WindowModal)
-        self.progress.setCancelButton(None)
-        self.progress.setAutoClose(False)
-        self.progress.setAutoReset(False)
-        self.progress.hide()
-
         # Start real‑time clock updates for time labels (but avoid double‑launch)
         self.clock_worker = getattr(self, "clock_worker", None)
-        if self.table_model.site and self.clock_worker is None:
+        if self.table_model.site and self.clock_worker is None and not getattr(self, "_obs_change_finalize_pending", False):
             self._start_clock_worker()
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_clock)
@@ -5080,13 +16943,23 @@ class MainWindow(QMainWindow):
         self._update_selected_details()
         self._validate_site_inputs()
         self._replot_timer.start()
+        QTimer.singleShot(120, self._prefetch_bhtom_observatory_presets_on_startup)
+        QTimer.singleShot(900, self._warmup_llm_on_startup)
     def _start_clock_worker(self):
         # Don’t create new workers while exiting
         if getattr(self, "_shutting_down", False):
             return
         # Stop any existing clock worker
         if self.clock_worker:
-            self.clock_worker.stop()
+            previous_worker = self.clock_worker
+            self.clock_worker = None
+            try:
+                previous_worker.request_stop()
+            except Exception:
+                try:
+                    previous_worker.stop()
+                except Exception:
+                    pass
         # Determine site, fallback to default if none
         site = self.table_model.site or Site(name="Default", latitude=0.0, longitude=0.0, elevation=0.0)
         logger.info("Launching new ClockWorker for site %s", site.name)
@@ -5099,6 +16972,7 @@ class MainWindow(QMainWindow):
         # Start the new worker
         worker.start()
         # Ensure finished threads clean themselves up
+        worker.finished.connect(lambda w=worker: self._clock_workers.remove(w) if w in self._clock_workers else None)
         worker.finished.connect(worker.deleteLater)
 
     # --------------------------------------------------
@@ -5136,18 +17010,32 @@ class MainWindow(QMainWindow):
 
         self.exp_act = QAction("Export plan…", self, shortcut=QKeySequence("Ctrl+E"))
         self.exp_act.triggered.connect(self._export_plan)
+        self.seestar_session_act = QAction("Seestar Session…", self)
+        self.seestar_session_act.triggered.connect(self._open_seestar_session)
 
-        self.dark_act = QAction("Toggle dark mode", self, shortcut=QKeySequence("Ctrl+D"))
+        self.dark_act = QAction("Toggle Dark/Light Mode", self, shortcut=QKeySequence("Ctrl+D"))
+        self.dark_act.setCheckable(True)
+        self.dark_act.setChecked(bool(getattr(self, "_dark_enabled", False)))
         self.dark_act.setShortcutContext(Qt.ApplicationShortcut)
-        self.dark_act.triggered.connect(self._toggle_dark)
+        self.dark_act.toggled.connect(lambda checked: self._set_dark_mode_enabled(bool(checked), persist=True))
         self.ai_describe_act = QAction("Describe selected object", self, shortcut=QKeySequence("Ctrl+I"))
         self.ai_describe_act.triggered.connect(self._ai_describe_target)
         self.ai_suggest_act = QAction("Suggest targets for tonight", self, shortcut=QKeySequence("Ctrl+Shift+I"))
         self.ai_suggest_act.triggered.connect(self._ai_suggest_targets)
-        self.ai_toggle_panel_act = QAction("Toggle AI panel", self)
+        self.weather_act = QAction("Weather Window…", self)
+        self.weather_act.triggered.connect(self._open_weather_window)
+        self.ai_toggle_panel_act = QAction("Toggle AI window", self)
         self.ai_toggle_panel_act.triggered.connect(
             lambda: self.ai_toggle_btn.setChecked(not self.ai_toggle_btn.isChecked())
         )
+        self.ai_warmup_act = QAction("Warm up LLM", self)
+        self.ai_warmup_act.triggered.connect(self._warmup_llm_manual)
+        self.ai_clear_chat_act = QAction("Clear AI chat", self)
+        self.ai_clear_chat_act.triggered.connect(self._clear_ai_messages)
+        self.ai_focus_input_act = QAction("Focus AI input", self)
+        self.ai_focus_input_act.triggered.connect(self._focus_ai_input)
+        self.ai_settings_act = QAction("AI Settings…", self)
+        self.ai_settings_act.triggered.connect(self._open_ai_settings)
 
         self.view_obs_preset_act = QAction("Observation Columns", self, checkable=True)
         self.view_obs_preset_act.triggered.connect(lambda: self._apply_column_preset("observation"))
@@ -5170,9 +17058,15 @@ class MainWindow(QMainWindow):
             self.add_act,
             self.toggle_obs_act,
             self.exp_act,
+            self.seestar_session_act,
             self.dark_act,
             self.ai_describe_act,
             self.ai_suggest_act,
+            self.ai_warmup_act,
+            self.ai_clear_chat_act,
+            self.ai_focus_input_act,
+            self.ai_settings_act,
+            self.weather_act,
         ):
             self.addAction(act)
 
@@ -5185,6 +17079,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.load_act)
         file_menu.addAction(self.load_plan_act)
         file_menu.addAction(self.exp_act)
+        file_menu.addAction(self.seestar_session_act)
         file_menu.addSeparator()
         file_menu.addAction(self.dark_act)
         file_menu.addSeparator()
@@ -5198,11 +17093,18 @@ class MainWindow(QMainWindow):
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.view_obs_preset_act)
         view_menu.addAction(self.view_full_preset_act)
+        view_menu.addSeparator()
+        view_menu.addAction(self.weather_act)
 
         ai_menu = menubar.addMenu("&AI")
         ai_menu.addAction(self.ai_describe_act)
         ai_menu.addSeparator()
+        ai_menu.addAction(self.ai_focus_input_act)
         ai_menu.addAction(self.ai_toggle_panel_act)
+        ai_menu.addAction(self.ai_warmup_act)
+        ai_menu.addAction(self.ai_clear_chat_act)
+        ai_menu.addSeparator()
+        ai_menu.addAction(self.ai_settings_act)
 
         # Settings menu
         settings_menu = menubar.addMenu("&Settings")
@@ -5214,9 +17116,13 @@ class MainWindow(QMainWindow):
         self.tbl_settings_act = QAction("Table Settings…", self)
         self.tbl_settings_act.triggered.connect(self.open_table_settings)
         settings_menu.addAction(self.tbl_settings_act)
+        self.obs_manager_act = QAction("Observatory Manager…", self)
+        self.obs_manager_act.triggered.connect(self._open_observatory_manager)
+        settings_menu.addAction(self.obs_manager_act)
 
         self.addAction(self.gen_settings_act)
         self.addAction(self.tbl_settings_act)
+        self.addAction(self.obs_manager_act)
 
     def _load_settings(self):
         """Load saved settings and apply both Table and General."""
@@ -5235,69 +17141,130 @@ class MainWindow(QMainWindow):
 
     def _migrate_table_settings_schema(self) -> None:
         version = self.settings.value("table/columnSchemaVersion", 0, type=int)
-        if version >= 2:
-            return
+        if version < 2:
+            old_column_count = 12
+            for idx in range(old_column_count - 1, -1, -1):
+                old_key = f"table/col{idx}"
+                if not self.settings.contains(old_key):
+                    continue
+                self.settings.setValue(f"table/col{idx + 1}", self.settings.value(old_key, type=bool))
+            self.settings.setValue("table/col0", True)
 
-        old_column_count = 12
-        for idx in range(old_column_count - 1, -1, -1):
-            old_key = f"table/col{idx}"
-            if not self.settings.contains(old_key):
-                continue
-            self.settings.setValue(f"table/col{idx + 1}", self.settings.value(old_key, type=bool))
-        self.settings.setValue("table/col0", True)
+            if self.settings.contains("table/defaultSortColumn"):
+                try:
+                    old_sort = int(self.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE))
+                except (TypeError, ValueError):
+                    old_sort = TargetTableModel.COL_SCORE
+                self.settings.setValue(
+                    "table/defaultSortColumn",
+                    min(old_sort + 1, TargetTableModel.COL_ACTIONS),
+                )
+            version = 2
 
-        if self.settings.contains("table/defaultSortColumn"):
-            try:
-                old_sort = int(self.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE))
-            except (TypeError, ValueError):
-                old_sort = TargetTableModel.COL_SCORE
-            self.settings.setValue(
-                "table/defaultSortColumn",
-                min(old_sort + 1, TargetTableModel.COL_ACTIONS),
-            )
+        if version < 3:
+            # Insert the new Last Mag/Mag column at index 10.
+            old_column_count = 13
+            inserted_col = TargetTableModel.COL_MAG
+            for idx in range(old_column_count - 1, inserted_col - 1, -1):
+                old_key = f"table/col{idx}"
+                if not self.settings.contains(old_key):
+                    continue
+                self.settings.setValue(f"table/col{idx + 1}", self.settings.value(old_key, type=bool))
+            self.settings.setValue(f"table/col{inserted_col}", True)
 
-        self.settings.setValue("table/columnSchemaVersion", 2)
+            if self.settings.contains("table/defaultSortColumn"):
+                try:
+                    old_sort = int(self.settings.value("table/defaultSortColumn", TargetTableModel.COL_SCORE))
+                except (TypeError, ValueError):
+                    old_sort = TargetTableModel.COL_SCORE
+                if old_sort >= inserted_col:
+                    old_sort += 1
+                self.settings.setValue(
+                    "table/defaultSortColumn",
+                    min(old_sort, TargetTableModel.COL_ACTIONS),
+                )
+            version = 3
+
+        if version < 4:
+            color_mode = str(self.settings.value("table/colorMode", "", type=str) or "").strip().lower()
+            if color_mode not in {"background", "text_glow"}:
+                self.settings.setValue("table/colorMode", "text_glow")
+            version = 4
+
+        self.settings.setValue("table/columnSchemaVersion", version)
 
     def _recompute_recommended_order_cache(self) -> None:
-        order_values = [0] * len(self.targets)
+        n_targets = len(self.targets)
+        previous = list(self.table_model.order_values)
+        order_values = [0] * n_targets
         ordered, _ = self._build_deterministic_observation_order()
         for rank, item in enumerate(ordered, start=1):
             row_index = int(item.get("row_index", -1))
             if 0 <= row_index < len(order_values):
                 order_values[row_index] = rank
+        next_rank = max(order_values, default=0) + 1
+        if next_rank <= n_targets:
+            # Give rows without deterministic windows a stable fallback order.
+            remaining_rows = [idx for idx, value in enumerate(order_values) if value <= 0]
+            remaining_rows.sort(
+                key=lambda idx: (
+                    0 if idx < len(previous) and previous[idx] > 0 else 1,
+                    int(previous[idx]) if idx < len(previous) and previous[idx] > 0 else 10**9,
+                    idx,
+                )
+            )
+            for idx in remaining_rows:
+                order_values[idx] = next_rank
+                next_rank += 1
         self.table_model.order_values = order_values
 
     def _apply_table_settings(self):
         """Apply table row height and table column widths."""
         row_h = self.settings.value("table/rowHeight", 24, type=int)
-        self.table_view.verticalHeader().setDefaultSectionSize(row_h)
-        # Lock row height and apply to all existing rows
-        for r in range(self.table_model.rowCount()):
-            self.table_view.setRowHeight(r, row_h)
-        name_col_w = self.settings.value("table/firstColumnWidth", 100, type=int)
-        self.table_view.setColumnWidth(TargetTableModel.COL_ORDER, 56)
-        self.table_view.setColumnWidth(TargetTableModel.COL_NAME, name_col_w)
-        # Lock Order and Name columns so Stretch mode doesn’t override them
+        self.table_view.set_forced_row_height(row_h)
         header = self.table_view.horizontalHeader()
-        header.setSectionResizeMode(TargetTableModel.COL_ORDER, QHeaderView.Fixed)
-        header.setSectionResizeMode(TargetTableModel.COL_NAME, QHeaderView.Fixed)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(36)
+        for col in range(self.table_model.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
         # Font size
         fs = self.settings.value("table/fontSize", 11, type=int)
         fnt = self.table_view.font()
         fnt.setPointSize(fs)
+        self.table_view.setUpdatesEnabled(False)
         self.table_view.setFont(fnt)
+        self.table_view.viewport().setFont(fnt)
+        header_font = QFont(fnt)
+        header_font.setWeight(QFont.Weight.Bold)
+        self.table_view.horizontalHeader().setFont(header_font)
+        self.table_view.verticalHeader().setFont(fnt)
         # Column visibility
         for col in range(self.table_model.columnCount()):
             show = self.settings.value(f"table/col{col}", True, type=bool)
             self.table_view.setColumnHidden(col, not show)
         # Highlight colors in model
-        palette = COLORBLIND_HIGHLIGHT if self.color_blind_mode else DEFAULT_HIGHLIGHT
+        palette = highlight_palette_for_theme(
+            getattr(self, "_theme_name", DEFAULT_UI_THEME),
+            dark_enabled=bool(getattr(self, "_dark_enabled", False)),
+            color_blind=bool(self.color_blind_mode),
+        )
         default_colors = {"below": palette.below, "limit": palette.limit, "above": palette.above}
         self.table_model.highlight_colors = {
-            k: QColor(self.settings.value(f"table/color/{k}", default_colors[k]))
+            k: QColor(_resolve_table_highlight_color(self.settings, k, default_colors[k]))
             for k in default_colors
         }
+        table_color_mode = str(self.settings.value("table/colorMode", "text_glow", type=str) or "text_glow").strip().lower()
+        if table_color_mode not in {"background", "text_glow"}:
+            table_color_mode = "text_glow"
+        self.table_model.color_mode = table_color_mode
+        self.table_view.setProperty("table_color_mode", table_color_mode)
         self._apply_column_preset(self.settings.value("table/viewPreset", "observation", type=str), save=False)
+        self.table_view.doItemsLayout()
+        self.table_view.viewport().update()
+        self.table_view.horizontalHeader().viewport().update()
+        self.table_view.setUpdatesEnabled(True)
+        self.table_view.viewport().update()
+        self._schedule_table_column_width_refresh(reset_widths=True)
 
     def _apply_column_preset(self, preset: str, save: bool = True):
         if preset not in {"observation", "full"}:
@@ -5310,6 +17277,7 @@ class MainWindow(QMainWindow):
             TargetTableModel.COL_MOON_SEP,
             TargetTableModel.COL_SCORE,
             TargetTableModel.COL_HOURS,
+            TargetTableModel.COL_MAG,
             TargetTableModel.COL_PRIORITY,
             TargetTableModel.COL_OBSERVED,
         }
@@ -5322,12 +17290,72 @@ class MainWindow(QMainWindow):
             else:
                 show = self.settings.value(f"table/col{col}", True, type=bool)
                 self.table_view.setColumnHidden(col, not show)
+        self._schedule_table_column_width_refresh(reset_widths=True)
         if save:
             self.settings.setValue("table/viewPreset", preset)
         if hasattr(self, "view_obs_preset_act"):
             self.view_obs_preset_act.setChecked(preset == "observation")
         if hasattr(self, "view_full_preset_act"):
             self.view_full_preset_act.setChecked(preset == "full")
+
+    def _schedule_table_column_width_refresh(self, reset_widths: bool = False) -> None:
+        if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
+            return
+        self._table_column_width_reset_requested = self._table_column_width_reset_requested or reset_widths
+        self._table_column_width_timer.start()
+
+    def _refresh_table_column_widths(self) -> None:
+        if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
+            return
+        reset_widths = self._table_column_width_reset_requested
+        self._table_column_width_reset_requested = False
+
+        header = self.table_view.horizontalHeader()
+        header_font_metrics = QFontMetrics(header.font())
+        table_font_metrics = QFontMetrics(self.table_view.font())
+        name_font = QFont(self.table_view.font())
+        name_font.setWeight(QFont.Weight.DemiBold)
+        name_font_metrics = QFontMetrics(name_font)
+        baseline_name_width = self.settings.value("table/firstColumnWidth", 100, type=int)
+        col_padding = 20
+        sort_indicator_padding = 18
+        baseline_widths = {
+            TargetTableModel.COL_NAME: baseline_name_width,
+        }
+        row_count = self.table_model.rowCount()
+
+        for col in range(self.table_model.columnCount()):
+            if self.table_view.isColumnHidden(col):
+                continue
+            if col == TargetTableModel.COL_ACTIONS:
+                continue
+
+            header_text = self.table_model.headerData(col, Qt.Horizontal, Qt.DisplayRole) or ""
+            header_width = header_font_metrics.horizontalAdvance(str(header_text)) + col_padding + sort_indicator_padding
+            content_width = 0
+            for row in range(row_count):
+                idx = self.table_model.index(row, col)
+                if not idx.isValid():
+                    continue
+                cell = self.table_model.data(idx, Qt.DisplayRole)
+                if cell is None:
+                    continue
+                text = str(cell)
+                if not text:
+                    continue
+                metrics = name_font_metrics if col == TargetTableModel.COL_NAME else table_font_metrics
+                content_width = max(content_width, metrics.horizontalAdvance(text))
+            required_width = max(
+                baseline_widths.get(col, 0),
+                header_width,
+                content_width + col_padding,
+            )
+
+            if reset_widths:
+                new_width = required_width
+            else:
+                new_width = max(self.table_view.columnWidth(col), required_width)
+            self.table_view.setColumnWidth(col, new_width)
 
     def open_table_settings(self):
         """Open the Table Settings dialog."""
@@ -5337,13 +17365,26 @@ class MainWindow(QMainWindow):
     def _apply_general_settings(self):
         """Apply default site."""
         s = self.settings
+        prev_show_sun_path = bool(getattr(self, "show_sun_path", True))
+        prev_show_moon_path = bool(getattr(self, "show_moon_path", True))
+        prev_show_obj_path = bool(getattr(self, "show_obj_path", True))
+        prev_dark_enabled = bool(getattr(self, "_dark_enabled", DEFAULT_DARK_MODE))
+        prev_theme_name = str(getattr(self, "_theme_name", DEFAULT_UI_THEME))
+        prev_accent_secondary = str(getattr(self, "_accent_secondary_override", "") or "")
+        prev_ui_font_size = int(getattr(self, "_ui_font_size", 11))
+        prev_color_blind_mode = bool(getattr(self, "color_blind_mode", False))
+        prev_radar_sweep_enabled = bool(getattr(self, "_radar_sweep_enabled", False))
+        prev_radar_sweep_speed = int(getattr(self, "_radar_sweep_speed", 140))
         self.show_sun_path  = self.settings.value("general/showSunPath",  True, type=bool)
         self.show_moon_path = self.settings.value("general/showMoonPath", True, type=bool)
         self.show_obj_path  = self.settings.value("general/showObjPath",  True, type=bool)
-        self._dark_enabled = self.settings.value("general/darkMode", False, type=bool)
+        self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
+        self._accent_secondary_override = self._load_accent_secondary_override(self._theme_name)
         self._ui_font_size = max(9, min(16, self.settings.value("general/uiFontSize", 11, type=int)))
         self.color_blind_mode = self.settings.value("general/colorBlindMode", False, type=bool)
+        self._radar_sweep_enabled = self.settings.value("general/radarSweepAnimation", False, type=bool)
+        self._radar_sweep_speed = max(40, min(260, self.settings.value("general/radarSweepSpeed", 140, type=int)))
         new_cutout_view_key = _normalize_cutout_view_key(
             self.settings.value("general/cutoutView", CUTOUT_DEFAULT_VIEW_KEY, type=str)
         )
@@ -5374,6 +17415,55 @@ class MainWindow(QMainWindow):
             self.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str)
             or LLMConfig.DEFAULT_MODEL
         ).strip() or LLMConfig.DEFAULT_MODEL
+        self.llm_config.timeout_s = max(
+            15,
+            int(self.settings.value("llm/timeoutSec", LLMConfig.DEFAULT_TIMEOUT_S, type=int)),
+        )
+        self.llm_config.max_tokens = max(
+            32,
+            int(self.settings.value("llm/maxTokens", LLMConfig.DEFAULT_MAX_TOKENS, type=int)),
+        )
+        self._llm_chat_font_size_pt = max(
+            9,
+            int(self.settings.value("llm/chatFontSizePt", LLMConfig.DEFAULT_CHAT_FONT_PT, type=int)),
+        )
+        self._ai_chat_spacing = str(
+            self.settings.value("llm/chatSpacing", LLMConfig.DEFAULT_CHAT_SPACING, type=str)
+            or LLMConfig.DEFAULT_CHAT_SPACING
+        ).strip().lower()
+        self._ai_chat_tint_strength = str(
+            self.settings.value("llm/chatTintStrength", LLMConfig.DEFAULT_CHAT_TINT_STRENGTH, type=str)
+            or LLMConfig.DEFAULT_CHAT_TINT_STRENGTH
+        ).strip().lower()
+        self._ai_chat_width = str(
+            self.settings.value("llm/chatMessageWidth", LLMConfig.DEFAULT_CHAT_WIDTH, type=str)
+            or LLMConfig.DEFAULT_CHAT_WIDTH
+        ).strip().lower()
+        self._ai_status_error_clear_s = max(
+            0,
+            int(self.settings.value("llm/statusErrorClearSec", LLMConfig.DEFAULT_STATUS_ERROR_CLEAR_S, type=int)),
+        )
+        style_changed = any(
+            (
+                prev_dark_enabled != self._dark_enabled,
+                prev_theme_name != self._theme_name,
+                prev_accent_secondary != self._accent_secondary_override,
+                prev_ui_font_size != self._ui_font_size,
+                prev_color_blind_mode != self.color_blind_mode,
+            )
+        )
+        polar_visuals_changed = any(
+            (
+                prev_show_sun_path != self.show_sun_path,
+                prev_show_moon_path != self.show_moon_path,
+                prev_show_obj_path != self.show_obj_path,
+                prev_radar_sweep_enabled != self._radar_sweep_enabled,
+                prev_radar_sweep_speed != self._radar_sweep_speed,
+            )
+        )
+        self._refresh_ai_warm_indicator()
+        self._apply_ai_chat_font()
+        self._render_ai_messages()
 
         if hasattr(self, "min_moon_sep_spin"):
             self.min_moon_sep_spin.blockSignals(True)
@@ -5400,20 +17490,42 @@ class MainWindow(QMainWindow):
             self._clear_cutout_cache()
         if (cutout_changed or view_changed) and hasattr(self, "cutout_image_label"):
             self._update_cutout_preview_for_target(self._selected_target_or_none())
+        self._update_quick_targets_button_tooltip()
+        self._update_seestar_button_tooltip()
 
         # If a payload is already cached, refresh the polar plot right away
-        if getattr(self, "last_payload", None):
+        if getattr(self, "last_payload", None) and polar_visuals_changed:
             self._update_polar_positions(self.last_payload)
         ds = s.value("general/defaultSite", type=str)
         if ds in self.observatories and self.obs_combo.currentText() != ds:
             self.obs_combo.setCurrentText(ds)
-        self._apply_table_settings()
-        self._apply_styles()
+        if style_changed:
+            self._apply_table_settings()
+            self._apply_styles()
+        self._update_radar_sweep_state()
         self._update_status_bar()
+        self._refresh_weather_window_context()
 
-    def open_general_settings(self):
-        dlg = GeneralSettingsDialog(self)
+    def open_general_settings(self, initial_tab: Optional[str] = None):
+        dlg = GeneralSettingsDialog(self, initial_tab=initial_tab)
         dlg.exec()
+
+    @Slot()
+    def _open_ai_settings(self) -> None:
+        self.open_general_settings(initial_tab="AI")
+
+    @Slot()
+    def _focus_ai_input(self) -> None:
+        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
+            self.ai_toggle_btn.setChecked(True)
+        ai_window = getattr(self, "ai_window", None)
+        if isinstance(ai_window, QDialog):
+            ai_window.show()
+            ai_window.raise_()
+            ai_window.activateWindow()
+        if hasattr(self, "ai_input"):
+            self.ai_input.setFocus(Qt.OtherFocusReason)
+            self.ai_input.selectAll()
 
     def _sun_alt_limit(self) -> float:
         if not hasattr(self, "sun_alt_limit_spin"):
@@ -5424,6 +17536,7 @@ class MainWindow(QMainWindow):
     def _on_sun_alt_limit_changed(self, value: int):
         self.settings.setValue("general/sunAltLimit", int(value))
         self._update_status_bar()
+        self._refresh_weather_window_context()
         if hasattr(self, "progress"):
             self._replot_timer.start()
 
@@ -5472,6 +17585,36 @@ class MainWindow(QMainWindow):
         if sel_model is None:
             return []
         return sorted({idx.row() for idx in sel_model.selectedRows()})
+
+    def _schedule_primary_target_selection(self) -> None:
+        if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
+            return
+        QTimer.singleShot(0, self._ensure_primary_target_selected)
+
+    @Slot()
+    def _ensure_primary_target_selected(self) -> None:
+        if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
+            return
+        rows = self.table_model.rowCount()
+        if rows <= 0:
+            self._update_selected_details()
+            return
+        current_rows = [row for row in self._selected_rows() if 0 <= row < rows and not self.table_view.isRowHidden(row)]
+        if current_rows:
+            return
+        target_row = next((row for row in range(rows) if not self.table_view.isRowHidden(row)), None)
+        if target_row is None:
+            self._update_selected_details()
+            return
+        sel_model = self.table_view.selectionModel()
+        if sel_model is None:
+            return
+        idx = self.table_model.index(target_row, TargetTableModel.COL_NAME)
+        if not idx.isValid():
+            return
+        sel_model.select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+        self.table_view.setCurrentIndex(idx)
+        self.table_view.scrollTo(idx, QTableView.PositionAtCenter)
 
     def _update_status_bar(self):
         if not hasattr(self, "status_filters_label") or not hasattr(self, "status_calc_label"):
@@ -5576,8 +17719,15 @@ class MainWindow(QMainWindow):
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
+        _style_dialog_button_box(buttons)
         layout.addWidget(buttons)
-        dlg.setMinimumWidth(max(520, dlg.sizeHint().width()))
+        _fit_dialog_to_screen(
+            dlg,
+            preferred_width=760,
+            preferred_height=520,
+            min_width=560,
+            min_height=340,
+        )
         if dlg.exec() != QDialog.Accepted:
             return
         tgt.notes = notes_edit.toPlainText().strip()
@@ -5625,16 +17775,21 @@ class MainWindow(QMainWindow):
         auto_color_btn.setMinimumWidth(70)
 
         def _default_color_for_row() -> str:
+            mapped = self.table_model.color_map.get(tgt.name)
+            if isinstance(mapped, QColor) and mapped.isValid():
+                return mapped.name()
             return self._target_plot_color_css(tgt, row, line_palette)
 
         def _refresh_color_preview():
             color_css = _normalized_css_color(color_edit.text())
+            solid_border = self._theme_color("panel_border", "#50627a")
+            dashed_border = self._theme_color("section_hint", solid_border)
             if color_css:
                 sample = QColor(color_css)
                 fg = "#111111" if sample.lightness() > 145 else "#f5f7fb"
                 color_preview.setText(color_css.upper())
                 color_preview.setStyleSheet(
-                    f"background:{color_css}; color:{fg}; border:1px solid #50627a; border-radius:4px; padding:2px 6px;"
+                    f"background:{color_css}; color:{fg}; border:1px solid {solid_border}; border-radius:4px; padding:2px 6px;"
                 )
                 return
             fallback = _default_color_for_row()
@@ -5642,7 +17797,7 @@ class MainWindow(QMainWindow):
             fg = "#111111" if sample.lightness() > 145 else "#f5f7fb"
             color_preview.setText("Auto")
             color_preview.setStyleSheet(
-                f"background:{fallback}; color:{fg}; border:1px dashed #50627a; border-radius:4px; padding:2px 6px;"
+                f"background:{fallback}; color:{fg}; border:1px dashed {dashed_border}; border-radius:4px; padding:2px 6px;"
             )
 
         def _pick_plot_color():
@@ -5686,8 +17841,15 @@ class MainWindow(QMainWindow):
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
+        _style_dialog_button_box(buttons)
         form.addRow(buttons)
-        dlg.setMinimumWidth(max(540, dlg.sizeHint().width()))
+        _fit_dialog_to_screen(
+            dlg,
+            preferred_width=920,
+            preferred_height=760,
+            min_width=620,
+            min_height=480,
+        )
 
         while dlg.exec() == QDialog.Accepted:
             name = name_edit.text().strip()
@@ -5843,10 +18005,7 @@ class MainWindow(QMainWindow):
             self.coord_error_label.setText("; ".join(errors))
             self.coord_error_label.setVisible(bool(errors))
         for edit in (self.lat_edit, self.lon_edit, self.elev_edit):
-            if edit in invalid:
-                edit.setStyleSheet("border: 1px solid #cc2f2f;")
-            else:
-                edit.setStyleSheet("")
+            _set_widget_invalid(edit, edit in invalid)
         return not invalid
 
     @Slot()
@@ -5859,6 +18018,7 @@ class MainWindow(QMainWindow):
                 latitude=self._read_site_float(self.lat_edit),
                 longitude=self._read_site_float(self.lon_edit),
                 elevation=self._read_site_float(self.elev_edit),
+                limiting_magnitude=self._current_limiting_magnitude(),
             )
         except (ValidationError, ValueError):
             return
@@ -5900,6 +18060,13 @@ class MainWindow(QMainWindow):
         self._cutout_reply = None
         self._cutout_pending_key = ""
         self._cutout_pending_name = ""
+        self._cutout_pending_background = False
+        self._cutout_prefetch_queue.clear()
+        self._cutout_prefetch_enqueued_keys.clear()
+        self._cutout_prefetch_total = 0
+        self._cutout_prefetch_completed = 0
+        self._cutout_prefetch_cached = 0
+        self._cutout_prefetch_active = False
 
         # 2) Stop *all* ClockWorkers created during this session
         for w in list(getattr(self, "_clock_workers", [])):
@@ -5953,9 +18120,45 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to stop MetadataLookupWorker: %s", exc)
             self._meta_worker = None
+        bhtom_worker = getattr(self, "_bhtom_worker", None)
+        if bhtom_worker is not None:
+            try:
+                if bhtom_worker.isRunning():
+                    bhtom_worker.requestInterruption()
+                    bhtom_worker.quit()
+                    if not bhtom_worker.wait(1500):
+                        bhtom_worker.terminate()
+                        bhtom_worker.wait(400)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to stop BhtomSuggestionWorker: %s", exc)
+            self._bhtom_worker = None
+            self._bhtom_worker_mode = ""
+            self._bhtom_worker_cache_key = None
+            self._bhtom_dialog = None
+        obs_worker = getattr(self, "_bhtom_observatory_worker", None)
+        if obs_worker is not None:
+            try:
+                if obs_worker.isRunning():
+                    obs_worker.requestInterruption()
+                    obs_worker.quit()
+                    if not obs_worker.wait(1500):
+                        obs_worker.terminate()
+                        obs_worker.wait(400)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to stop BhtomObservatoryPresetWorker: %s", exc)
+            self._bhtom_observatory_worker = None
+            self._bhtom_observatory_loading_message = ""
         self._stop_finder_workers(aggressive=True)
         self._finder_worker = None
         self._finder_pending_key = ""
+        self._finder_pending_name = ""
+        self._finder_pending_background = False
+        self._finder_prefetch_queue.clear()
+        self._finder_prefetch_enqueued_keys.clear()
+        self._finder_prefetch_total = 0
+        self._finder_prefetch_completed = 0
+        self._finder_prefetch_cached = 0
+        self._finder_prefetch_active = False
         self._finder_retry_after.clear()
 
     def _apply_default_sort(self):
@@ -6084,26 +18287,37 @@ class MainWindow(QMainWindow):
     def _plan_contains_target(self, target: Target) -> bool:
         return any(_targets_match(existing, target) for existing in self.targets)
 
-    def _append_target_to_plan(self, target: Target) -> bool:
+    def _append_target_to_plan(
+        self,
+        target: Target,
+        refresh: bool = True,
+        notify_duplicate: bool = True,
+    ) -> bool:
         if self._plan_contains_target(target):
-            QMessageBox.information(self, "Already in plan", f"{target.name} is already present in the current plan.")
+            if notify_duplicate:
+                QMessageBox.information(self, "Already in plan", f"{target.name} is already present in the current plan.")
             return False
 
         target_copy = Target(**target.model_dump())
         self._ensure_known_target_type(target_copy)
         self.table_model.append_target(target_copy)
-        self._recompute_recommended_order_cache()
-        self._apply_table_settings()
-        self._apply_default_sort()
-        self._fetch_missing_magnitudes_async()
-        self._replot_timer.start()
+        if refresh:
+            self._recompute_recommended_order_cache()
+            self._apply_table_settings()
+            self._apply_default_sort()
+            self._refresh_target_color_map()
+            self._emit_table_data_changed()
+            self._fetch_missing_magnitudes_async()
+            self._replot_timer.start()
 
-        for row_idx, existing in enumerate(self.targets):
-            if existing is target_copy or _targets_match(existing, target_copy):
-                self.table_view.selectRow(row_idx)
-                self.table_view.scrollTo(self.table_model.index(row_idx, TargetTableModel.COL_NAME))
-                break
-        self._update_selected_details()
+            for row_idx, existing in enumerate(self.targets):
+                if existing is target_copy or _targets_match(existing, target_copy):
+                    self.table_view.selectRow(row_idx)
+                    self.table_view.scrollTo(self.table_model.index(row_idx, TargetTableModel.COL_NAME))
+                    break
+            self._update_selected_details()
+            self._prefetch_cutouts_for_all_targets(prioritize=self._selected_target_or_none())
+            self._prefetch_finder_charts_for_all_targets(prioritize=self._selected_target_or_none())
         return True
 
     @Slot()
@@ -6111,16 +18325,22 @@ class MainWindow(QMainWindow):
         """Kick off the worker thread unless one is already running."""
         logger.info("Starting new visibility calculation …")
         if self.worker and self.worker.isRunning():
-            # Stop existing calculation and start a new one
-            self.worker.quit()
-            self.worker.wait()
+            self._queued_plan_run = True
+            try:
+                self.worker.requestInterruption()
+            except Exception:
+                pass
+            self._begin_visibility_refresh("Updating visibility for the new context…")
+            return
         if not self._validate_site_inputs():
             return
         try:
             site = Site(
+                name=self.obs_combo.currentText(),
                 latitude=self._read_site_float(self.lat_edit),
                 longitude=self._read_site_float(self.lon_edit),
                 elevation=self._read_site_float(self.elev_edit),
+                limiting_magnitude=self._current_limiting_magnitude(),
             )
             settings = SessionSettings(
                 date=self.date_edit.date(),
@@ -6133,21 +18353,33 @@ class MainWindow(QMainWindow):
             return
 
         self.table_model.site = site
+        self._queued_plan_run = False
+        self._pending_visibility_context_key = self._visibility_context_key_from_parts(
+            site_name=site.name,
+            latitude=float(site.latitude),
+            longitude=float(site.longitude),
+            elevation=float(site.elevation),
+            obs_date=settings.date,
+            time_samples=int(settings.time_samples),
+            limit_altitude=float(settings.limit_altitude),
+        )
         # Update the observation limit for table coloring
         self.table_model.limit = settings.limit_altitude
         self._emit_table_data_changed()
         self._calc_started_at = perf_counter()
         self._update_status_bar()
 
-        # Show busy indicator
-        self.progress.show()
-
         self.worker = AstronomyWorker(self.targets, settings, parent=self)
+        self.worker.aborted.connect(self._on_astronomy_worker_aborted)
         self.worker.finished.connect(self._update_plot)
-        self.worker.finished.connect(lambda _: self.progress.hide())
         self.worker.finished.connect(lambda _: self.plot_canvas.setEnabled(True))
+        if getattr(self, "visibility_web", None) is not None:
+            self.worker.finished.connect(lambda _: self.visibility_web.setEnabled(True))
         # disable canvas during computation
         self.plot_canvas.setEnabled(False)
+        if getattr(self, "visibility_web", None) is not None:
+            self.visibility_web.setEnabled(False)
+        self._begin_visibility_refresh("Computing night tracks…")
         self.worker.start()
 
     def _remove_target(self, row: int):
@@ -6219,6 +18451,7 @@ class MainWindow(QMainWindow):
             bottom_right,
             [Qt.DisplayRole, Qt.BackgroundRole, Qt.ForegroundRole, Qt.ToolTipRole, Qt.CheckStateRole],
         )
+        self._schedule_table_column_width_refresh(reset_widths=True)
 
     def _apply_table_row_visibility(self):
         if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
@@ -6228,6 +18461,7 @@ class MainWindow(QMainWindow):
             # Keep all rows visible in the table; filtered/observed rows are
             # represented by disabled (greyed) styling via row_enabled.
             self.table_view.setRowHidden(row, False)
+        self._schedule_primary_target_selection()
 
     def _clear_table_dynamic_cache(self):
         self.table_model.order_values = []
@@ -6243,16 +18477,45 @@ class MainWindow(QMainWindow):
         # Row widgets were replaced by a context menu to keep the table fast.
         return
 
+    @Slot()
+    def _on_astronomy_worker_aborted(self) -> None:
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            QTimer.singleShot(40, self._on_astronomy_worker_aborted)
+            return
+        self.worker = None
+        if self._queued_plan_run:
+            self._queued_plan_run = False
+            QTimer.singleShot(0, self._run_plan)
+
     @Slot(dict)
     def _update_plot(self, data: dict):
         """Redraw the altitude plot with new data from the worker."""
         logger.info("Altitude plot refresh (%d targets)", len(self.targets))
+        sender = self.sender()
+        if sender is getattr(self, "worker", None):
+            self.worker = None
+        payload_key = str(data.get("site_key", "") or "")
+        current_key = self._current_visibility_context_key()
+        if payload_key and current_key and payload_key != current_key:
+            if self._queued_plan_run:
+                self._queued_plan_run = False
+                QTimer.singleShot(0, self._run_plan)
+            return
         self.last_payload = data
         # Keep full visibility data around for polar path plotting
         self.full_payload = data
         # Reset stored visibility lines for this redraw
         self.vis_lines.clear()
         self.ax_alt.clear()
+        plot_bg = self._theme_color("plot_bg", "#0f1825")
+        plot_panel_bg = self._theme_color("plot_panel_bg", "#162334")
+        plot_text = self._theme_color("plot_text", "#d7e4f0")
+        plot_grid = self._theme_color("plot_grid", "#2f4666")
+        plot_guide = self._theme_color("plot_guide", "#62748a")
+        soft_grid_color = self._mix_qcolors(self._theme_qcolor("plot_grid", plot_grid), self._theme_qcolor("plot_panel_bg", plot_panel_bg), 0.34)
+        self.plot_canvas.figure.patch.set_facecolor(plot_bg)
+        self.ax_alt.set_facecolor(plot_panel_bg)
 
         # Localise the timezone
         tz = pytz.timezone(data.get("tz", "UTC"))
@@ -6283,6 +18546,7 @@ class MainWindow(QMainWindow):
             latitude=self._read_site_float(self.lat_edit),
             longitude=self._read_site_float(self.lon_edit),
             elevation=self._read_site_float(self.elev_edit),
+            limiting_magnitude=self._current_limiting_magnitude(),
         )
         observer_now = Observer(location=site.to_earthlocation(), timezone=tz_name)
         now_dt = datetime.now(pytz.timezone(tz_name))
@@ -6401,33 +18665,10 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------------------
         # Twilight shading (civil, nautical, astronomical), only when valid
         # ------------------------------------------------------------------
-        civil_col = "#FFF2CC"
-        naut_col = "#CCE5FF"
-        astro_col = "#D9D9D9"
-        # Build a dict of available event datetimes
-        ev = {}
-        for key in ("sunset", "dusk_civ", "dusk_naut", "dusk",
-                    "dawn", "dawn_naut", "dawn_civ", "sunrise",
-                    "moonrise", "moonset"):
-            try:
-                dt = mdates.num2date(data[key]).astimezone(tz)
-                ev[key] = dt
-            except Exception:
-                continue
-
-        # Always display a fixed local-time window: 12:00 -> 12:00 next day.
-        obs_date = self.date_edit.date()
-        start_noon_naive = datetime(obs_date.year(), obs_date.month(), obs_date.day(), 12, 0)
-        next_date = obs_date.addDays(1)
-        end_noon_naive = datetime(next_date.year(), next_date.month(), next_date.day(), 12, 0)
-        try:
-            start_dt = tz.localize(start_noon_naive)
-            end_dt = tz.localize(end_noon_naive)
-        except Exception:
-            # Fallback to cached midnight window if timezone localization fails.
-            center_dt = mdates.num2date(data["midnight"]).astimezone(tz)
-            start_dt = center_dt - timedelta(hours=12)
-            end_dt = center_dt + timedelta(hours=12)
+        civil_col = self._theme_color("plot_twilight_civil", "#FFF2CC")
+        naut_col = self._theme_color("plot_twilight_naut", "#CCE5FF")
+        astro_col = self._theme_color("plot_twilight_astro", "#D9D9D9")
+        start_dt, end_dt, ev = self._visibility_time_window(data, tz)
         self.ax_alt.set_xlim(start_dt, end_dt)
         xmin, xmax = self.ax_alt.get_xlim()
 
@@ -6456,7 +18697,7 @@ class MainWindow(QMainWindow):
         for key, dt in ev.items():
             num = mdates.date2num(dt)
             if xmin <= num <= xmax:
-                self.ax_alt.axvline(dt, color="#BBBBBB", linestyle="--", alpha=0.15)
+                self.ax_alt.axvline(dt, color=self._qcolor_rgba_mpl(soft_grid_color, 0.24), linestyle="--", alpha=1.0, linewidth=0.9)
 
         # ------------------------------------------------------------------
         # Red limiting‑altitude line
@@ -6465,7 +18706,7 @@ class MainWindow(QMainWindow):
         limit_line_label = "Limit Airmass" if self._plot_airmass else "Limit Altitude"
         self.ax_alt.axhline(
             limit_line_value,
-            color="red",
+            color=self._theme_color("plot_limit", "#ff5d8f"),
             linestyle="-",
             linewidth=0.5,
             alpha=0.4,
@@ -6481,7 +18722,7 @@ class MainWindow(QMainWindow):
             sun_plot_values = self._plot_y_values(data["sun_alt"])
             self.sun_line, = self.ax_alt.plot(
                 times, sun_plot_values,
-                color="orange", linewidth=1.2, linestyle='-',
+                color=self._theme_color("plot_sun", "orange"), linewidth=1.2, linestyle='-',
                 alpha=0.8, label="Sun"
             )
             self.sun_line.set_visible(self.sun_check.isChecked())
@@ -6491,7 +18732,7 @@ class MainWindow(QMainWindow):
             moon_plot_values = self._plot_y_values(data["moon_alt"])
             self.moon_line, = self.ax_alt.plot(
                 times, moon_plot_values,
-                color="silver", linewidth=1.2, linestyle='-',
+                color=self._theme_color("plot_moon", "silver"), linewidth=1.2, linestyle='-',
                 alpha=0.8, label="Moon"
             )
             self.moon_line.set_visible(self.moon_check.isChecked())
@@ -6519,19 +18760,31 @@ class MainWindow(QMainWindow):
         phase_value = int(max(0, min(100, round(phase_pct))))
         self.moonphase_bar.setValue(phase_value)
         self.moonphase_bar.setFormat(f"{phase_value}%")
-
         self._configure_main_plot_y_axis()
         self.ax_alt.set_xlabel("Time (local)")
+        self.ax_alt.xaxis.label.set_color(plot_text)
+        self.ax_alt.yaxis.label.set_color(plot_text)
+        self.ax_alt.tick_params(axis="x", colors=plot_text)
+        self.ax_alt.tick_params(axis="y", colors=plot_text)
+        for spine in self.ax_alt.spines.values():
+            spine.set_color(self._qcolor_css(soft_grid_color))
+        self.ax_alt.grid(True, color=self._qcolor_rgba_mpl(soft_grid_color, 0.16), alpha=1.0, linestyle="--", linewidth=0.6)
         # self.ax_alt.legend(loc="upper right")
         # Hour labels in the observer's local timezone
         self.ax_alt.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=tz))
         # Display selected observation date
         date_str = self.date_edit.date().toString("yyyy-MM-dd")
-        self.ax_alt.set_title(f"Date: {date_str}")
+        self.ax_alt.set_title(f"Date: {date_str}", color=plot_text)
         # Current time indicator
         now = datetime.now(tz)
         data["now_local"] = now
-        self.now_line = self.ax_alt.axvline(float(mdates.date2num(now)), color="magenta", linestyle=":", linewidth=1.2, label="Now")
+        self.now_line = self.ax_alt.axvline(
+            float(mdates.date2num(now)),
+            color=self._theme_color("plot_now", "magenta"),
+            linestyle=":",
+            linewidth=1.2,
+            label="Now",
+        )
 
         # Update time labels
         # Local time
@@ -6539,21 +18792,16 @@ class MainWindow(QMainWindow):
         # UTC time (with globe icon)
         now_utc = datetime.now(timezone.utc)
         self.utctime_label.setText(f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')}")
+        self._refresh_weather_window_context()
 
         # Apply default alpha and width based on altitude limit
         for name, line, is_over in self.vis_lines:
-            line.set_linewidth(1.4)
-            if is_over:
-                line.set_alpha(0.7)
-            else:
-                line.set_alpha(0.3)
+            self._apply_visibility_line_style(line, is_over=is_over, is_selected=False)
         # Highlight selected targets over limit
         sel_rows = [i.row() for i in self.table_view.selectionModel().selectedRows()]
         sel_names = [self.targets[i].name for i in sel_rows]
         for name, line, is_over in self.vis_lines:
-            if name in sel_names and is_over:
-                line.set_alpha(1.0)
-                line.set_linewidth(2.5)
+            self._apply_visibility_line_style(line, is_over=is_over, is_selected=(name in sel_names))
         visible_targets = sum(1 for flag in row_enabled if flag)
         if self._calc_started_at > 0:
             self._last_calc_stats = CalcRunStats(
@@ -6566,7 +18814,11 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
         self._reset_plot_navigation_home()
         self.plot_canvas.draw_idle()
+        self._render_visibility_web_plot(data)
         self._update_polar_positions(data)
+        if self._queued_plan_run:
+            self._queued_plan_run = False
+            QTimer.singleShot(0, self._run_plan)
 
     @Slot()
     def _toggle_visibility(self):
@@ -6576,15 +18828,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'moon_line') and self.moon_line:
             self.moon_line.set_visible(self.moon_check.isChecked())
         self.plot_canvas.draw_idle()
+        if isinstance(getattr(self, "last_payload", None), dict):
+            self._render_visibility_web_plot(self.last_payload)
 
-    @Slot(int)
-    def _on_plot_mode_switch_changed(self, value: int):
-        checked = bool(value)
+    @Slot(bool)
+    def _on_plot_mode_switch_changed(self, checked: bool):
         if self._plot_airmass == checked:
             self._refresh_plot_mode_switch()
             return
         self._plot_airmass = checked
         self._refresh_plot_mode_switch()
+        self._animate_plot_mode_switch()
         self.settings.setValue("general/plotAirmass", self._plot_airmass)
         if isinstance(self.last_payload, dict):
             self._update_plot(self.last_payload)
@@ -6603,6 +18857,7 @@ class MainWindow(QMainWindow):
     def _handle_clock_update(self, data):
         self.localtime_label.setText(data["now_local"].strftime("%Y-%m-%d %H:%M:%S"))
         self.utctime_label.setText(data["now_utc"].strftime("%Y-%m-%d %H:%M:%S"))
+        self._refresh_weather_window_context(rebuild=False)
         self.sun_alt_label.setText(f"{data['sun_alt']:.1f}°")
         self.moon_alt_label.setText(f"{data['moon_alt']:.1f}°")
         self.table_model.current_alts = data["alts"]
@@ -6632,6 +18887,11 @@ class MainWindow(QMainWindow):
                     float(mdates.date2num(now)), color="magenta", linestyle=":", linewidth=1.2, label="Now"
                 )
             self.plot_canvas.draw_idle()
+            current_minute_key = now.strftime("%Y-%m-%d %H:%M")
+            if getattr(self, "_visibility_web_minute_key", "") != current_minute_key:
+                self._visibility_web_minute_key = current_minute_key
+                self.last_payload["now_local"] = now
+                self._render_visibility_web_plot(self.last_payload, now_override=now)
             self._update_polar_positions(data, dynamic_only=True)
 
 
@@ -6710,7 +18970,11 @@ class MainWindow(QMainWindow):
                 r_full = np.concatenate([r_full, r_seg, [np.nan]])
             trace, = self.polar_ax.plot(
                 theta_full, r_full,
-                color='green', linewidth=0.8, linestyle=':', alpha=0.7, zorder=1
+                color=self._theme_color("polar_selected_path", "#8cff84"),
+                linewidth=0.8,
+                linestyle=':',
+                alpha=0.7,
+                zorder=1,
             )
             self.selected_trace_line = trace
         # Redraw the polar canvas to reflect changes
@@ -6746,16 +19010,10 @@ class MainWindow(QMainWindow):
         sel_rows = [idx.row() for idx in self.table_view.selectionModel().selectedRows()]
         sel_names = [self.targets[i].name for i in sel_rows]
         for name, line, is_over in self.vis_lines:
-            if name in sel_names and is_over:
-                line.set_alpha(1.0)
-                line.set_linewidth(2.5)
-            else:
-                line.set_linewidth(1.4)
-                if is_over:
-                    line.set_alpha(0.7)
-                else:
-                    line.set_alpha(0.3)
+            self._apply_visibility_line_style(line, is_over=is_over, is_selected=(name in sel_names))
         self.plot_canvas.draw_idle()
+        if isinstance(getattr(self, "last_payload", None), dict):
+            self._render_visibility_web_plot(self.last_payload)
 
     @Slot(dict)
     def _update_polar_positions(self, data: dict, dynamic_only: bool = False):
@@ -6784,7 +19042,8 @@ class MainWindow(QMainWindow):
                 continue
             tgt_coords.append((np.deg2rad(az), 90 - alt))
             self.polar_indices.append(i)
-        self.polar_scatter.set_offsets(np.array(tgt_coords) if tgt_coords else np.empty((0, 2)))
+        self._radar_target_coords = np.array(tgt_coords, dtype=float) if tgt_coords else np.empty((0, 2), dtype=float)
+        self.polar_scatter.set_offsets(self._radar_target_coords if tgt_coords else np.empty((0, 2)))
 
         sel_coords = []
         for row in self._selected_rows():
@@ -6801,6 +19060,7 @@ class MainWindow(QMainWindow):
         if site is None:
             self.sun_marker.set_offsets(np.empty((0, 2)))
             self.moon_marker.set_offsets(np.empty((0, 2)))
+            self._refresh_radar_sweep_artists(redraw=False)
             self.polar_canvas.draw_idle()
             return
 
@@ -6850,7 +19110,13 @@ class MainWindow(QMainWindow):
                     theta = np.insert(theta, wrap_pts, np.nan)
                     r = np.insert(r, wrap_pts, np.nan)
                     self.sun_path_line, = self.polar_ax.plot(
-                        theta, r, color="gold", linewidth=0.9, linestyle="--", alpha=0.7, zorder=1
+                        theta,
+                        r,
+                        color=self._theme_color("polar_sun", "gold"),
+                        linewidth=0.9,
+                        linestyle="--",
+                        alpha=0.7,
+                        zorder=1,
                     )
 
             if self.show_moon_path and has_moon_path:
@@ -6864,7 +19130,13 @@ class MainWindow(QMainWindow):
                     theta = np.insert(theta, wrap_pts, np.nan)
                     r = np.insert(r, wrap_pts, np.nan)
                     self.moon_path_line, = self.polar_ax.plot(
-                        theta, r, color="silver", linewidth=0.9, linestyle="--", alpha=0.7, zorder=1
+                        theta,
+                        r,
+                        color=self._theme_color("polar_moon", "silver"),
+                        linewidth=0.9,
+                        linestyle="--",
+                        alpha=0.7,
+                        zorder=1,
                     )
 
             signature = (round(site.latitude, 6), int(self.limit_spin.value()))
@@ -6884,10 +19156,22 @@ class MainWindow(QMainWindow):
                 theta_pol = np.deg2rad(pole_az)
                 circle = self.polar_ax.scatter(
                     [theta_pol], [r_pol],
-                    facecolors='none', edgecolors='purple', marker='o', s=80, linewidths=1.5, zorder=3, alpha=0.3
+                    facecolors='none',
+                    edgecolors=self._theme_color("polar_pole", "purple"),
+                    marker='o',
+                    s=80,
+                    linewidths=1.5,
+                    zorder=3,
+                    alpha=0.3,
                 )
                 dot = self.polar_ax.scatter(
-                    [theta_pol], [r_pol], c='purple', marker='.', s=30, zorder=4, alpha=0.3
+                    [theta_pol],
+                    [r_pol],
+                    c=self._theme_color("polar_pole", "purple"),
+                    marker='.',
+                    s=30,
+                    zorder=4,
+                    alpha=0.3,
                 )
                 self.pole_marker = (circle, dot)
 
@@ -6900,11 +19184,17 @@ class MainWindow(QMainWindow):
                 theta_full = np.linspace(0, 2 * math.pi, 200)
                 r_full = np.full_like(theta_full, 90 - lim)
                 self.limit_circle, = self.polar_ax.plot(
-                    theta_full, r_full, color='red', linestyle='-', linewidth=0.5, alpha=0.4
+                    theta_full,
+                    r_full,
+                    color=self._theme_color("polar_limit", "#ff5d8f"),
+                    linestyle='-',
+                    linewidth=0.5,
+                    alpha=0.4,
                 )
                 self._polar_static_signature = signature
 
         self._clock_polar_tick += 1
+        self._refresh_radar_sweep_artists(redraw=False)
         self.polar_canvas.draw_idle()
 
     @Slot()
@@ -7724,11 +20014,11 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Unable to resolve '{query}' using {source_label}.")
         raise ValueError(f"Unable to resolve '{query}' using {source_label}: {last_error}") from last_error
 
-    def _build_ai_panel(self) -> QWidget:
-        panel = QFrame(self)
+    def _build_ai_panel(self, parent: Optional[QWidget] = None) -> QWidget:
+        host = parent if parent is not None else self
+        panel = QFrame(host)
         panel.setObjectName("AIAssistantPanel")
-        panel.setMinimumHeight(170)
-        panel.setMaximumHeight(260)
+        _set_dynamic_property(panel, "accented", True)
 
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -7740,57 +20030,486 @@ class MainWindow(QMainWindow):
         describe_btn = QPushButton("Describe Object")
         describe_btn.clicked.connect(self._ai_describe_target)
         btn_col.addWidget(describe_btn)
+        _set_button_variant(describe_btn, "secondary")
+        _set_button_icon_kind(describe_btn, "describe")
+        describe_btn.ensurePolished()
+
+        describe_hint = QLabel("Uses local metadata only.\nNo LLM request.", panel)
+        describe_hint.setObjectName("SectionHint")
+        describe_hint.setWordWrap(True)
+        btn_col.addWidget(describe_hint)
+
+        self.ai_copy_last_btn = QPushButton("Copy Last Reply")
+        self.ai_copy_last_btn.clicked.connect(self._copy_last_ai_response)
+        _set_button_variant(self.ai_copy_last_btn, "ghost")
+        _set_button_icon_kind(self.ai_copy_last_btn, "describe")
+        btn_col.addWidget(self.ai_copy_last_btn)
+
+        self.ai_export_chat_btn = QPushButton("Export Chat")
+        self.ai_export_chat_btn.clicked.connect(self._export_ai_chat)
+        _set_button_variant(self.ai_export_chat_btn, "ghost")
+        _set_button_icon_kind(self.ai_export_chat_btn, "save")
+        btn_col.addWidget(self.ai_export_chat_btn)
+
+        self.ai_reset_appearance_btn = QPushButton("Reset Appearance")
+        self.ai_reset_appearance_btn.clicked.connect(self._reset_ai_chat_appearance)
+        _set_button_variant(self.ai_reset_appearance_btn, "ghost")
+        _set_button_icon_kind(self.ai_reset_appearance_btn, "refresh")
+        btn_col.addWidget(self.ai_reset_appearance_btn)
+
+        self.ai_settings_btn = QPushButton("AI Settings")
+        self.ai_settings_btn.clicked.connect(self._open_ai_settings)
+        _set_button_variant(self.ai_settings_btn, "ghost")
+        _set_button_icon_kind(self.ai_settings_btn, "edit")
+        btn_col.addWidget(self.ai_settings_btn)
+
+        self.ai_context_hint = QLabel(
+            "No chat memory.\nAsk complete questions with the object or class name.",
+            panel,
+        )
+        self.ai_context_hint.setObjectName("SectionHint")
+        self.ai_context_hint.setWordWrap(True)
+        self.ai_context_hint.setToolTip(
+            "Examples: 'Którą SN z BHTOM najlepiej dziś obserwować?' or "
+            "'How should I observe 8C0716_714 tonight?'"
+        )
+        btn_col.addWidget(self.ai_context_hint)
+
+        warmup_btn = QPushButton("Warm Up LLM", panel)
+        warmup_btn.clicked.connect(self._warmup_llm_manual)
+        _set_button_variant(warmup_btn, "ghost")
+        _set_button_icon_kind(warmup_btn, "refresh")
+        warmup_btn.setToolTip("Send a lightweight request to warm the current LLM model.")
+        btn_col.addWidget(warmup_btn)
+
+        clear_btn = QPushButton("Clear", panel)
+        clear_btn.clicked.connect(self._clear_ai_messages)
+        _set_button_variant(clear_btn, "ghost")
+        _set_button_icon_kind(clear_btn, "clear")
+        btn_col.addWidget(clear_btn)
+
+        status_row = QWidget(panel)
+        status_row_l = QHBoxLayout(status_row)
+        status_row_l.setContentsMargins(0, 0, 0, 0)
+        status_row_l.setSpacing(0)
+
+        self.ai_warm_badge_label = QLabel(f"● cold {self.llm_config.model}", status_row)
+        self.ai_warm_badge_label.setObjectName("SectionHint")
+        self.ai_warm_badge_label.setToolTip(self.llm_config.model)
+        status_row_l.addWidget(self.ai_warm_badge_label, 1)
+        _set_label_tone(self.ai_warm_badge_label, "muted")
+        btn_col.addWidget(status_row)
 
         btn_col.addStretch(1)
         btn_widget = QWidget(panel)
         btn_widget.setLayout(btn_col)
-        btn_widget.setFixedWidth(145)
+        describe_width = max(
+            210,
+            describe_btn.sizeHint().width() + 24,
+            self.ai_copy_last_btn.sizeHint().width() + 24,
+            self.ai_export_chat_btn.sizeHint().width() + 24,
+            self.ai_reset_appearance_btn.sizeHint().width() + 24,
+            self.ai_settings_btn.sizeHint().width() + 24,
+            warmup_btn.sizeHint().width() + 24,
+            clear_btn.sizeHint().width() + 24,
+            244,
+        )
+        describe_btn.setMinimumWidth(describe_width - 12)
+        describe_hint.setFixedWidth(describe_width - 12)
+        self.ai_copy_last_btn.setMinimumWidth(describe_width - 12)
+        self.ai_export_chat_btn.setMinimumWidth(describe_width - 12)
+        self.ai_reset_appearance_btn.setMinimumWidth(describe_width - 12)
+        self.ai_settings_btn.setMinimumWidth(describe_width - 12)
+        self.ai_context_hint.setFixedWidth(describe_width - 12)
+        warmup_btn.setMinimumWidth(describe_width - 12)
+        clear_btn.setMinimumWidth(describe_width - 12)
+        btn_widget.setFixedWidth(describe_width)
         layout.addWidget(btn_widget)
 
-        self.ai_output = QTextEdit(panel)
-        self.ai_output.setReadOnly(True)
-        self.ai_output.setPlaceholderText(
+        self._ai_output_placeholder_text = (
             "AI responses will appear here.\n"
-            "Configure your local LLM in Settings -> General Settings."
+            "Configure Ollama or another local LLM in Settings -> General Settings."
         )
-        layout.addWidget(self.ai_output, 1)
+        self.ai_output = QScrollArea(panel)
+        self.ai_output.setWidgetResizable(True)
+        self.ai_output.setFrameShape(QFrame.NoFrame)
+        self.ai_output.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.ai_output.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.ai_output.setObjectName("AIChatScroll")
+        self.ai_output.viewport().installEventFilter(self)
+        self._ai_output_last_viewport_width = 0
+        self.ai_output_content = QWidget(self.ai_output)
+        self.ai_output_content.setObjectName("AIChatContent")
+        self.ai_output_layout = QVBoxLayout(self.ai_output_content)
+        self.ai_output_layout.setContentsMargins(12, 12, 12, 12)
+        self.ai_output_layout.setSpacing(0)
+        self.ai_output.setWidget(self.ai_output_content)
+        self._apply_ai_chat_font()
+        center_widget = QWidget(panel)
+        center_col = QVBoxLayout(center_widget)
+        center_col.setContentsMargins(0, 0, 0, 0)
+        center_col.setSpacing(8)
+        center_col.addWidget(self.ai_output, 1)
 
-        input_col = QVBoxLayout()
-        input_col.setSpacing(6)
+        composer_row = QHBoxLayout()
+        composer_row.setContentsMargins(0, 0, 0, 0)
+        composer_row.setSpacing(8)
 
-        self.ai_input = QLineEdit(panel)
-        self.ai_input.setPlaceholderText("Ask about tonight's observing plan...")
+        self.ai_input = QLineEdit(center_widget)
+        self.ai_input.setPlaceholderText("Ask about tonight or the selected object...")
+        self.ai_input.setToolTip(
+            "The AI chat does not keep chat memory. "
+            "Use complete questions with the object or class name, e.g. 'Która SN z BHTOM jest dziś najlepsza?'"
+        )
         self.ai_input.returnPressed.connect(self._send_ai_query)
-        input_col.addWidget(self.ai_input)
+        composer_row.addWidget(self.ai_input, 1)
 
-        send_btn = QPushButton("Send")
+        send_btn = QPushButton("Send", center_widget)
         send_btn.clicked.connect(self._send_ai_query)
-        input_col.addWidget(send_btn)
-
-        clear_btn = QPushButton("Clear")
-        clear_btn.clicked.connect(self._clear_ai_messages)
-        input_col.addWidget(clear_btn)
-
-        self.ai_status_label = QLabel("Ready", panel)
-        self.ai_status_label.setObjectName("SectionHint")
-        input_col.addWidget(self.ai_status_label)
-        input_col.addStretch(1)
-
-        input_widget = QWidget(panel)
-        input_widget.setLayout(input_col)
-        input_widget.setFixedWidth(210)
-        layout.addWidget(input_widget)
+        _set_button_variant(send_btn, "primary")
+        _set_button_icon_kind(send_btn, "send")
+        send_btn.setToolTip(
+            "Send the current question to the local LLM. Object-specific questions are auto-routed to a lighter selected-target prompt."
+        )
+        send_btn.setMinimumWidth(max(132, send_btn.sizeHint().width() + 16))
+        composer_row.addWidget(send_btn)
+        center_col.addLayout(composer_row)
+        layout.addWidget(center_widget, 1)
+        self._refresh_ai_panel_action_buttons()
+        self._refresh_ai_warm_indicator()
 
         return panel
 
+    def _build_ai_window(self) -> QDialog:
+        window = QDialog(self)
+        window.setObjectName("AIAssistantWindow")
+        window.setWindowTitle("AI Assistant")
+        window.setModal(False)
+        _fit_dialog_to_screen(
+            window,
+            preferred_width=1180,
+            preferred_height=620,
+            min_width=860,
+            min_height=360,
+        )
+
+        window_l = QVBoxLayout(window)
+        window_l.setContentsMargins(8, 8, 8, 8)
+        window_l.setSpacing(6)
+        panel = self._build_ai_panel(window)
+        window_l.addWidget(panel, 1)
+        window.finished.connect(self._on_ai_window_finished)
+        return window
+
     @Slot(bool)
     def _toggle_ai_panel(self, checked: bool) -> None:
-        if hasattr(self, "ai_panel"):
-            self.ai_panel.setVisible(bool(checked))
+        ai_window = getattr(self, "ai_window", None)
+        if isinstance(ai_window, QDialog):
+            if checked:
+                ai_window.show()
+                ai_window.raise_()
+                ai_window.activateWindow()
+                self._warmup_llm_if_needed()
+            else:
+                ai_window.hide()
         if hasattr(self, "ai_toggle_btn"):
             self.ai_toggle_btn.setText("Hide AI" if checked else "AI Assistant")
 
-    def _build_session_context(self, *, include_current_snapshot: bool = True) -> str:
+    @Slot(int)
+    def _on_ai_window_finished(self, _result: int) -> None:
+        if not hasattr(self, "ai_toggle_btn"):
+            return
+        if not self.ai_toggle_btn.isChecked():
+            return
+        blocker = QSignalBlocker(self.ai_toggle_btn)
+        self.ai_toggle_btn.setChecked(False)
+        del blocker
+        self.ai_toggle_btn.setText("AI Assistant")
+
+    def _llm_warmup_cache_key(self) -> tuple[str, str]:
+        return (
+            str(getattr(self.llm_config, "url", "") or "").strip().rstrip("/"),
+            str(getattr(self.llm_config, "model", "") or "").strip(),
+        )
+
+    def _llm_is_warm(self) -> bool:
+        cache_key = self._llm_warmup_cache_key()
+        if self._llm_last_warmup_key != cache_key:
+            return False
+        return (perf_counter() - float(self._llm_last_warmup_at)) < 600.0
+
+    def _start_llm_warmup(
+        self,
+        *,
+        force: bool = False,
+        user_initiated: bool = False,
+        silent: bool = False,
+    ) -> bool:
+        worker = self._llm_worker
+        if worker is not None and worker.isRunning():
+            if user_initiated:
+                self._set_ai_status("AI assistant is busy.", tone="warning")
+            return False
+        if not force and self._llm_is_warm():
+            if not silent:
+                self._set_ai_status("Ready", tone="info")
+            return False
+        self._llm_warmup_silent = bool(silent)
+        if not silent:
+            self._set_ai_status("Warming up LLM...", tone="info")
+        worker = LLMWorker(
+            config=self.llm_config,
+            prompt="Reply with OK.",
+            system_prompt="Reply with exactly OK.",
+            tag="warmup",
+            parent=self,
+        )
+        worker.responseChunk.connect(self._on_ai_chunk)
+        worker.responseReady.connect(self._on_ai_response)
+        worker.errorOccurred.connect(self._on_ai_error)
+        worker.finished.connect(self._on_ai_worker_finished)
+        self._llm_worker = worker
+        self._llm_active_tag = "warmup"
+        self._refresh_ai_warm_indicator()
+        worker.start()
+        return True
+
+    @Slot()
+    def _warmup_llm_if_needed(self) -> None:
+        self._start_llm_warmup(force=False, user_initiated=False, silent=False)
+
+    @Slot()
+    def _warmup_llm_manual(self) -> None:
+        self._start_llm_warmup(force=True, user_initiated=True, silent=False)
+
+    @Slot()
+    def _warmup_llm_on_startup(self) -> None:
+        if self._llm_startup_warmup_attempted or getattr(self, "_shutting_down", False):
+            return
+        self._llm_startup_warmup_attempted = True
+        self._start_llm_warmup(force=False, user_initiated=False, silent=True)
+
+    def _refresh_ai_warm_indicator(self) -> None:
+        configured_model = str(getattr(self.llm_config, "model", "") or "").strip() or LLMConfig.DEFAULT_MODEL
+        is_warm = self._llm_is_warm()
+        active_tag = str(getattr(self, "_llm_active_tag", "") or "").strip().lower()
+        runtime_status = str(getattr(self, "_ai_runtime_status", "") or "").strip().lower()
+        model_text = configured_model
+        if is_warm and self._llm_last_warmup_key[1]:
+            model_text = self._llm_last_warmup_key[1]
+
+        badge_text = f"● cold {model_text}"
+        badge_tone = "muted"
+        badge_glow_color = self._theme_qcolor("section_hint", "#8fa3b8")
+
+        if runtime_status == "warm-up failed":
+            badge_text = f"! warm-up failed {model_text}"
+            badge_tone = "warning"
+            badge_glow_color = self._theme_qcolor("state_warning", "#ffcc66")
+        elif active_tag == "warmup":
+            badge_text = f"◌ warming {model_text}"
+            badge_tone = "info"
+            badge_glow_color = self._theme_qcolor("state_info", "#59f3ff")
+        elif active_tag and runtime_status.startswith("stream"):
+            badge_text = f"✦ streaming {model_text}"
+            badge_tone = "info"
+            badge_glow_color = self._theme_qcolor("state_info", "#59f3ff")
+        elif active_tag:
+            badge_text = f"✦ thinking {model_text}"
+            badge_tone = "info"
+            badge_glow_color = self._theme_qcolor("state_info", "#59f3ff")
+        elif is_warm:
+            badge_text = f"● warm {model_text}"
+            badge_tone = "success"
+            badge_glow_color = self._theme_qcolor("state_success", "#67ff9a")
+
+        if hasattr(self, "ai_warm_badge_label"):
+            self.ai_warm_badge_label.setText(badge_text)
+            self.ai_warm_badge_label.setToolTip(badge_text)
+            _set_label_tone(self.ai_warm_badge_label, badge_tone)
+            self._apply_label_glow_effect(self.ai_warm_badge_label, badge_glow_color, blur_radius=22.0)
+
+    def _set_ai_status(self, text: str, *, tone: str = "info") -> None:
+        self._ai_runtime_status = str(text)
+        self._ai_runtime_status_tone = str(tone)
+        if tone in {"warning", "error"} and self._ai_status_error_clear_s > 0:
+            self._ai_status_clear_timer.start(int(self._ai_status_error_clear_s * 1000))
+        else:
+            self._ai_status_clear_timer.stop()
+        self._refresh_ai_warm_indicator()
+
+    @Slot()
+    def _clear_ai_runtime_status(self) -> None:
+        if str(getattr(self, "_llm_active_tag", "") or "").strip():
+            return
+        self._ai_runtime_status = ""
+        self._ai_runtime_status_tone = "info"
+        self._refresh_ai_warm_indicator()
+
+    @staticmethod
+    def _apply_label_glow_effect(label: Optional[QLabel], color: QColor, *, blur_radius: float) -> None:
+        if label is None:
+            return
+        current = label.graphicsEffect()
+        if not isinstance(current, QGraphicsDropShadowEffect):
+            effect = QGraphicsDropShadowEffect(label)
+            effect.setOffset(0.0, 0.0)
+            label.setGraphicsEffect(effect)
+        else:
+            effect = current
+        glow_color = QColor(color)
+        if not glow_color.isValid():
+            glow_color = QColor("#59f3ff")
+        if glow_color.alpha() < 210:
+            glow_color.setAlpha(210)
+        effect.setBlurRadius(float(blur_radius))
+        effect.setColor(glow_color)
+
+    def _current_site_for_weather(self) -> Optional[Site]:
+        site = getattr(self.table_model, "site", None) if hasattr(self, "table_model") else None
+        if isinstance(site, Site):
+            return site
+        if hasattr(self, "obs_combo") and hasattr(self, "observatories"):
+            selected = self.obs_combo.currentText()
+            maybe = self.observatories.get(selected)
+            if isinstance(maybe, Site):
+                return maybe
+        return None
+
+    def _refresh_weather_window_context(self, *, rebuild: bool = True) -> None:
+        window = getattr(self, "weather_window", None)
+        if not isinstance(window, WeatherDialog):
+            return
+        site = self._current_site_for_weather()
+        obs_name = site.name if isinstance(site, Site) else (
+            self.obs_combo.currentText() if hasattr(self, "obs_combo") else "-"
+        )
+        date = self.date_edit.date() if hasattr(self, "date_edit") else QDate.currentDate()
+        local_time_text = self.localtime_label.text() if hasattr(self, "localtime_label") else "-"
+        utc_time_text = self.utctime_label.text() if hasattr(self, "utctime_label") else "-"
+        sunrise_text = self.sunrise_label.text() if hasattr(self, "sunrise_label") else "-"
+        sunset_text = self.sunset_label.text() if hasattr(self, "sunset_label") else "-"
+        moonrise_text = self.moonrise_label.text() if hasattr(self, "moonrise_label") else "-"
+        moonset_text = self.moonset_label.text() if hasattr(self, "moonset_label") else "-"
+        moon_phase_pct = int(self.moonphase_bar.value()) if hasattr(self, "moonphase_bar") else 0
+        window.set_context(
+            site=site,
+            obs_name=obs_name,
+            date=date,
+            sun_alt_limit=self._sun_alt_limit(),
+            local_time_text=local_time_text,
+            utc_time_text=utc_time_text,
+            sunrise_text=sunrise_text,
+            sunset_text=sunset_text,
+            moonrise_text=moonrise_text,
+            moonset_text=moonset_text,
+            moon_phase_pct=moon_phase_pct,
+            rebuild=rebuild,
+        )
+
+    @Slot()
+    def _open_weather_window(self) -> None:
+        window = getattr(self, "weather_window", None)
+        if not isinstance(window, WeatherDialog):
+            window = WeatherDialog(self)
+            window.setStyleSheet(self.styleSheet())
+            self.weather_window = window
+        self._refresh_weather_window_context()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _selected_target_row_index(self) -> Optional[int]:
+        rows = self._selected_rows() if hasattr(self, "table_view") else []
+        if rows and 0 <= rows[0] < len(self.targets):
+            return int(rows[0])
+        return None
+
+    def _build_llm_target_summary_line(
+        self,
+        row_index: int,
+        target: Target,
+        *,
+        include_current_snapshot: bool = True,
+    ) -> str:
+        details: list[str] = []
+        order_values = getattr(self.table_model, "order_values", [])
+        if row_index < len(order_values):
+            order_value = _safe_int(order_values[row_index])
+            if isinstance(order_value, int) and order_value > 0:
+                details.append(f"order {order_value}")
+        details.append(f"pri {target.priority}")
+        if target.observed:
+            details.append("observed")
+        if target.object_type and not _object_type_is_unknown(target.object_type):
+            details.append(f"type {target.object_type}")
+
+        metrics = self.target_metrics.get(target.name)
+        if metrics is not None:
+            details.extend(
+                [
+                    f"score {metrics.score:.1f}",
+                    f"best {self._format_target_best_window_compact(target) or 'none'}",
+                    f"over {metrics.hours_above_limit:.1f} h",
+                    f"max alt {metrics.max_altitude_deg:.0f} deg",
+                ]
+            )
+        else:
+            details.append("visibility not calculated")
+
+        if include_current_snapshot:
+            if row_index < len(self.table_model.current_alts):
+                alt_now = self.table_model.current_alts[row_index]
+                if math.isfinite(alt_now):
+                    details.append(f"now alt {alt_now:.1f} deg")
+            if row_index < len(self.table_model.current_seps):
+                moon_sep_now = self.table_model.current_seps[row_index]
+                if math.isfinite(moon_sep_now):
+                    details.append(f"now moon sep {moon_sep_now:.1f} deg")
+
+        return f"  - {target.name}: " + ", ".join(details)
+
+    def _session_context_target_indices(self, *, max_items: int = 8) -> tuple[list[int], int]:
+        if not self.targets:
+            return [], 0
+
+        row_enabled = list(getattr(self.table_model, "row_enabled", []))
+        visible_indices = [idx for idx, enabled in enumerate(row_enabled) if enabled] if row_enabled else []
+        candidate_indices = visible_indices or list(range(len(self.targets)))
+        selected_row = self._selected_target_row_index()
+
+        def _sort_key(idx: int) -> tuple[object, ...]:
+            order_values = getattr(self.table_model, "order_values", [])
+            raw_order = order_values[idx] if idx < len(order_values) else 0
+            order_value = _safe_int(raw_order) or 0
+            metrics = self.target_metrics.get(self.targets[idx].name)
+            score = float(metrics.score) if metrics is not None else -1.0
+            hours_above = float(metrics.hours_above_limit) if metrics is not None else -1.0
+            return (
+                0 if order_value > 0 else 1,
+                order_value if order_value > 0 else 10**9,
+                -score,
+                -hours_above,
+                _normalize_catalog_display_name(self.targets[idx].name).lower(),
+            )
+
+        ranked = sorted(candidate_indices, key=_sort_key)
+        summary_indices: list[int] = []
+        for idx in ranked:
+            if idx == selected_row:
+                continue
+            summary_indices.append(idx)
+            if len(summary_indices) >= max_items:
+                break
+        omitted_count = max(0, len(candidate_indices) - len(summary_indices))
+        return summary_indices, omitted_count
+
+    def _build_session_context(
+        self,
+        *,
+        include_current_snapshot: bool = True,
+        user_question: str = "",
+    ) -> str:
         parts: list[str] = []
         date_str = self.date_edit.date().toString("yyyy-MM-dd")
         parts.append(f"Observation date: {date_str}")
@@ -7802,6 +20521,10 @@ class MainWindow(QMainWindow):
             )
         parts.append(f"Altitude limit: {self.limit_spin.value()} deg")
         parts.append(f"Sun altitude threshold: {self._sun_alt_limit():.0f} deg")
+        if hasattr(self, "min_moon_sep_spin"):
+            parts.append(f"Moon separation threshold: {float(self.min_moon_sep_spin.value()):.0f} deg")
+        if hasattr(self, "min_score_spin"):
+            parts.append(f"Score threshold: {float(self.min_score_spin.value()):.1f}")
 
         payload = self.last_payload if isinstance(self.last_payload, dict) else None
         tz_name = site.timezone_name if site else "UTC"
@@ -7837,9 +20560,10 @@ class MainWindow(QMainWindow):
             if isinstance(now_local, datetime):
                 parts.append(f"Current local time: {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
             parts.append(
-                "Events: "
+                "Night events: "
                 f"sunset {_fmt_event('sunset')}, sunrise {_fmt_event('sunrise')}, "
-                f"dusk {_fmt_event('dusk')}, dawn {_fmt_event('dawn')}"
+                f"astronomical night starts {_fmt_event('dusk')}, "
+                f"astronomical night ends {_fmt_event('dawn')}"
             )
             moon_phase = payload.get("moon_phase")
             if moon_phase is not None:
@@ -7852,59 +20576,307 @@ class MainWindow(QMainWindow):
             parts.append("Targets: none")
             return "\n".join(parts)
 
-        rows: list[str] = []
-        max_items = 40
-        for idx, target in enumerate(self.targets):
-            if idx >= max_items:
-                rows.append(f"  - ... and {len(self.targets) - max_items} more")
-                break
-            details: list[str] = [f"priority {target.priority}"]
-            if target.observed:
-                details.append("observed yes")
+        visible_count = sum(bool(enabled) for enabled in getattr(self.table_model, "row_enabled", []))
+        if visible_count > 0:
+            parts.append(f"Targets in plan: {len(self.targets)} total, {visible_count} visible under current filters")
+        else:
+            parts.append(f"Targets in plan: {len(self.targets)}")
 
-            metrics = self.target_metrics.get(target.name)
-            if metrics is not None:
-                details.extend(
+        selected_row = self._selected_target_row_index()
+        if selected_row is not None and 0 <= selected_row < len(self.targets):
+            selected_target = self.targets[selected_row]
+            parts.append(
+                "Selected target:\n"
+                + self._build_llm_target_summary_line(
+                    selected_row,
+                    selected_target,
+                    include_current_snapshot=include_current_snapshot,
+                )
+            )
+
+        summary_indices, omitted_count = self._session_context_target_indices(
+            max_items=8,
+        )
+        if summary_indices:
+            rows = [
+                self._build_llm_target_summary_line(
+                    idx,
+                    self.targets[idx],
+                    include_current_snapshot=include_current_snapshot,
+                )
+                for idx in summary_indices
+            ]
+            parts.append("Target shortlist:\n" + "\n".join(rows))
+            if omitted_count > 0:
+                parts.append(f"Additional visible targets omitted from prompt: {omitted_count}")
+
+        suggestion_context = self._build_bhtom_suggestion_shortlist_context(
+            user_question=user_question,
+            max_items=5,
+        )
+        if suggestion_context:
+            parts.append(suggestion_context)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _question_bhtom_type_markers(question: str) -> tuple[str, ...]:
+        normalized = _normalize_catalog_display_name(question).lower()
+        if not normalized:
+            return ()
+
+        markers: list[str] = []
+
+        def _contains_token(token: str) -> bool:
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", normalized))
+
+        if any(token in normalized for token in ("supernova", "super nowa", "supernowa")) or _contains_token("sn"):
+            markers.extend(["supernova", "sn"])
+        if "nova" in normalized:
+            markers.append("nova")
+        if any(token in normalized for token in ("quasar", "qso")) or _contains_token("qso"):
+            markers.extend(["quasar", "qso"])
+        if _contains_token("agn") or "seyfert" in normalized:
+            markers.extend(["agn", "seyfert"])
+        if _contains_token("tde") or "tidal disruption" in normalized:
+            markers.append("tde")
+        if _contains_token("cv") or "cataclysmic" in normalized:
+            markers.extend(["cv", "cataclysmic"])
+        if "blazar" in normalized:
+            markers.append("blazar")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for marker in markers:
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(marker)
+        return tuple(deduped)
+
+    def _build_bhtom_suggestion_shortlist_context(
+        self,
+        *,
+        user_question: str = "",
+        max_items: int = 5,
+    ) -> str:
+        suggestions = list(getattr(self, "_bhtom_ranked_suggestions_cache", []) or [])
+        if not suggestions:
+            return ""
+
+        type_markers = self._question_bhtom_type_markers(user_question)
+        shortlist = suggestions
+        shortlist_label = "Cached BHTOM suggestion shortlist (not yet in plan)"
+        max_rows = max_items
+
+        if type_markers:
+            filtered: list[dict[str, object]] = []
+            for item in suggestions:
+                target = item.get("target")
+                if not isinstance(target, Target):
+                    continue
+                haystack = " ".join(
                     [
-                        f"score {metrics.score:.1f}",
-                        f"hours_above_limit {metrics.hours_above_limit:.2f} h",
-                        f"max_altitude {metrics.max_altitude_deg:.1f} deg",
-                        f"peak_moon_sep {metrics.peak_moon_sep_deg:.1f} deg",
+                        _normalize_catalog_display_name(target.name).lower(),
+                        _normalize_catalog_display_name(target.source_object_id).lower(),
+                        _normalize_catalog_display_name(target.object_type).lower(),
                     ]
                 )
+                if any(marker in haystack for marker in type_markers):
+                    filtered.append(item)
+            if filtered:
+                shortlist = filtered
+                max_rows = max(max_items, 10)
+                shortlist_label = (
+                    "Cached BHTOM suggestion shortlist matching this question "
+                    "(not yet in plan)"
+                )
 
-            window = self.target_windows.get(target.name)
-            if window is not None:
-                try:
-                    start_txt = window[0].astimezone(tz).strftime("%Y-%m-%d %H:%M")
-                    end_txt = window[1].astimezone(tz).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    start_txt = window[0].strftime("%Y-%m-%d %H:%M")
-                    end_txt = window[1].strftime("%Y-%m-%d %H:%M")
-                details.append(f"best_window_local {start_txt} -> {end_txt}")
-            else:
-                details.append("best_window_local none under current constraints")
+        rows: list[str] = []
+        for item in shortlist:
+            target = item.get("target")
+            metrics = item.get("metrics")
+            window_start = item.get("window_start")
+            window_end = item.get("window_end")
+            if not isinstance(target, Target) or not isinstance(metrics, TargetNightMetrics):
+                continue
+            if not isinstance(window_start, datetime) or not isinstance(window_end, datetime):
+                continue
 
-            if include_current_snapshot:
-                if idx < len(self.table_model.current_alts):
-                    alt_now = self.table_model.current_alts[idx]
-                    if math.isfinite(alt_now):
-                        details.append(f"current_alt_snapshot {alt_now:.1f} deg")
-                if idx < len(self.table_model.current_azs):
-                    az_now = self.table_model.current_azs[idx]
-                    if math.isfinite(az_now):
-                        details.append(f"current_az_snapshot {az_now:.1f} deg")
-                if idx < len(self.table_model.current_seps):
-                    moon_sep_now = self.table_model.current_seps[idx]
-                    if math.isfinite(moon_sep_now):
-                        details.append(f"current_moon_sep_snapshot {moon_sep_now:.1f} deg")
+            details: list[str] = []
+            if target.object_type and not _object_type_is_unknown(target.object_type):
+                details.append(f"type {target.object_type}")
+            importance = _safe_float(item.get("importance"))
+            if importance is not None and math.isfinite(importance):
+                details.append(f"importance {importance:.1f}")
+            if target.magnitude is not None and math.isfinite(float(target.magnitude)):
+                details.append(f"{_target_magnitude_label(target).lower()} {float(target.magnitude):.2f}")
+            details.append(f"score {metrics.score:.1f}")
+            details.append(f"best {window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}")
+            best_airmass = _safe_float(item.get("best_airmass"))
+            if best_airmass is not None and math.isfinite(best_airmass):
+                details.append(f"min airmass {best_airmass:.2f}")
+            rows.append(f"  - {target.name}: " + ", ".join(details))
+            if len(rows) >= max_rows:
+                break
 
-            rows.append(
-                f"  - {target.name}: RA {target.ra:.3f} deg, Dec {target.dec:.3f} deg; "
-                + "; ".join(details)
-            )
-        parts.append("Current targets:\n" + "\n".join(rows))
-        return "\n".join(parts)
+        if not rows:
+            return ""
+        omitted = max(0, len(shortlist) - len(rows))
+        summary = shortlist_label
+        if omitted > 0:
+            summary = f"{summary} (+{omitted} more)"
+        return summary + ":\n" + "\n".join(rows)
+
+    @staticmethod
+    def _find_normalized_text_position(text: str, candidate: str) -> Optional[int]:
+        normalized_text = _normalize_catalog_display_name(text).lower()
+        normalized_candidate = _normalize_catalog_display_name(candidate).lower()
+        if not normalized_text or not normalized_candidate:
+            return None
+        direct_pos = normalized_text.find(normalized_candidate)
+        if direct_pos >= 0:
+            return direct_pos
+        compact_text = re.sub(r"[^a-z0-9]+", "", normalized_text)
+        compact_candidate = re.sub(r"[^a-z0-9]+", "", normalized_candidate)
+        if len(compact_candidate) < 5:
+            return None
+        compact_pos = compact_text.find(compact_candidate)
+        if compact_pos >= 0:
+            return compact_pos
+        return None
+
+    def _extract_addable_bhtom_targets_from_ai_text(self, text: str, *, max_items: int = 4) -> list[Target]:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return []
+        suggestions = list(getattr(self, "_bhtom_ranked_suggestions_cache", []) or [])
+        if not suggestions:
+            return []
+
+        matched: list[tuple[int, int, Target]] = []
+        seen: set[str] = set()
+        for rank, item in enumerate(suggestions):
+            target = item.get("target")
+            if not isinstance(target, Target):
+                continue
+            if self._plan_contains_target(target):
+                continue
+            positions: list[int] = []
+            for candidate_name in {target.name.strip(), str(target.source_object_id or "").strip()}:
+                if not candidate_name:
+                    continue
+                pos = self._find_normalized_text_position(raw_text, candidate_name)
+                if pos is not None:
+                    positions.append(pos)
+            if not positions:
+                continue
+            dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            matched.append((min(positions), rank, target))
+
+        matched.sort(key=lambda item: (item[0], item[1], item[2].name.lower()))
+        return [target for _, _, target in matched[: max(1, int(max_items))]]
+
+    @staticmethod
+    def _looks_like_object_scoped_query(text: str) -> bool:
+        normalized = _normalize_catalog_display_name(text).lower()
+        if not normalized:
+            return False
+        explicit_phrases = (
+            "this object",
+            "this target",
+            "selected object",
+            "selected target",
+            "details of this object",
+            "details of the object",
+            "describe this object",
+            "tell me about this object",
+            "ten obiekt",
+            "tego obiektu",
+            "wybrany obiekt",
+            "wybranego obiektu",
+            "tego targetu",
+            "tego celu",
+            "opisz ten obiekt",
+            "szczegoly tego obiektu",
+            "szczegóły tego obiektu",
+            "jak powinienem go obserwowac",
+            "jak powinienem go obserwować",
+            "jak go obserwowac",
+            "jak go obserwować",
+            "jak obserwowac ten obiekt",
+            "jak obserwować ten obiekt",
+            "jak obserwowac ten target",
+            "jak obserwować ten target",
+            "jak obserwowac ten cel",
+            "jak obserwować ten cel",
+        )
+        return any(phrase in normalized for phrase in explicit_phrases)
+
+    def _should_auto_route_selected_target_query(self, text: str, target: Optional[Target]) -> bool:
+        if target is None:
+            return False
+        normalized = _normalize_catalog_display_name(text).lower()
+        if not normalized:
+            return False
+        if self._looks_like_object_scoped_query(normalized):
+            return True
+
+        selected_tokens = [
+            _normalize_catalog_display_name(target.name).lower(),
+            _normalize_catalog_display_name(target.source_object_id).lower(),
+        ]
+        mentions_selected_target = any(token and token in normalized for token in selected_tokens)
+        if not mentions_selected_target:
+            return False
+
+        object_markers = (
+            "describe",
+            "details",
+            "detail",
+            "summary",
+            "summarize",
+            "tell me about",
+            "what is",
+            "what are",
+            "info",
+            "information",
+            "object",
+            "target",
+            "obiekt",
+            "opisz",
+            "szczegoly",
+            "szczegóły",
+            "informacje",
+        )
+        session_markers = (
+            "tonight",
+            "plan",
+            "schedule",
+            "compare",
+            "comparison",
+            "order",
+            "rank",
+            "ranking",
+            "which target",
+            "which object",
+            "best target",
+            "other targets",
+            "lista",
+            "porown",
+            "porówn",
+            "kolejn",
+            "harmonogram",
+        )
+        return any(marker in normalized for marker in object_markers) and not any(
+            marker in normalized for marker in session_markers
+        )
+
+    def _dispatch_selected_target_llm_question(self, target: Target, question: str, *, label: str) -> None:
+        prompt = self._build_selected_target_llm_prompt(target, question)
+        self._dispatch_llm(prompt, tag="chat_selected", label=label)
 
     def _build_deterministic_observation_order(self) -> tuple[list[dict[str, object]], list[str]]:
         payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
@@ -8032,8 +21004,13 @@ class MainWindow(QMainWindow):
     _SYSTEM_PROMPT = (
         "You are an expert astronomy observation assistant. "
         "Provide concise, practical, and accurate guidance for planning observations. "
-        "When suggesting objects, prefer common catalog names (Messier, NGC, IC, etc.). "
-        "Use the provided session context and prioritize objects practical for the current site and night."
+        "Keep answers compact by default and avoid unnecessary background. "
+        "Use only the provided session context when answering questions about tonight's plan. "
+        "Do not introduce targets that are not listed in the provided session context unless the user explicitly asks for off-plan suggestions. "
+        "If a cached BHTOM suggestion shortlist is included in the session context, you may use only those listed BHTOM suggestions as off-plan candidates. "
+        "Use target names exactly as they appear in the provided context; do not swap in unrelated Messier, NGC, or other catalog examples. "
+        "Interpret dusk as the start of the observing night window and dawn as the end of the observing night window. "
+        "If the data is missing or ambiguous, say so instead of guessing."
     )
 
     def _format_target_coords_compact(self, target: Target) -> str:
@@ -8059,6 +21036,53 @@ class MainWindow(QMainWindow):
             start = window[0].strftime("%H:%M")
             end = window[1].strftime("%H:%M")
         return f"{start}-{end}"
+
+    def _build_fast_target_llm_context(self, target: Target) -> str:
+        self._ensure_known_target_type(target)
+        lines: list[str] = [f"Name: {target.name}", f"Source: {_target_source_label(target.source_catalog)}"]
+
+        source_id = target.source_object_id.strip()
+        if source_id and _normalize_catalog_token(source_id) != _normalize_catalog_token(target.name):
+            lines.append(f"Catalog ID: {source_id}")
+        if target.object_type and not _object_type_is_unknown(target.object_type):
+            lines.append(f"Type: {target.object_type}")
+
+        bhtom_importance = self._bhtom_importance_for_target(target)
+        if bhtom_importance is not None:
+            lines.append(f"BHTOM importance: {bhtom_importance:.1f}")
+
+        if target.magnitude is not None:
+            lines.append(f"{_target_magnitude_label(target)}: {target.magnitude:.2f}")
+        lines.append(f"Coords: {self._format_target_coords_compact(target)}")
+
+        row_index: Optional[int] = None
+        for idx, existing in enumerate(self.targets):
+            if _targets_match(existing, target):
+                row_index = idx
+                break
+
+        metrics = self.target_metrics.get(target.name)
+        tonight_parts: list[str] = []
+        best_window = self._format_target_best_window_compact(target)
+        if best_window:
+            tonight_parts.append(f"best {best_window}")
+        if metrics is not None:
+            tonight_parts.append(f"max alt {metrics.max_altitude_deg:.0f} deg")
+            tonight_parts.append(f"over limit {metrics.hours_above_limit:.1f} h")
+            tonight_parts.append(f"score {metrics.score:.1f}")
+        if row_index is not None:
+            if row_index < len(self.table_model.current_alts):
+                alt_now = self.table_model.current_alts[row_index]
+                if math.isfinite(alt_now):
+                    tonight_parts.append(f"now alt {alt_now:.1f} deg")
+            if row_index < len(self.table_model.current_seps):
+                moon_sep_now = self.table_model.current_seps[row_index]
+                if math.isfinite(moon_sep_now):
+                    tonight_parts.append(f"now moon sep {moon_sep_now:.1f} deg")
+        if tonight_parts:
+            lines.append("Tonight: " + ", ".join(tonight_parts))
+
+        return "\n".join(lines)
 
     @staticmethod
     def _format_compact_number(value: float, *, decimals_small: int = 3) -> str:
@@ -8307,174 +21331,343 @@ class MainWindow(QMainWindow):
     def _bhtom_api_base_url(self) -> str:
         return (os.getenv("BHTOM_API_BASE_URL", "") or BHTOM_API_BASE_URL).strip().rstrip("/")
 
-    def _bhtom_api_token(self) -> str:
-        token = (
+    def _bhtom_api_token_optional(self) -> str:
+        return (
             self.settings.value("general/bhtomApiToken", "", type=str)
             or os.getenv("BHTOM_API_TOKEN", "")
         ).strip()
+
+    def _bhtom_api_token(self) -> str:
+        token = self._bhtom_api_token_optional()
         if not token:
-            raise RuntimeError("Suggest Targets requires a BHTOM API token in Settings -> General Settings.")
+            raise RuntimeError("BHTOM features require an API token in Settings -> General Settings.")
         return token
 
-    def _fetch_bhtom_target_page(self, page: int, token: Optional[str] = None) -> object:
-        auth_token = token or self._bhtom_api_token()
-        endpoint = f"{self._bhtom_api_base_url()}{BHTOM_TARGET_LIST_PATH}"
-        body = json.dumps(
-            {
-                "page": page,
-                "type": "SIDEREAL",
-                "importanceMin": BHTOM_SUGGESTION_MIN_IMPORTANCE,
-            }
-        ).encode("utf-8")
-        req = Request(
-            endpoint,
-            data=body,
-            headers={
-                "Authorization": f"Token {auth_token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "AstroPlanner/1.0 (desktop app)",
-            },
-        )
-        try:
-            with urlopen(req, timeout=20) as resp:
-                raw = resp.read().decode("utf-8")
-        except HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8", errors="ignore").strip()
-            except Exception:
-                detail = ""
-            if exc.code in {401, 403}:
-                raise RuntimeError("BHTOM unauthorized (401/403). Check BHTOM_API_TOKEN.") from exc
-            if detail:
-                raise RuntimeError(f"BHTOM request failed ({exc.code}): {detail[:240]}") from exc
-            raise RuntimeError(f"BHTOM request failed ({exc.code}).") from exc
-        except Exception as exc:
-            raise RuntimeError(f"BHTOM lookup failed: {exc}") from exc
+    def _bhtom_observatory_cache_path(self) -> Path:
+        return Path(__file__).resolve().parent / "config" / "bhtom_observatory_presets_cache.json"
 
+    def _bhtom_token_hash(self, token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _clone_bhtom_observatory_presets(self, presets: list[dict[str, object]]) -> list[dict[str, object]]:
+        cloned: list[dict[str, object]] = []
+        for item in presets:
+            if not isinstance(item, dict):
+                continue
+            site = item.get("site")
+            if not isinstance(site, Site):
+                continue
+            cloned.append(
+                {
+                    "key": str(item.get("key", "")),
+                    "label": str(item.get("label", "")),
+                    "site": Site(**site.model_dump()),
+                }
+            )
+        return cloned
+
+    def _deserialize_bhtom_observatory_presets(self, payload: object) -> list[dict[str, object]]:
+        if not isinstance(payload, list):
+            return []
+        parsed: list[dict[str, object]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", "")).strip()
+            label = str(item.get("label", "")).strip()
+            site_payload = item.get("site")
+            if not key or not label or not isinstance(site_payload, dict):
+                continue
+            try:
+                site = Site(**site_payload)
+            except Exception:
+                continue
+            parsed.append({"key": key, "label": label, "site": site})
+        return parsed
+
+    def _load_bhtom_observatory_disk_cache(
+        self,
+        *,
+        token: str,
+        base_url: str,
+    ) -> Optional[list[dict[str, object]]]:
+        cache_path = self._bhtom_observatory_cache_path()
+        if not cache_path.exists():
+            return None
         try:
-            return json.loads(raw)
-        except Exception as exc:
-            raise RuntimeError("BHTOM returned non-JSON response.") from exc
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if int(payload.get("version", 0)) != 1:
+            return None
+        if str(payload.get("base_url", "")).strip().rstrip("/") != str(base_url).strip().rstrip("/"):
+            return None
+        if str(payload.get("token_hash", "")).strip() != self._bhtom_token_hash(token):
+            return None
+        fetched_at = _safe_float(payload.get("fetched_at_unix"))
+        if fetched_at is None:
+            return None
+        age_s = datetime.now(timezone.utc).timestamp() - float(fetched_at)
+        if age_s < 0 or age_s > BHTOM_OBSERVATORY_CACHE_TTL_S:
+            return None
+        presets = self._deserialize_bhtom_observatory_presets(payload.get("presets"))
+        if not presets:
+            return None
+        return presets
+
+    def _save_bhtom_observatory_disk_cache(
+        self,
+        presets: list[dict[str, object]],
+        *,
+        token: str,
+        base_url: str,
+    ) -> None:
+        serializable: list[dict[str, object]] = []
+        for item in presets:
+            if not isinstance(item, dict):
+                continue
+            site = item.get("site")
+            if not isinstance(site, Site):
+                continue
+            serializable.append(
+                {
+                    "key": str(item.get("key", "")),
+                    "label": str(item.get("label", "")),
+                    "site": site.model_dump(),
+                }
+            )
+        if not serializable:
+            return
+        payload = {
+            "version": 1,
+            "base_url": str(base_url).strip().rstrip("/"),
+            "token_hash": self._bhtom_token_hash(token),
+            "fetched_at_unix": datetime.now(timezone.utc).timestamp(),
+            "presets": serializable,
+        }
+        cache_path = self._bhtom_observatory_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _fetch_bhtom_target_page(self, page: int, token: Optional[str] = None) -> object:
+        return _fetch_bhtom_target_page_payload(
+            endpoint_base_url=self._bhtom_api_base_url(),
+            token=(token or self._bhtom_api_token()),
+            page=int(page),
+        )
+
+    def _fetch_bhtom_observatory_page(self, page: int, token: Optional[str] = None) -> object:
+        return _fetch_bhtom_observatory_page_payload(
+            endpoint_base_url=self._bhtom_api_base_url(),
+            token=(token or self._bhtom_api_token()),
+            page=int(page),
+        )
+
+    def _bhtom_observatory_prefetch_status(self) -> tuple[bool, str]:
+        worker = getattr(self, "_bhtom_observatory_worker", None)
+        if worker is not None and worker.isRunning():
+            return True, str(self._bhtom_observatory_loading_message or "Loading BHTOM presets...")
+        cache = self._cached_bhtom_observatory_presets()
+        if cache:
+            return False, f"Loaded {len(cache)} cached BHTOM presets."
+        if not self._bhtom_api_token_optional():
+            return False, "BHTOM token is not configured."
+        return False, "BHTOM presets load in background."
+
+    def _prefetch_bhtom_observatory_presets_on_startup(self) -> None:
+        token = self._bhtom_api_token_optional()
+        if not token:
+            return
+        base_url = self._bhtom_api_base_url()
+        cached = self._cached_bhtom_observatory_presets(token=token, base_url=base_url)
+        if cached:
+            self.bhtom_observatory_presets_changed.emit(cached, f"Loaded {len(cached)} cached BHTOM presets.")
+        self._ensure_bhtom_observatory_prefetch(force_refresh=True)
+
+    def _ensure_bhtom_observatory_prefetch(self, *, force_refresh: bool = False) -> bool:
+        token = self._bhtom_api_token_optional()
+        if not token:
+            self._bhtom_observatory_loading_message = "BHTOM token is not configured."
+            self.bhtom_observatory_presets_loading.emit(False, self._bhtom_observatory_loading_message)
+            return False
+        base_url = self._bhtom_api_base_url()
+        worker = self._bhtom_observatory_worker
+        if worker is not None and worker.isRunning():
+            return False
+        if not force_refresh:
+            cached = self._cached_bhtom_observatory_presets(token=token, base_url=base_url)
+            if cached:
+                self.bhtom_observatory_presets_changed.emit(cached, f"Loaded {len(cached)} cached BHTOM presets.")
+                return False
+        self._bhtom_observatory_worker_request_id += 1
+        req_id = self._bhtom_observatory_worker_request_id
+        self._bhtom_observatory_loading_message = "Loading BHTOM presets..."
+        self.bhtom_observatory_presets_loading.emit(True, self._bhtom_observatory_loading_message)
+        prefetch_worker = BhtomObservatoryPresetWorker(req_id, base_url=base_url, token=token, parent=self)
+        prefetch_worker.progress.connect(self._on_bhtom_observatory_prefetch_progress)
+        prefetch_worker.completed.connect(self._on_bhtom_observatory_prefetch_completed)
+        prefetch_worker.finished.connect(lambda w=prefetch_worker: self._on_bhtom_observatory_prefetch_finished(w))
+        prefetch_worker.finished.connect(prefetch_worker.deleteLater)
+        self._bhtom_observatory_worker = prefetch_worker
+        prefetch_worker.start()
+        return True
+
+    @Slot(int, int, str)
+    def _on_bhtom_observatory_prefetch_progress(self, page: int, _total_pages: int, message: str) -> None:
+        if self._bhtom_observatory_worker is None:
+            return
+        txt = str(message or "").strip() or f"Loading BHTOM presets... page {int(page)}"
+        self._bhtom_observatory_loading_message = txt
+        self.bhtom_observatory_presets_loading.emit(True, txt)
+
+    @Slot(int, list, str)
+    def _on_bhtom_observatory_prefetch_completed(self, request_id: int, presets: list, err: str) -> None:
+        if request_id != self._bhtom_observatory_worker_request_id:
+            return
+        token = self._bhtom_api_token_optional()
+        base_url = self._bhtom_api_base_url()
+        if err:
+            msg = "BHTOM preset refresh failed." if str(err).strip().lower() == "cancelled" else f"BHTOM preset refresh failed: {err}"
+            cached = self._cached_bhtom_observatory_presets(token=token, base_url=base_url)
+            self._bhtom_observatory_loading_message = msg
+            self.bhtom_observatory_presets_loading.emit(False, msg)
+            if cached:
+                self.bhtom_observatory_presets_changed.emit(cached, f"{msg} Using cached presets.")
+            return
+        safe_presets = self._clone_bhtom_observatory_presets(presets if isinstance(presets, list) else [])
+        if not safe_presets:
+            self._bhtom_observatory_loading_message = "BHTOM returned no usable presets."
+            self.bhtom_observatory_presets_loading.emit(False, self._bhtom_observatory_loading_message)
+            return
+        self._bhtom_observatory_cache_key = (base_url, token)
+        self._bhtom_observatory_cache = safe_presets
+        self._bhtom_observatory_cache_loaded_at = perf_counter()
+        try:
+            self._save_bhtom_observatory_disk_cache(safe_presets, token=token, base_url=base_url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist BHTOM observatory cache: %s", exc)
+        loaded_msg = f"Loaded {len(safe_presets)} BHTOM presets."
+        self._bhtom_observatory_loading_message = loaded_msg
+        self.bhtom_observatory_presets_loading.emit(False, loaded_msg)
+        self.bhtom_observatory_presets_changed.emit(self._clone_bhtom_observatory_presets(safe_presets), loaded_msg)
+
+    def _on_bhtom_observatory_prefetch_finished(self, worker: BhtomObservatoryPresetWorker) -> None:
+        if self._bhtom_observatory_worker is worker:
+            self._bhtom_observatory_worker = None
 
     @staticmethod
     def _extract_bhtom_items(payload: object) -> list[dict[str, Any]]:
-        if isinstance(payload, list):
-            return [item for item in payload if isinstance(item, dict)]
-        if not isinstance(payload, dict):
-            return []
-
-        for key in ("results", "targets", "items", "data", "objects"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-            if isinstance(value, dict):
-                for nested_key in ("results", "targets", "items", "data", "objects"):
-                    nested_value = value.get(nested_key)
-                    if isinstance(nested_value, list):
-                        return [item for item in nested_value if isinstance(item, dict)]
-        return []
+        return _extract_bhtom_items(payload)
 
     @staticmethod
     def _bhtom_payload_has_more(payload: object, page: int, item_count: int) -> bool:
-        if isinstance(payload, dict):
-            next_value = payload.get("next")
-            if next_value not in (None, "", False):
-                return True
-            for key in ("has_next", "hasNext"):
-                if payload.get(key) is True:
-                    return True
-            total_pages = None
-            for key in ("totalPages", "total_pages", "numPages", "num_pages", "pages", "page_count"):
-                total_pages = _safe_int(payload.get(key))
-                if total_pages is not None:
-                    break
-            if total_pages is not None:
-                return page < total_pages
-            total_count = None
-            for key in ("count", "total", "totalCount", "recordsTotal"):
-                total_count = _safe_int(payload.get(key))
-                if total_count is not None:
-                    break
-            if total_count is not None:
-                return page * BHTOM_PAGE_SIZE < total_count
-        return item_count >= BHTOM_PAGE_SIZE and page < BHTOM_MAX_SUGGESTION_PAGES
+        return _bhtom_payload_has_more(payload, page, item_count)
 
     @staticmethod
     def _pick_first_present(sources: list[dict[str, Any]], *keys: str) -> object:
-        for source in sources:
-            for key in keys:
-                if key in source and source[key] not in (None, ""):
-                    return source[key]
-        return None
+        return _pick_first_present(sources, *keys)
 
     def _build_bhtom_candidate(self, item: dict[str, Any]) -> Optional[dict[str, object]]:
-        nested_sources = [item]
-        for key in ("target", "target_data", "data", "object", "coordinates"):
-            nested = item.get(key)
-            if isinstance(nested, dict):
-                nested_sources.append(nested)
+        return _build_bhtom_candidate_from_item(item)
 
-        name_raw = self._pick_first_present(nested_sources, "name", "target_name", "display_name", "identifier")
-        name = _normalize_catalog_display_name(name_raw)
-        if not name:
-            return None
+    @staticmethod
+    def _extract_bhtom_observatory_items(payload: object) -> list[dict[str, Any]]:
+        return _extract_bhtom_observatory_items(payload)
 
-        ra_deg = _safe_float(self._pick_first_present(nested_sources, "ra", "raDeg", "ra_deg", "rightAscension"))
-        dec_deg = _safe_float(self._pick_first_present(nested_sources, "dec", "decDeg", "dec_deg", "declination"))
-        if ra_deg is None or dec_deg is None:
-            return None
+    @staticmethod
+    def _bhtom_observatory_payload_has_more(payload: object, page: int, item_count: int) -> bool:
+        return _bhtom_observatory_payload_has_more(payload, page, item_count)
 
-        classification = str(
-            self._pick_first_present(
-                nested_sources,
-                "classification",
-                "object_type",
-                "objectType",
-                "targetClass",
-                "class",
-            )
-            or ""
-        ).strip()
-        magnitude = _safe_float(
-            self._pick_first_present(
-                nested_sources,
-                "mag_last",
-                "last_mag",
-                "lastMagnitude",
-                "magnitude",
-                "mag",
-            )
-        )
-        importance = _safe_float(self._pick_first_present(nested_sources, "importance", "importance_value")) or 0.0
-        bhtom_priority = _safe_int(self._pick_first_present(nested_sources, "priority", "observing_priority")) or 0
-        target_priority = max(1, min(5, int(bhtom_priority))) if bhtom_priority > 0 else 3
-        sun_separation = _safe_float(
-            self._pick_first_present(nested_sources, "sun_separation", "sunSeparation", "sun")
-        )
-        source_id_raw = self._pick_first_present(nested_sources, "id", "pk", "target_id", "targetId", "name")
-        source_id = str(source_id_raw).strip() if source_id_raw is not None else name
+    def _cached_bhtom_observatory_presets(
+        self,
+        *,
+        token: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ) -> Optional[list[dict[str, object]]]:
+        resolved_token = (token or "").strip()
+        if not resolved_token:
+            try:
+                resolved_token = self._bhtom_api_token()
+            except Exception:
+                return None
+        resolved_base_url = (base_url or self._bhtom_api_base_url()).strip().rstrip("/")
+        cache_key = (resolved_base_url, resolved_token)
+        cache_age = perf_counter() - self._bhtom_observatory_cache_loaded_at
+        if (
+            self._bhtom_observatory_cache_key == cache_key
+            and self._bhtom_observatory_cache is not None
+            and cache_age < BHTOM_OBSERVATORY_CACHE_TTL_S
+        ):
+            return self._clone_bhtom_observatory_presets(self._bhtom_observatory_cache)
+        disk_cached = self._load_bhtom_observatory_disk_cache(token=resolved_token, base_url=resolved_base_url)
+        if disk_cached:
+            self._bhtom_observatory_cache_key = cache_key
+            self._bhtom_observatory_cache = self._clone_bhtom_observatory_presets(disk_cached)
+            self._bhtom_observatory_cache_loaded_at = perf_counter()
+            return self._clone_bhtom_observatory_presets(self._bhtom_observatory_cache)
+        return None
 
-        return {
-            "target": Target(
-                name=name,
-                ra=float(ra_deg),
-                dec=float(dec_deg),
-                source_catalog="bhtom",
-                source_object_id=source_id or name,
-                magnitude=magnitude,
-                object_type=classification,
-                priority=target_priority,
-            ),
-            "importance": float(importance),
-            "bhtom_priority": int(bhtom_priority),
-            "sun_separation": float(sun_separation) if sun_separation is not None else None,
-        }
-
-    def _fetch_bhtom_target_candidates(self) -> list[dict[str, object]]:
+    def _fetch_bhtom_observatory_presets(self, *, force_refresh: bool = False) -> list[dict[str, object]]:
         token = self._bhtom_api_token()
-        cache_key = (self._bhtom_api_base_url(), token)
+        base_url = self._bhtom_api_base_url()
+        cache_key = (base_url, token)
+        if not force_refresh:
+            cached = self._cached_bhtom_observatory_presets(token=token, base_url=base_url)
+            if cached is not None:
+                return cached
+
+        items: list[dict[str, Any]] = []
+        for page in range(1, BHTOM_MAX_OBSERVATORY_PAGES + 1):
+            payload = self._fetch_bhtom_observatory_page(page, token=token)
+            page_items = self._extract_bhtom_observatory_items(payload)
+            if not page_items:
+                if page == 1:
+                    if isinstance(payload, dict):
+                        keys = ", ".join(sorted(str(key) for key in payload.keys()))
+                        raise RuntimeError(
+                            f"BHTOM observatory endpoint returned an unexpected payload shape (keys: {keys or 'none'})."
+                        )
+                    raise RuntimeError("BHTOM observatory endpoint returned an unexpected payload shape.")
+                break
+            items.extend(page_items)
+            if not self._bhtom_observatory_payload_has_more(payload, page, len(page_items)):
+                break
+
+        presets = _build_bhtom_observatory_presets(items)
+        if not presets:
+            raise RuntimeError("BHTOM returned no usable observatory/camera presets.")
+
+        self._bhtom_observatory_cache_key = cache_key
+        self._bhtom_observatory_cache = self._clone_bhtom_observatory_presets(
+            presets if isinstance(presets, list) else []
+        )
+        self._bhtom_observatory_cache_loaded_at = perf_counter()
+        try:
+            self._save_bhtom_observatory_disk_cache(
+                self._bhtom_observatory_cache,
+                token=token,
+                base_url=base_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist BHTOM observatory cache: %s", exc)
+        return self._clone_bhtom_observatory_presets(self._bhtom_observatory_cache)
+
+    def _cached_bhtom_candidates(
+        self,
+        *,
+        token: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ) -> Optional[list[dict[str, object]]]:
+        resolved_token = (token or "").strip()
+        if not resolved_token:
+            try:
+                resolved_token = self._bhtom_api_token()
+            except Exception:
+                return None
+        resolved_base_url = (base_url or self._bhtom_api_base_url()).strip().rstrip("/")
+        cache_key = (resolved_base_url, resolved_token)
         cache_age = perf_counter() - self._bhtom_candidate_cache_loaded_at
         if (
             self._bhtom_candidate_cache_key == cache_key
@@ -8482,6 +21675,15 @@ class MainWindow(QMainWindow):
             and cache_age < BHTOM_SUGGESTION_CACHE_TTL_S
         ):
             return list(self._bhtom_candidate_cache)
+        return None
+
+    def _fetch_bhtom_target_candidates(self) -> list[dict[str, object]]:
+        token = self._bhtom_api_token()
+        base_url = self._bhtom_api_base_url()
+        cache_key = (base_url, token)
+        cached = self._cached_bhtom_candidates(token=token, base_url=base_url)
+        if cached is not None:
+            return cached
 
         candidates: list[dict[str, object]] = []
         seen_keys: set[str] = set()
@@ -8572,139 +21774,209 @@ class MainWindow(QMainWindow):
         self._bhtom_candidate_cache_key = None
         self._bhtom_candidate_cache = None
         self._bhtom_candidate_cache_loaded_at = 0.0
+        self._bhtom_ranked_suggestions_cache = []
         return self._build_local_target_suggestions()
 
-    def _build_local_target_suggestions(self) -> tuple[list[dict[str, object]], list[str]]:
+    def _build_bhtom_suggestion_context(self) -> tuple[Optional[dict[str, object]], Optional[str]]:
         payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
         if not payload:
-            return [], ["Run a visibility calculation first so suggestions use tonight's sky."]
-
+            return None, "Run a visibility calculation first so suggestions use tonight's sky."
         if not self.table_model.site:
-            return [], ["Set a valid observing site before requesting suggestions."]
-
+            return None, "Set a valid observing site before requesting suggestions."
         try:
-            tz_name = str(payload.get("tz", self.table_model.site.timezone_name))
-            tz = pytz.timezone(tz_name)
-        except Exception:
-            tz_name = self.table_model.site.timezone_name
-            tz = pytz.UTC
-
+            token = self._bhtom_api_token()
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
         try:
-            time_datetimes = [t.astimezone(tz) for t in mdates.num2date(payload["times"])]
-        except Exception:
-            return [], ["Visibility samples are unavailable in the current plot state."]
-        if not time_datetimes:
-            return [], ["Visibility samples are unavailable in the current plot state."]
+            site = Site(
+                name=self.table_model.site.name,
+                latitude=self._read_site_float(self.lat_edit),
+                longitude=self._read_site_float(self.lon_edit),
+                elevation=self._read_site_float(self.elev_edit),
+                limiting_magnitude=self._current_limiting_magnitude(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return None, f"Invalid observing site values: {exc}"
 
-        site = Site(
-            name=self.table_model.site.name,
-            latitude=self._read_site_float(self.lat_edit),
-            longitude=self._read_site_float(self.lon_edit),
-            elevation=self._read_site_float(self.elev_edit),
-        )
-        observer = Observer(location=site.to_earthlocation(), timezone=tz_name)
-        time_samples = Time(time_datetimes)
-        moon_ra = np.array(payload.get("moon_ra", np.full(len(time_datetimes), np.nan)), dtype=float)
-        moon_dec = np.array(payload.get("moon_dec", np.full(len(time_datetimes), np.nan)), dtype=float)
-        if moon_ra.shape[0] != len(time_datetimes) or moon_dec.shape[0] != len(time_datetimes):
-            return [], ["Moon position samples are unavailable in the current plot state."]
-        moon_coords = SkyCoord(ra=moon_ra * u.deg, dec=moon_dec * u.deg)
-
-        sun_alt_series = np.array(payload.get("sun_alt", np.full(len(time_datetimes), np.nan)), dtype=float)
-        sun_alt_limit = self._sun_alt_limit()
-        obs_sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= sun_alt_limit)
-        limit = float(self.limit_spin.value())
         min_moon_sep = float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0
-        sample_hours = 24.0 / max(len(time_datetimes) - 1, 1)
+        context = {
+            "payload": payload,
+            "site": site,
+            "targets": [Target(**target.model_dump()) for target in self.targets],
+            "limit_altitude": float(self.limit_spin.value()),
+            "sun_alt_limit": self._sun_alt_limit(),
+            "min_moon_sep": min_moon_sep,
+            "bhtom_base_url": self._bhtom_api_base_url(),
+            "bhtom_token": token,
+        }
+        return context, None
 
-        current_names = {_normalize_catalog_token(target.name) for target in self.targets}
-        current_source_ids = {_normalize_catalog_token(target.source_object_id) for target in self.targets if target.source_object_id}
-        current_coords = [target.skycoord for target in self.targets]
+    def _start_bhtom_worker(self, *, mode: str, emit_partials: bool) -> bool:
+        existing = self._bhtom_worker
+        if existing is not None and existing.isRunning():
+            title = "Quick Targets" if mode == "quick" else "Suggest Targets"
+            QMessageBox.information(self, title, "A BHTOM request is already in progress.")
+            return False
 
-        candidates = self._fetch_bhtom_target_candidates()
-        ranked: list[dict[str, object]] = []
-        skipped_notes: list[str] = []
+        context, error = self._build_bhtom_suggestion_context()
+        if context is None:
+            title = "Quick Targets" if mode == "quick" else "Suggest Targets"
+            QMessageBox.warning(self, title, error or "Unable to prepare BHTOM request.")
+            return False
 
-        for candidate_info in candidates:
-            target = candidate_info["target"]
-            assert isinstance(target, Target)
-            normalized_name = _normalize_catalog_token(target.name)
-            normalized_source = _normalize_catalog_token(target.source_object_id)
-            if normalized_name in current_names or (normalized_source and normalized_source in current_source_ids):
-                continue
-            if any(float(target.skycoord.separation(coord).deg) < 0.05 for coord in current_coords):
-                continue
+        self._bhtom_worker_request_id += 1
+        req_id = self._bhtom_worker_request_id
+        self._bhtom_worker_mode = mode
+        base_url = str(context["bhtom_base_url"])
+        token = str(context["bhtom_token"])
+        self._bhtom_worker_cache_key = (base_url, token)
+        cached_candidates = self._cached_bhtom_candidates(token=token, base_url=base_url)
+        if cached_candidates is not None:
+            logger.info("Using cached BHTOM candidates (%d entries).", len(cached_candidates))
 
-            fixed = FixedTarget(name=target.name, coord=target.skycoord)
-            altaz = observer.altaz(time_samples, fixed)
-            altitude = np.array(altaz.alt.deg, dtype=float)  # type: ignore[arg-type]
-            moon_sep = np.array(target.skycoord.separation(moon_coords).deg, dtype=float)
-            metrics = compute_target_metrics(
-                altitude_deg=altitude,
-                moon_sep_deg=moon_sep,
-                limit_altitude=limit,
-                sample_hours=sample_hours,
-                priority=max(1, min(5, int(candidate_info.get("bhtom_priority", 3) or 3))),
-                observed=False,
-                valid_mask=obs_sun_mask,
-            )
-
-            valid_mask = np.isfinite(altitude) & (altitude >= limit) & obs_sun_mask
-            if not valid_mask.any():
-                continue
-
-            valid_indices = np.where(valid_mask)[0]
-            runs = np.split(valid_indices, np.where(np.diff(valid_indices) != 1)[0] + 1)
-            best_run = max(runs, key=len)
-            start_idx = int(best_run[0])
-            end_idx = min(int(best_run[-1]) + 1, len(time_datetimes) - 1)
-            window_start = time_datetimes[start_idx]
-            window_end = time_datetimes[end_idx]
-            best_window_airmass = self._airmass_from_altitude(altitude[best_run])
-            finite_window_airmass = best_window_airmass[np.isfinite(best_window_airmass)]
-            best_airmass = float(np.min(finite_window_airmass)) if finite_window_airmass.size > 0 else None
-            finite_window_moon_sep = moon_sep[best_run][np.isfinite(moon_sep[best_run])]
-            min_window_moon_sep = (
-                float(np.min(finite_window_moon_sep))
-                if finite_window_moon_sep.size > 0
-                else None
-            )
-
-            ranked.append(
-                {
-                    "target": target,
-                    "metrics": metrics,
-                    "window_start": window_start,
-                    "window_end": window_end,
-                    "best_airmass": best_airmass,
-                    "min_window_moon_sep": min_window_moon_sep,
-                    "moon_sep_warning": (
-                        min_moon_sep > 0.0
-                        and min_window_moon_sep is not None
-                        and round(float(min_window_moon_sep), 1) < min_moon_sep
-                    ),
-                    "added_to_plan": False,
-                    "importance": float(candidate_info.get("importance", 0.0) or 0.0),
-                    "bhtom_priority": int(candidate_info.get("bhtom_priority", 0) or 0),
-                    "sun_separation": candidate_info.get("sun_separation"),
-                }
-            )
-
-        if not ranked:
-            skipped_notes.append("No BHTOM targets matched the current filters and night window.")
-            return [], skipped_notes
-
-        ranked.sort(
-            key=lambda item: (
-                -float(item["importance"]),
-                -int(item["bhtom_priority"]),
-                -float(item["metrics"].score),  # type: ignore[index]
-                -float(item["metrics"].hours_above_limit),  # type: ignore[index]
-                item["window_start"],
-                str(item["target"].name).lower(),  # type: ignore[index]
-            )
+        worker = BhtomSuggestionWorker(
+            request_id=req_id,
+            payload=dict(context["payload"]),  # type: ignore[arg-type]
+            site=Site(**context["site"].model_dump()),  # type: ignore[index]
+            targets=[Target(**t.model_dump()) for t in context["targets"]],  # type: ignore[index]
+            limit_altitude=float(context["limit_altitude"]),
+            sun_alt_limit=float(context["sun_alt_limit"]),
+            min_moon_sep=float(context["min_moon_sep"]),
+            bhtom_base_url=base_url,
+            bhtom_token=token,
+            cached_candidates=cached_candidates,
+            emit_partials=emit_partials,
+            parent=self,
         )
-        return ranked, skipped_notes
+        worker.pageReady.connect(self._on_bhtom_worker_page_ready)
+        worker.completed.connect(self._on_bhtom_worker_completed)
+        worker.finished.connect(lambda w=worker: self._on_bhtom_worker_finished(w))
+        worker.finished.connect(worker.deleteLater)
+        self._bhtom_worker = worker
+        worker.start()
+        return True
+
+    def _cancel_bhtom_worker(self) -> None:
+        worker = self._bhtom_worker
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+                worker.quit()
+        except Exception:
+            pass
+
+    @Slot(int, list, list, int, int)
+    def _on_bhtom_worker_page_ready(
+        self,
+        request_id: int,
+        suggestions: list[dict[str, object]],
+        notes: list[str],
+        page: int,
+        loaded_candidates: int,
+    ) -> None:
+        if request_id != self._bhtom_worker_request_id:
+            return
+        if page < 0:
+            self._set_bhtom_status(f"BHTOM: cache ({loaded_candidates})", busy=True)
+        else:
+            self._set_bhtom_status(f"BHTOM: page {page} ({loaded_candidates})", busy=True)
+        if self._bhtom_worker_mode != "suggest":
+            return
+        dlg = self._bhtom_dialog
+        if dlg is None or not shb.isValid(dlg):
+            return
+        dlg.update_suggestions(suggestions, notes)
+        if page < 0:
+            dlg.set_loading_state(True, "Loading BHTOM targets from cache...")
+        else:
+            dlg.set_loading_state(True, f"Loading BHTOM targets... page {page}")
+
+    def _on_bhtom_worker_finished(self, worker: BhtomSuggestionWorker) -> None:
+        if self._bhtom_worker is worker:
+            self._bhtom_worker = None
+        if not self._bhtom_worker_mode:
+            self._bhtom_worker_cache_key = None
+
+    @Slot(int, list, list, list, str)
+    def _on_bhtom_worker_completed(
+        self,
+        request_id: int,
+        suggestions: list[dict[str, object]],
+        notes: list[str],
+        raw_candidates: list[dict[str, object]],
+        error: str,
+    ) -> None:
+        if request_id != self._bhtom_worker_request_id:
+            return
+        mode = self._bhtom_worker_mode
+        self._bhtom_worker_mode = ""
+        cache_key = self._bhtom_worker_cache_key
+        self._bhtom_worker_cache_key = None
+
+        if error:
+            self._set_bhtom_status("BHTOM: cancelled" if error == "cancelled" else "BHTOM: error", busy=False)
+            if error != "cancelled":
+                logger.warning("BHTOM suggestion worker failed: %s", error)
+                if mode == "suggest":
+                    dlg = self._bhtom_dialog
+                    if dlg is not None and shb.isValid(dlg):
+                        dlg.set_loading_state(False, "Loading failed")
+                        if not dlg.table_model.total_count():
+                            dlg.notes_label.setText(f"Notes: {error}")
+                            dlg.notes_label.setVisible(True)
+                    else:
+                        QMessageBox.warning(self, "Suggest Targets", error)
+                elif mode == "quick":
+                    QMessageBox.warning(self, "Quick Targets", error)
+            self._set_ai_status("Ready", tone="info")
+            return
+
+        if cache_key is not None and raw_candidates:
+            self._bhtom_candidate_cache_key = cache_key
+            self._bhtom_candidate_cache = list(raw_candidates)
+            self._bhtom_candidate_cache_loaded_at = perf_counter()
+        self._bhtom_ranked_suggestions_cache = list(suggestions)
+
+        if mode == "suggest":
+            dlg = self._bhtom_dialog
+            if dlg is not None and shb.isValid(dlg):
+                dlg.update_suggestions(suggestions, notes)
+                dlg.set_loading_state(False, "Loaded")
+            self._set_bhtom_status(f"BHTOM: ready ({len(suggestions)})", busy=False)
+        elif mode == "quick":
+            self._apply_quick_targets_from_suggestions(suggestions, notes)
+            self._set_bhtom_status(f"BHTOM: ready ({len(suggestions)})", busy=False)
+        else:
+            self._set_bhtom_status("BHTOM: idle", busy=False)
+
+        self._set_ai_status("Ready", tone="info")
+
+    @Slot(int)
+    def _on_suggest_dialog_closed(self, _result: int) -> None:
+        if self._bhtom_worker_mode == "suggest":
+            self._cancel_bhtom_worker()
+            self._set_bhtom_status("BHTOM: cancelled", busy=False)
+        self._bhtom_dialog = None
+        self._set_ai_status("Ready", tone="info")
+
+    def _build_local_target_suggestions(self) -> tuple[list[dict[str, object]], list[str]]:
+        context, error = self._build_bhtom_suggestion_context()
+        if context is None:
+            return [], [error or "Unable to prepare BHTOM context."]
+        candidates = self._fetch_bhtom_target_candidates()
+        suggestions, notes = _rank_local_target_suggestions_from_candidates(
+            payload=context["payload"],  # type: ignore[index]
+            site=context["site"],  # type: ignore[index]
+            targets=context["targets"],  # type: ignore[index]
+            limit_altitude=float(context["limit_altitude"]),
+            sun_alt_limit=float(context["sun_alt_limit"]),
+            min_moon_sep=float(context["min_moon_sep"]),
+            candidates=candidates,
+        )
+        self._bhtom_ranked_suggestions_cache = list(suggestions)
+        return suggestions, notes
 
     def _format_local_target_suggestions(self, suggestions: list[dict[str, object]], notes: list[str]) -> str:
         if not suggestions:
@@ -8761,14 +22033,191 @@ class MainWindow(QMainWindow):
         return "\n".join(lines).strip()
 
     @Slot()
+    def _quick_add_suggested_targets(self) -> None:
+        self._set_ai_status("Loading suggestions...", tone="info")
+        self._set_bhtom_status("BHTOM: loading quick targets...", busy=True)
+        if not self._start_bhtom_worker(mode="quick", emit_partials=True):
+            self._set_bhtom_status("BHTOM: idle", busy=False)
+            self._set_ai_status("Ready", tone="info")
+            return
+
+    def _apply_quick_targets_from_suggestions(
+        self,
+        suggestions: list[dict[str, object]],
+        notes: list[str],
+    ) -> None:
+        if not suggestions:
+            QMessageBox.information(
+                self,
+                "Quick Targets",
+                "\n".join(notes) if notes else "No BHTOM targets matched the current night window.",
+            )
+            return
+
+        cfg = self._quick_targets_config()
+        quick_count = int(cfg["count"])
+        min_importance = float(cfg["min_importance"])
+        min_score = (
+            float(self.min_score_spin.value())
+            if bool(cfg["use_score_filter"]) and hasattr(self, "min_score_spin")
+            else 0.0
+        )
+        min_moon_sep = (
+            float(self.min_moon_sep_spin.value())
+            if bool(cfg["use_moon_filter"]) and hasattr(self, "min_moon_sep_spin")
+            else 0.0
+        )
+        use_limiting_mag = bool(cfg["use_limiting_mag"])
+        limiting_mag = float(self._current_limiting_magnitude())
+
+        filtered: list[dict[str, object]] = []
+        for item in suggestions:
+            target = item.get("target")
+            metrics = item.get("metrics")
+            if not isinstance(target, Target) or not isinstance(metrics, TargetNightMetrics):
+                continue
+            if float(item.get("importance", 0.0) or 0.0) < min_importance:
+                continue
+            if float(metrics.score) < min_score:
+                continue
+            min_sep = _safe_float(item.get("min_window_moon_sep"))
+            if min_moon_sep > 0.0:
+                if min_sep is None or not math.isfinite(min_sep) or min_sep < min_moon_sep:
+                    continue
+            if use_limiting_mag and target.magnitude is not None and math.isfinite(float(target.magnitude)):
+                if float(target.magnitude) > limiting_mag:
+                    continue
+            filtered.append(item)
+
+        filtered.sort(
+            key=lambda item: (
+                -float(item["metrics"].score),  # type: ignore[index]
+                -float(item["metrics"].hours_above_limit),  # type: ignore[index]
+                -float(item.get("importance", 0.0) or 0.0),
+                str(item["target"].name).lower(),  # type: ignore[index]
+            )
+        )
+
+        quick_rows = filtered[:quick_count]
+        if not quick_rows:
+            details: list[str] = []
+            if min_score > 0.0:
+                details.append(f"score≥{min_score:.0f}")
+            if min_moon_sep > 0.0:
+                details.append(f"moon≥{min_moon_sep:.0f}°")
+            if use_limiting_mag:
+                details.append(f"mag≤{limiting_mag:.1f}")
+            details_txt = f" ({', '.join(details)})" if details else ""
+            QMessageBox.information(
+                self,
+                "Quick Targets",
+                f"No suggested targets matched the configured Quick Targets filters{details_txt}.",
+            )
+            return
+
+        added_count = 0
+        skipped_count = 0
+        first_added: Optional[Target] = None
+        for item in quick_rows:
+            target = item.get("target")
+            if not isinstance(target, Target):
+                continue
+            if self._append_target_to_plan(target, refresh=False, notify_duplicate=False):
+                added_count += 1
+                if first_added is None:
+                    first_added = target
+            else:
+                skipped_count += 1
+
+        if added_count > 0:
+            self._recompute_recommended_order_cache()
+            self._apply_table_settings()
+            self._apply_default_sort()
+            self._refresh_target_color_map()
+            self._emit_table_data_changed()
+            self._fetch_missing_magnitudes_async()
+            self._replot_timer.start()
+            if first_added is not None:
+                for row_idx, existing in enumerate(self.targets):
+                    if _targets_match(existing, first_added):
+                        self.table_view.selectRow(row_idx)
+                        self.table_view.scrollTo(self.table_model.index(row_idx, TargetTableModel.COL_NAME))
+                        break
+            self._update_selected_details()
+            self._prefetch_cutouts_for_all_targets(prioritize=self._selected_target_or_none())
+            self._prefetch_finder_charts_for_all_targets(prioritize=self._selected_target_or_none())
+        summary = (
+            f"Quick Targets: added {added_count}/{len(quick_rows)}"
+            + (f", skipped {skipped_count} duplicates" if skipped_count > 0 else "")
+        )
+        self._set_bhtom_status("BHTOM: quick targets ready", busy=False)
+        self._set_ai_status(summary, tone="info")
+        status_bar = self.statusBar() if hasattr(self, "statusBar") else None
+        if status_bar is not None:
+            status_bar.showMessage(summary, 5000)
+
+    @Slot()
     def _send_ai_query(self) -> None:
         text = self.ai_input.text().strip() if hasattr(self, "ai_input") else ""
         if not text:
             return
+        selected_target = self._selected_target_or_none()
+        if self._looks_like_object_scoped_query(text) and selected_target is None:
+            QMessageBox.information(
+                self,
+                "No selection",
+                "Select one target first, or use a session-wide question.",
+            )
+            return
+
         self.ai_input.clear()
-        context = self._build_session_context()
+        if self._should_auto_route_selected_target_query(text, selected_target):
+            self._dispatch_selected_target_llm_question(
+                selected_target,
+                text,
+                label=text,
+            )
+            return
+
+        context = self._build_session_context(user_question=text)
         prompt = f"Current session context:\n{context}\n\nUser question: {text}"
-        self._dispatch_llm(prompt, tag="chat", label=f"You: {text}")
+        self._dispatch_llm(prompt, tag="chat", label=text)
+
+    def _build_selected_target_llm_prompt(self, target: Target, question: str) -> str:
+        compact_description = self._build_fast_target_llm_context(target)
+        return (
+            f"Selected object context:\n"
+            f"{compact_description}\n\n"
+            f"User question about the selected object: {question}\n\n"
+            "Answer in no more than 4 short sentences and stay grounded in the selected object context."
+        )
+
+    def _build_fast_general_llm_prompt(self, question: str) -> str:
+        return (
+            f"User question: {question}\n\n"
+            "Answer concisely in no more than 4 short sentences. "
+            "Do not assume details about any selected object unless the question explicitly asks about it."
+        )
+
+    @Slot()
+    def _send_ai_selected_target_query(self) -> None:
+        target = self._selected_target_or_none()
+
+        typed_text = self.ai_input.text().strip() if hasattr(self, "ai_input") else ""
+        question = typed_text or "Give a concise summary of this selected object for tonight's observing."
+        if not typed_text and target is None:
+            QMessageBox.information(self, "No selection", "Select one target first.")
+            return
+        if typed_text and hasattr(self, "ai_input"):
+            self.ai_input.clear()
+
+        if target is not None and (not typed_text or self._should_auto_route_selected_target_query(question, target)):
+            label = typed_text or f"Summarize {target.name}"
+            self._dispatch_selected_target_llm_question(target, question, label=label)
+            return
+
+        prompt = self._build_fast_general_llm_prompt(question)
+        self._dispatch_llm(prompt, tag="chat_fast", label=question)
 
     @Slot()
     def _ai_describe_target(self) -> None:
@@ -8778,53 +22227,46 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
             self.ai_toggle_btn.setChecked(True)
-        self._append_ai_message(f"Describe: {target.name}", is_user=True)
+        self._append_ai_message(f"Describe {target.name}", is_user=True)
         self._append_ai_message(self._build_compact_target_description(target), is_ai=True)
         worker = self._llm_worker
-        if hasattr(self, "ai_status_label") and (worker is None or not worker.isRunning()):
-            self.ai_status_label.setText("Ready")
+        if worker is None or not worker.isRunning():
+            self._set_ai_status("Ready", tone="info")
 
     @Slot()
     def _ai_suggest_targets(self) -> None:
-        if hasattr(self, "ai_status_label"):
-            self.ai_status_label.setText("Loading suggestions...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            suggestions, notes = self._build_local_target_suggestions()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Local target suggestion failed: %s", exc)
-            QMessageBox.warning(self, "Suggest Targets", str(exc))
-            if hasattr(self, "ai_status_label"):
-                self.ai_status_label.setText("Ready")
-            QApplication.restoreOverrideCursor()
-            return
-        QApplication.restoreOverrideCursor()
-
-        if not suggestions:
-            QMessageBox.information(
-                self,
-                "Suggest Targets",
-                "\n".join(notes) if notes else "No BHTOM targets matched the current night window.",
-            )
-            if hasattr(self, "ai_status_label"):
-                self.ai_status_label.setText("Ready")
+        self._set_ai_status("Loading suggestions...", tone="info")
+        if self._bhtom_worker is not None and self._bhtom_worker.isRunning():
+            QMessageBox.information(self, "Suggest Targets", "A BHTOM request is already in progress.")
+            self._set_ai_status("Ready", tone="info")
             return
 
         dlg = SuggestedTargetsDialog(
-            suggestions=suggestions,
-            notes=notes,
+            suggestions=[],
+            notes=[],
             moon_sep_threshold=float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0,
+            mag_warning_threshold=self._current_limiting_magnitude(),
             initial_score_filter=float(self.min_score_spin.value()) if hasattr(self, "min_score_spin") else 0.0,
             bhtom_base_url=self._bhtom_api_base_url(),
             add_callback=self._append_target_to_plan,
-            reload_callback=self._reload_local_target_suggestions,
+            reload_callback=None,
             parent=self,
         )
+        dlg.set_loading_state(True, "Loading BHTOM targets...")
+        self._bhtom_dialog = dlg
+        dlg.finished.connect(self._on_suggest_dialog_closed)
+        self._set_bhtom_status("BHTOM: loading suggestions...", busy=True)
+        if not self._start_bhtom_worker(mode="suggest", emit_partials=True):
+            self._bhtom_dialog = None
+            dlg.set_loading_state(False, "Loading failed")
+            self._set_bhtom_status("BHTOM: idle", busy=False)
+            self._set_ai_status("Ready", tone="info")
+            return
         dlg.exec()
 
         worker = self._llm_worker
-        if hasattr(self, "ai_status_label") and (worker is None or not worker.isRunning()):
-            self.ai_status_label.setText("Ready")
+        if worker is None or not worker.isRunning():
+            self._set_ai_status("Ready", tone="info")
 
     def _dispatch_llm(self, prompt: str, tag: str, label: str) -> None:
         worker = self._llm_worker
@@ -8838,8 +22280,7 @@ class MainWindow(QMainWindow):
             self.ai_toggle_btn.setChecked(True)
         self._append_ai_message(label, is_user=True)
         self._start_ai_response_message()
-        if hasattr(self, "ai_status_label"):
-            self.ai_status_label.setText("Thinking...")
+        self._set_ai_status("Thinking...", tone="info")
         worker = LLMWorker(
             config=self.llm_config,
             prompt=prompt,
@@ -8852,30 +22293,47 @@ class MainWindow(QMainWindow):
         worker.errorOccurred.connect(self._on_ai_error)
         worker.finished.connect(self._on_ai_worker_finished)
         self._llm_worker = worker
+        self._llm_active_tag = tag
+        self._refresh_ai_warm_indicator()
         worker.start()
 
     @Slot(str, str)
     def _on_ai_chunk(self, tag: str, text: str) -> None:
         if not text:
             return
-        if hasattr(self, "ai_status_label"):
-            self.ai_status_label.setText("Streaming...")
+        if tag == "warmup":
+            return
+        self._set_ai_status("Streaming...", tone="info")
         self._append_ai_stream_chunk(text)
 
     @Slot(str, str)
     def _on_ai_response(self, tag: str, text: str) -> None:
+        if tag == "warmup":
+            self._llm_last_warmup_key = self._llm_warmup_cache_key()
+            self._llm_last_warmup_at = perf_counter()
+            self._set_ai_status("Ready", tone="info")
+            return
         logger.info("LLM response received (tag=%s, length=%d)", tag, len(text))
         self._finalize_ai_response(text)
 
     @Slot(str)
     def _on_ai_error(self, message: str) -> None:
+        if self._llm_active_tag == "warmup":
+            logger.warning("LLM warm-up error: %s", message)
+            if self._llm_warmup_silent:
+                self._ai_runtime_status = ""
+                self._refresh_ai_warm_indicator()
+            else:
+                self._set_ai_status("Warm-up failed", tone="warning")
+            return
         logger.warning("LLM error: %s", message)
         self._fail_ai_response(message)
 
     @Slot()
     def _on_ai_worker_finished(self) -> None:
-        if hasattr(self, "ai_status_label"):
-            self.ai_status_label.setText("Ready")
+        active_tag = self._llm_active_tag
+        if active_tag != "warmup":
+            self._set_ai_status("Ready", tone="info")
         idx = self._ai_stream_message_index
         if idx is not None and 0 <= idx < len(self._ai_messages):
             if not self._ai_messages[idx].get("text", "").strip():
@@ -8885,12 +22343,122 @@ class MainWindow(QMainWindow):
         sender = self.sender()
         if sender is self._llm_worker:
             self._llm_worker = None
+        if active_tag == "warmup":
+            self._llm_warmup_silent = False
+        self._llm_active_tag = ""
+        self._refresh_ai_warm_indicator()
 
     def _clear_ai_messages(self) -> None:
+        self._ai_stream_render_timer.stop()
         self._ai_messages.clear()
+        self._ai_message_widget_refs.clear()
         self._ai_stream_message_index = None
-        if hasattr(self, "ai_output"):
-            self.ai_output.clear()
+        if hasattr(self, "ai_output_layout"):
+            self._render_ai_messages()
+        self._refresh_ai_panel_action_buttons()
+
+    def _apply_ai_chat_font(self) -> None:
+        if not hasattr(self, "ai_output"):
+            return
+        font = self.ai_output.font()
+        font.setPointSize(int(getattr(self, "_llm_chat_font_size_pt", LLMConfig.DEFAULT_CHAT_FONT_PT)))
+        self.ai_output.setFont(font)
+        if hasattr(self, "ai_output_content"):
+            self.ai_output_content.setFont(font)
+        if getattr(self, "_ai_messages", None):
+            self._render_ai_messages()
+
+    def _last_ai_response_text(self) -> str:
+        for message in reversed(self._ai_messages):
+            if str(message.get("kind", "")) != "ai":
+                continue
+            text = str(message.get("text", "")).strip()
+            if text:
+                return text
+        return ""
+
+    def _build_ai_chat_transcript(self) -> str:
+        role_map = {
+            "user": "You",
+            "ai": "LLM",
+            "error": "Error",
+            "info": "Info",
+        }
+        sections: list[str] = []
+        for message in self._ai_messages:
+            text = str(message.get("text", "")).strip()
+            if not text:
+                continue
+            kind = str(message.get("kind", "info"))
+            role = role_map.get(kind, kind.title() or "Info")
+            sections.append(f"{role}\n{text}")
+        return "\n\n".join(sections).strip()
+
+    def _refresh_ai_panel_action_buttons(self) -> None:
+        has_messages = any(str(message.get("text", "")).strip() for message in self._ai_messages)
+        has_last_ai = bool(self._last_ai_response_text())
+        if hasattr(self, "ai_copy_last_btn"):
+            self.ai_copy_last_btn.setEnabled(has_last_ai)
+        if hasattr(self, "ai_export_chat_btn"):
+            self.ai_export_chat_btn.setEnabled(has_messages)
+
+    def _add_ai_suggested_target(self, target: Target) -> None:
+        added = self._append_target_to_plan(target, refresh=True, notify_duplicate=False)
+        if added:
+            self._set_ai_status(f"Added {target.name} to the plan.", tone="info")
+        else:
+            self._set_ai_status(f"{target.name} is already in the plan.", tone="warning")
+        self._render_ai_messages()
+
+    @Slot()
+    def _copy_last_ai_response(self) -> None:
+        text = self._last_ai_response_text()
+        if not text:
+            self._set_ai_status("No AI response to copy.", tone="warning")
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+        self._set_ai_status("Copied last AI response.", tone="info")
+
+    @Slot()
+    def _export_ai_chat(self) -> None:
+        transcript = self._build_ai_chat_transcript()
+        if not transcript:
+            self._set_ai_status("No AI chat to export.", tone="warning")
+            return
+        default_name = f"astroplanner-ai-chat-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export AI Chat",
+            str(Path.home() / default_name),
+            "Text files (*.txt);;Markdown files (*.md);;All files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            Path(file_path).write_text(transcript + "\n", encoding="utf-8")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Failed", f"Could not export AI chat:\n{exc}")
+            self._set_ai_status("AI chat export failed.", tone="warning")
+            return
+        self._set_ai_status(f"Exported AI chat to {Path(file_path).name}.", tone="info")
+
+    @Slot()
+    def _reset_ai_chat_appearance(self) -> None:
+        self.settings.setValue("llm/chatFontSizePt", LLMConfig.DEFAULT_CHAT_FONT_PT)
+        self.settings.setValue("llm/chatSpacing", LLMConfig.DEFAULT_CHAT_SPACING)
+        self.settings.setValue("llm/chatTintStrength", LLMConfig.DEFAULT_CHAT_TINT_STRENGTH)
+        self.settings.setValue("llm/chatMessageWidth", LLMConfig.DEFAULT_CHAT_WIDTH)
+        self.settings.setValue("llm/statusErrorClearSec", LLMConfig.DEFAULT_STATUS_ERROR_CLEAR_S)
+        self._llm_chat_font_size_pt = LLMConfig.DEFAULT_CHAT_FONT_PT
+        self._ai_chat_spacing = LLMConfig.DEFAULT_CHAT_SPACING
+        self._ai_chat_tint_strength = LLMConfig.DEFAULT_CHAT_TINT_STRENGTH
+        self._ai_chat_width = LLMConfig.DEFAULT_CHAT_WIDTH
+        self._ai_status_error_clear_s = LLMConfig.DEFAULT_STATUS_ERROR_CLEAR_S
+        self._apply_ai_chat_font()
+        self._render_ai_messages()
+        self._set_ai_status("AI appearance reset to defaults.", tone="info")
 
     @staticmethod
     def _mix_qcolors(first: QColor, second: QColor, first_ratio: float) -> QColor:
@@ -8906,62 +22474,495 @@ class MainWindow(QMainWindow):
     def _qcolor_css(color: QColor) -> str:
         return color.name(QColor.HexRgb)
 
+    @staticmethod
+    def _qcolor_rgba_css(color: QColor, alpha: float) -> str:
+        use_color = QColor(color)
+        if not use_color.isValid():
+            use_color = QColor("#59f3ff")
+        return f"rgba({use_color.red()}, {use_color.green()}, {use_color.blue()}, {max(0.0, min(1.0, float(alpha))):.3f})"
+
+    @staticmethod
+    def _qcolor_rgba_mpl(color: QColor, alpha: float) -> tuple[float, float, float, float]:
+        use_color = QColor(color)
+        if not use_color.isValid():
+            use_color = QColor("#59f3ff")
+        return (
+            float(use_color.redF()),
+            float(use_color.greenF()),
+            float(use_color.blueF()),
+            max(0.0, min(1.0, float(alpha))),
+        )
+
+    @staticmethod
+    def _format_ai_message_inline_markdown(text: str) -> str:
+        rendered = str(text)
+        rendered = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", rendered)
+        rendered = re.sub(r"\*\*([^*\n][\s\S]*?)\*\*", r"<strong>\1</strong>", rendered)
+        rendered = re.sub(r"(?<!\*)\*([^*\n][\s\S]*?)\*(?!\*)", r"<em>\1</em>", rendered)
+        return rendered
+
+    def _render_ai_message_body(self, raw_text: str, *, muted_text: QColor) -> str:
+        text = str(raw_text or "")
+        if not text.strip():
+            return f'<span style="color:{self._qcolor_css(muted_text)}"><i>...</i></span>'
+
+        blocks: list[str] = []
+        paragraph_lines: list[str] = []
+        list_kind: Optional[str] = None
+        list_items: list[str] = []
+
+        def flush_paragraph() -> None:
+            nonlocal paragraph_lines
+            if not paragraph_lines:
+                return
+            joined = "<br>".join(
+                self._format_ai_message_inline_markdown(html_module.escape(line))
+                for line in paragraph_lines
+            )
+            blocks.append(f"<div>{joined}</div>")
+            paragraph_lines = []
+
+        def flush_list() -> None:
+            nonlocal list_kind, list_items
+            if not list_kind or not list_items:
+                list_kind = None
+                list_items = []
+                return
+            tag = "ol" if list_kind == "ol" else "ul"
+            items_html = "".join(
+                f"<li>{self._format_ai_message_inline_markdown(html_module.escape(item))}</li>"
+                for item in list_items
+            )
+            blocks.append(
+                f'<{tag} style="margin:4px 0 4px 18px;padding:0;">{items_html}</{tag}>'
+            )
+            list_kind = None
+            list_items = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                flush_paragraph()
+                flush_list()
+                continue
+
+            bullet_match = re.match(r"^\s*[-*]\s+(.+)$", line)
+            ordered_match = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
+            if bullet_match:
+                flush_paragraph()
+                if list_kind not in (None, "ul"):
+                    flush_list()
+                list_kind = "ul"
+                list_items.append(bullet_match.group(1).strip())
+                continue
+            if ordered_match:
+                flush_paragraph()
+                if list_kind not in (None, "ol"):
+                    flush_list()
+                list_kind = "ol"
+                list_items.append(ordered_match.group(1).strip())
+                continue
+
+            flush_list()
+            paragraph_lines.append(stripped)
+
+        flush_paragraph()
+        flush_list()
+        return "".join(blocks)
+
+    def _scroll_ai_output_to_bottom(self) -> None:
+        if not hasattr(self, "ai_output"):
+            return
+        scroll = self.ai_output.verticalScrollBar()
+        if scroll is not None:
+            scroll.setValue(scroll.maximum())
+
+    def _apply_ai_message_body_widget(
+        self,
+        body: QLabel,
+        bubble: QFrame,
+        *,
+        body_html: str,
+        font_pt: int,
+        line_height: float,
+        text_color: QColor,
+        bubble_pad_h: int,
+        bubble_max_width: int,
+        stream_fixed_width: bool,
+    ) -> None:
+        body_rich_text = (
+            f'<div style="color:{self._qcolor_css(text_color)};'
+            f'font-size:{font_pt}pt;line-height:{line_height};">'
+            f"{body_html}</div>"
+        )
+        body.setText(body_rich_text)
+        max_body_width = max(150, bubble_max_width - (2 * bubble_pad_h))
+        if stream_fixed_width:
+            body_width = max_body_width
+        else:
+            doc = QTextDocument()
+            doc.setDefaultFont(body.font())
+            doc.setDocumentMargin(0)
+            doc.setHtml(body_rich_text)
+            body_width = max(150, min(max_body_width, int(math.ceil(doc.idealWidth())) + 2))
+        body.setFixedWidth(body_width)
+        bubble.setFixedWidth(body_width + (2 * bubble_pad_h))
+
+    def _build_ai_message_widget(
+        self,
+        *,
+        kind: str,
+        body_html: str,
+        show_headers: bool,
+        font_pt: int,
+        header_pt: int,
+        outer_margin: int,
+        header_margin: int,
+        bubble_pad_h: int,
+        bubble_pad_v: int,
+        line_height: float,
+        message_max_width_ratio: float,
+        text_color: QColor,
+        muted_text: QColor,
+        label_color: QColor,
+        border_color: QColor,
+        background_color: QColor,
+        header_icon_html: str,
+        header_text: str,
+        align_right: bool,
+        streaming: bool = False,
+        action_targets: Optional[list[Target]] = None,
+    ) -> tuple[QWidget, dict[str, Any]]:
+        viewport_width = max(320, int(self.ai_output.viewport().width()))
+        bubble_max_width = max(240, int(viewport_width * message_max_width_ratio))
+
+        row = QWidget(self.ai_output_content)
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(0, outer_margin, 0, outer_margin)
+        row_l.setSpacing(0)
+
+        stack = QWidget(row)
+        stack_l = QVBoxLayout(stack)
+        stack_l.setContentsMargins(0, 0, 0, 0)
+        stack_l.setSpacing(header_margin)
+
+        if show_headers:
+            header = QLabel(stack)
+            header.setTextFormat(Qt.RichText)
+            header.setText(
+                f'<span style="color:{self._qcolor_css(label_color)};'
+                f'font-size:{header_pt}pt;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;">'
+                f'{header_icon_html}{html_module.escape(header_text)}</span>'
+            )
+            header.setTextInteractionFlags(Qt.NoTextInteraction)
+            header.setStyleSheet("background:transparent;border:none;padding:0;margin:0;")
+            stack_l.addWidget(header, 0, Qt.AlignRight if align_right else Qt.AlignLeft)
+
+        bubble = QFrame(stack)
+        bubble.setObjectName("AIChatBubble")
+        bubble.setMaximumWidth(bubble_max_width)
+        bubble.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        top_left = 14 if not align_right else 14
+        top_right = 14 if align_right else 14
+        bottom_left = 5 if not align_right else 14
+        bottom_right = 5 if align_right else 14
+        bubble.setStyleSheet(
+            "QFrame#AIChatBubble {"
+            f"background:{self._qcolor_rgba_css(background_color, background_color.alphaF())};"
+            f"border:1px solid {self._qcolor_css(border_color)};"
+            f"border-top-left-radius:{top_left}px;"
+            f"border-top-right-radius:{top_right}px;"
+            f"border-bottom-left-radius:{bottom_left}px;"
+            f"border-bottom-right-radius:{bottom_right}px;"
+            "}"
+        )
+        shadow = QGraphicsDropShadowEffect(bubble)
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(border_color.red(), border_color.green(), border_color.blue(), 42))
+        bubble.setGraphicsEffect(shadow)
+
+        bubble_l = QVBoxLayout(bubble)
+        bubble_l.setContentsMargins(bubble_pad_h, bubble_pad_v, bubble_pad_h, bubble_pad_v)
+        bubble_l.setSpacing(0)
+
+        body = QLabel(bubble)
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.RichText)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setStyleSheet(
+            "background:transparent;border:none;padding:0;margin:0;"
+            f"color:{self._qcolor_css(text_color)};"
+        )
+        self._apply_ai_message_body_widget(
+            body,
+            bubble,
+            body_html=body_html,
+            font_pt=font_pt,
+            line_height=line_height,
+            text_color=text_color,
+            bubble_pad_h=bubble_pad_h,
+            bubble_max_width=bubble_max_width,
+            stream_fixed_width=streaming,
+        )
+        bubble_l.addWidget(body)
+
+        if action_targets:
+            action_box = QWidget(bubble)
+            action_box_l = QVBoxLayout(action_box)
+            action_box_l.setContentsMargins(0, 8, 0, 0)
+            action_box_l.setSpacing(6)
+            for target in action_targets:
+                add_btn = QPushButton(f"Add {target.name}", action_box)
+                _set_button_variant(add_btn, "ghost")
+                _set_button_icon_kind(add_btn, "add")
+                add_btn.clicked.connect(lambda _checked=False, t=target: self._add_ai_suggested_target(t))
+                action_box_l.addWidget(add_btn, 0, Qt.AlignLeft)
+            bubble_l.addWidget(action_box, 0, Qt.AlignLeft)
+
+        stack_l.addWidget(bubble, 0, Qt.AlignRight if align_right else Qt.AlignLeft)
+
+        if align_right:
+            row_l.addStretch(1)
+            row_l.addWidget(stack, 0, Qt.AlignRight)
+        else:
+            row_l.addWidget(stack, 0, Qt.AlignLeft)
+            row_l.addStretch(1)
+        return row, {
+            "row": row,
+            "bubble": bubble,
+            "body": body,
+            "font_pt": font_pt,
+            "line_height": line_height,
+            "text_color": QColor(text_color),
+            "muted_text": QColor(muted_text),
+            "bubble_pad_h": bubble_pad_h,
+            "bubble_max_width": bubble_max_width,
+            "streaming": streaming,
+        }
+
+    def _update_ai_message_widget(self, idx: int, *, streaming: bool) -> bool:
+        if not (0 <= idx < len(self._ai_messages)) or not (0 <= idx < len(self._ai_message_widget_refs)):
+            return False
+        refs = self._ai_message_widget_refs[idx]
+        body = refs.get("body")
+        bubble = refs.get("bubble")
+        if not isinstance(body, QLabel) or not isinstance(bubble, QFrame):
+            return False
+        message = self._ai_messages[idx]
+        body_html = self._render_ai_message_body(str(message.get("text", "")), muted_text=QColor(refs["muted_text"]))
+        self._apply_ai_message_body_widget(
+            body,
+            bubble,
+            body_html=body_html,
+            font_pt=int(refs["font_pt"]),
+            line_height=float(refs["line_height"]),
+            text_color=QColor(refs["text_color"]),
+            bubble_pad_h=int(refs["bubble_pad_h"]),
+            bubble_max_width=int(refs["bubble_max_width"]),
+            stream_fixed_width=streaming,
+        )
+        refs["streaming"] = streaming
+        body.updateGeometry()
+        bubble.updateGeometry()
+        row = refs.get("row")
+        if isinstance(row, QWidget):
+            row.updateGeometry()
+        self.ai_output_content.updateGeometry()
+        return True
+
     def _render_ai_messages(self) -> None:
         if not hasattr(self, "ai_output"):
             return
+        font_pt = max(9, int(getattr(self, "_llm_chat_font_size_pt", LLMConfig.DEFAULT_CHAT_FONT_PT)))
+        header_pt = max(8, font_pt - 2)
+        spacing_mode = str(getattr(self, "_ai_chat_spacing", LLMConfig.DEFAULT_CHAT_SPACING) or LLMConfig.DEFAULT_CHAT_SPACING).strip().lower()
+        tint_mode = str(getattr(self, "_ai_chat_tint_strength", LLMConfig.DEFAULT_CHAT_TINT_STRENGTH) or LLMConfig.DEFAULT_CHAT_TINT_STRENGTH).strip().lower()
+        width_mode = str(getattr(self, "_ai_chat_width", LLMConfig.DEFAULT_CHAT_WIDTH) or LLMConfig.DEFAULT_CHAT_WIDTH).strip().lower()
+        show_headers = True
+        if spacing_mode == "compact":
+            outer_margin = 4
+            header_margin = 2
+            bubble_pad_v = 4
+            bubble_pad_h = 7
+            line_height = 1.28
+        else:
+            outer_margin = 6
+            header_margin = 3
+            bubble_pad_v = 6
+            bubble_pad_h = 9
+            line_height = 1.35
+        tint_scale_map = {
+            "low": 0.75,
+            "medium": 1.10,
+            "high": 1.45,
+        }
+        tint_scale = float(tint_scale_map.get(tint_mode, 1.00))
+        max_width_map = {
+            "narrow": 0.34,
+            "normal": 0.48,
+            "wide": 0.62,
+        }
+        message_max_width_ratio = float(max_width_map.get(width_mode, 0.76))
         palette = self.ai_output.palette()
         base = palette.color(QPalette.Base)
-        alt_base = palette.color(QPalette.AlternateBase)
         text_color = palette.color(QPalette.Text)
         highlight = palette.color(QPalette.Highlight)
-        accent_red = QColor("#dc2626")
+        accent_red = self._theme_qcolor("state_error", "#dc2626")
+        accent_primary = self._theme_qcolor("accent_primary", "#59f3ff")
+        accent_secondary = self._theme_qcolor("accent_secondary", "#ff4fd8")
+        accent_secondary_soft = self._theme_qcolor("accent_secondary_soft", "#d38cff")
 
-        user_border = self._mix_qcolors(highlight, base, 0.45)
-        ai_border = self._mix_qcolors(text_color, base, 0.14)
+        user_border = self._mix_qcolors(accent_primary, highlight, 0.60)
+        ai_border = self._mix_qcolors(accent_secondary, accent_secondary_soft, 0.58)
         error_border = self._mix_qcolors(accent_red, base, 0.38)
         muted_text = self._mix_qcolors(text_color, base, 0.42)
+        user_bg = self._mix_qcolors(accent_primary, base, 0.14)
+        ai_bg = self._mix_qcolors(accent_secondary_soft, base, 0.10)
+        error_bg = self._mix_qcolors(accent_red, base, 0.08)
+        user_label = self._mix_qcolors(accent_primary, text_color, 0.82)
+        ai_label = self._mix_qcolors(accent_secondary, text_color, 0.76)
+        error_label = self._mix_qcolors(accent_red, text_color, 0.80)
+        self.ai_output.setUpdatesEnabled(False)
+        try:
+            while self.ai_output_layout.count():
+                item = self.ai_output_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            self._ai_message_widget_refs = []
 
-        parts: list[str] = []
-        for message in self._ai_messages:
-            kind = message.get("kind", "ai")
-            raw_text = str(message.get("text", ""))
-            escaped = html_module.escape(raw_text).replace("\n", "<br>")
-            if kind == "user":
-                html = (
-                    '<div style="margin:6px 0;text-align:right">'
-                    '<span style="display:inline-block;max-width:95%;padding:6px 9px;'
-                    'background:transparent;'
-                    f'border:1px solid {self._qcolor_css(user_border)};'
-                    f'border-radius:10px;color:{self._qcolor_css(text_color)}">'
-                    f"<b>{escaped}</b></span></div>"
+            if not self._ai_messages:
+                placeholder = QLabel(self._ai_output_placeholder_text, self.ai_output_content)
+                placeholder.setObjectName("SectionHint")
+                placeholder.setWordWrap(True)
+                placeholder.setTextInteractionFlags(Qt.NoTextInteraction)
+                self.ai_output_layout.addWidget(placeholder, 0, Qt.AlignTop)
+                self.ai_output_layout.addStretch(1)
+                self._refresh_ai_panel_action_buttons()
+                return
+
+            for idx, message in enumerate(self._ai_messages):
+                kind = message.get("kind", "ai")
+                raw_text = str(message.get("text", ""))
+                body_html = self._render_ai_message_body(raw_text, muted_text=muted_text)
+                is_streaming_message = bool(
+                    kind == "ai"
+                    and self._ai_stream_message_index is not None
+                    and idx == self._ai_stream_message_index
+                    and self._llm_active_tag not in {"", "warmup"}
                 )
-            elif kind == "error":
-                html = (
-                    '<div style="margin:6px 0;text-align:left">'
-                    '<span style="display:inline-block;max-width:95%;padding:6px 9px;'
-                    'background:transparent;'
-                    f'border:1px solid {self._qcolor_css(error_border)};'
-                    f'border-radius:10px;color:{self._qcolor_css(text_color)}">'
-                    f"{escaped}</span></div>"
-                )
-            else:
-                body = escaped or (
-                    f'<span style="color:{self._qcolor_css(muted_text)}"><i>...</i></span>'
-                )
-                html = (
-                    '<div style="margin:6px 0;text-align:left">'
-                    '<span style="display:inline-block;max-width:95%;padding:6px 9px;'
-                    'background:transparent;'
-                    f'border:1px solid {self._qcolor_css(ai_border)};'
-                    f'border-radius:10px;color:{self._qcolor_css(text_color)}">'
-                    f"{body}</span></div>"
-                )
-            parts.append(html)
-        self.ai_output.setHtml("".join(parts))
-        scroll = self.ai_output.verticalScrollBar()
-        scroll.setValue(scroll.maximum())
+                if kind == "user":
+                    widget, refs = self._build_ai_message_widget(
+                        kind="user",
+                        body_html=body_html,
+                        show_headers=show_headers,
+                        font_pt=font_pt,
+                        header_pt=header_pt,
+                        outer_margin=outer_margin,
+                        header_margin=header_margin,
+                        bubble_pad_h=bubble_pad_h,
+                        bubble_pad_v=bubble_pad_v,
+                        line_height=line_height,
+                        message_max_width_ratio=message_max_width_ratio,
+                        text_color=text_color,
+                        muted_text=muted_text,
+                        label_color=user_label,
+                        border_color=user_border,
+                        background_color=QColor.fromRgbF(user_bg.redF(), user_bg.greenF(), user_bg.blueF(), min(0.98, 0.96 * tint_scale)),
+                        header_icon_html=(
+                            f'<span style="display:inline-block;min-width:16px;height:16px;line-height:16px;'
+                            f'padding:0 5px;margin:0 5px 0 0;text-align:center;border-radius:999px;'
+                            f'background:{self._qcolor_rgba_css(user_label, 0.16)};'
+                            f'border:1px solid {self._qcolor_css(user_border)};'
+                            f'color:{self._qcolor_css(user_label)}">&#8250;</span>'
+                        ),
+                        header_text="You",
+                        align_right=True,
+                        streaming=False,
+                    )
+                elif kind == "error":
+                    widget, refs = self._build_ai_message_widget(
+                        kind="error",
+                        body_html=body_html,
+                        show_headers=show_headers,
+                        font_pt=font_pt,
+                        header_pt=header_pt,
+                        outer_margin=outer_margin,
+                        header_margin=header_margin,
+                        bubble_pad_h=bubble_pad_h,
+                        bubble_pad_v=bubble_pad_v,
+                        line_height=line_height,
+                        message_max_width_ratio=message_max_width_ratio,
+                        text_color=text_color,
+                        muted_text=muted_text,
+                        label_color=error_label,
+                        border_color=error_border,
+                        background_color=QColor.fromRgbF(error_bg.redF(), error_bg.greenF(), error_bg.blueF(), min(0.98, 1.00 * tint_scale)),
+                        header_icon_html=(
+                            f'<span style="display:inline-block;min-width:16px;height:16px;line-height:16px;'
+                            f'padding:0 5px;margin:0 5px 0 0;text-align:center;border-radius:999px;'
+                            f'background:{self._qcolor_rgba_css(error_label, 0.16)};'
+                            f'border:1px solid {self._qcolor_css(error_border)};'
+                            f'color:{self._qcolor_css(error_label)}">!</span>'
+                        ),
+                        header_text="Error",
+                        align_right=False,
+                        streaming=False,
+                    )
+                else:
+                    action_targets = [] if is_streaming_message else self._extract_addable_bhtom_targets_from_ai_text(raw_text)
+                    widget, refs = self._build_ai_message_widget(
+                        kind="ai",
+                        body_html=body_html,
+                        show_headers=show_headers,
+                        font_pt=font_pt,
+                        header_pt=header_pt,
+                        outer_margin=outer_margin,
+                        header_margin=header_margin,
+                        bubble_pad_h=bubble_pad_h,
+                        bubble_pad_v=bubble_pad_v,
+                        line_height=line_height,
+                        message_max_width_ratio=message_max_width_ratio,
+                        text_color=text_color,
+                        muted_text=muted_text,
+                        label_color=ai_label,
+                        border_color=ai_border,
+                        background_color=QColor.fromRgbF(ai_bg.redF(), ai_bg.greenF(), ai_bg.blueF(), min(0.98, 0.98 * tint_scale)),
+                        header_icon_html=(
+                            f'<span style="display:inline-block;min-width:16px;height:16px;line-height:16px;'
+                            f'padding:0 5px;margin:0 5px 0 0;text-align:center;border-radius:999px;'
+                            f'background:{self._qcolor_rgba_css(ai_label, 0.16)};'
+                            f'border:1px solid {self._qcolor_css(ai_border)};'
+                            f'color:{self._qcolor_css(ai_label)}">&#10022;</span>'
+                        ),
+                        header_text="LLM",
+                        align_right=False,
+                        streaming=is_streaming_message,
+                        action_targets=action_targets,
+                    )
+                self.ai_output_layout.addWidget(widget, 0, Qt.AlignTop)
+                self._ai_message_widget_refs.append(refs)
+            self.ai_output_layout.addStretch(1)
+        finally:
+            self.ai_output.setUpdatesEnabled(True)
+
+        self._scroll_ai_output_to_bottom()
+        self._refresh_ai_panel_action_buttons()
+
+    def _flush_ai_stream_render(self) -> None:
+        idx = self._ai_stream_message_index
+        if idx is None:
+            return
+        if not self._update_ai_message_widget(idx, streaming=True):
+            self._render_ai_messages()
+            return
+        self._scroll_ai_output_to_bottom()
+        self._refresh_ai_panel_action_buttons()
 
     def _start_ai_response_message(self) -> None:
+        self._ai_stream_render_timer.stop()
         self._ai_stream_message_index = self._append_ai_message("", is_ai=True)
 
     def _append_ai_stream_chunk(self, text: str) -> None:
@@ -8972,19 +22973,26 @@ class MainWindow(QMainWindow):
             idx = self._append_ai_message("", is_ai=True)
             self._ai_stream_message_index = idx
         self._ai_messages[idx]["text"] = self._ai_messages[idx].get("text", "") + text
-        self._render_ai_messages()
+        if not self._ai_stream_render_timer.isActive():
+            self._ai_stream_render_timer.start(45)
 
     def _finalize_ai_response(self, text: str) -> None:
+        self._ai_stream_render_timer.stop()
         idx = self._ai_stream_message_index
         if idx is not None and 0 <= idx < len(self._ai_messages):
             self._ai_messages[idx]["kind"] = "ai"
             self._ai_messages[idx]["text"] = text
-            self._render_ai_messages()
+            if not self._update_ai_message_widget(idx, streaming=False):
+                self._render_ai_messages()
+            else:
+                self._scroll_ai_output_to_bottom()
+                self._refresh_ai_panel_action_buttons()
         else:
             self._append_ai_message(text, is_ai=True)
         self._ai_stream_message_index = None
 
     def _fail_ai_response(self, message: str) -> None:
+        self._ai_stream_render_timer.stop()
         idx = self._ai_stream_message_index
         if idx is not None and 0 <= idx < len(self._ai_messages):
             current_text = self._ai_messages[idx].get("text", "")

@@ -1,0 +1,18 @@
+title = "Seestar Simulator"
+
+[network]
+ip_address = "0.0.0.0"
+tcp_port = 4700
+udp_port = 4720
+
+[logging]
+log_level = "INFO"
+log_prefix = ""
+log_to_stdout = true
+max_size_mb = 5
+num_keep_logs = 10
+log_events_in_info = true
+log_heartbeat_msgs = false
+
+[options]
+dropped_frame_ratio = 0

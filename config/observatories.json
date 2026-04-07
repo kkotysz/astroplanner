@@ -1,29 +1,110 @@
 {
-  "version": 1,
+  "version": 3,
   "observatories": [
     {
-      "name": "Białków",
-      "latitude": 51.474248,
-      "longitude": 16.657821,
-      "elevation": 128.0
+      "name": "Białków Large Telescope",
+      "latitude": 51.47425,
+      "longitude": 16.657822,
+      "elevation": 150.0,
+      "limiting_magnitude": 19.5,
+      "telescope_diameter_mm": 600.0,
+      "telescope_diameter_m": 0.6,
+      "focal_length_mm": 7500.0,
+      "pixel_size_um": 22.5,
+      "detector_width_px": 1250,
+      "detector_height_px": 1152,
+      "custom_conditions_url": "",
+      "preset_key": "obs:1|cam:1"
     },
     {
-      "name": "OCM",
+      "name": "Białków Small Telescope",
+      "latitude": 51.47425,
+      "longitude": 16.657822,
+      "elevation": 150.0,
+      "limiting_magnitude": 17.0,
+      "telescope_diameter_mm": 320.0,
+      "telescope_diameter_m": 0.32,
+      "focal_length_mm": 2862.0,
+      "pixel_size_um": 13.5,
+      "detector_width_px": 0,
+      "detector_height_px": 0,
+      "custom_conditions_url": "",
+      "preset_key": "obs:186|cam:172"
+    },
+    {
+      "name": "Rolf Chini Observatorio Cerro Murphy",
       "latitude": -24.59,
       "longitude": -70.19,
-      "elevation": 2800.0
+      "elevation": 2800.0,
+      "limiting_magnitude": 20.0,
+      "telescope_diameter_mm": 0.0,
+      "telescope_diameter_m": 0.0,
+      "focal_length_mm": 0.0,
+      "pixel_size_um": 0.0,
+      "detector_width_px": 0,
+      "detector_height_px": 0,
+      "custom_conditions_url": "",
+      "preset_key": "custom"
     },
     {
       "name": "Roque de los Muchachos",
       "latitude": 28.4522,
       "longitude": -17.533,
-      "elevation": 2426.0
+      "elevation": 2426.0,
+      "limiting_magnitude": 20.000000000000014,
+      "telescope_diameter_mm": 0.0,
+      "telescope_diameter_m": 0.0,
+      "focal_length_mm": 0.0,
+      "pixel_size_um": 0.0,
+      "detector_width_px": 0,
+      "detector_height_px": 0,
+      "custom_conditions_url": "",
+      "preset_key": "custom"
     },
     {
-      "name": "Serra La Nave",
-      "latitude": 37.691767,
-      "longitude": 14.978734,
-      "elevation": 1730.0
+      "name": "Seestar S50 [OPO]",
+      "latitude": 50.666818,
+      "longitude": 17.923641,
+      "elevation": 160.0,
+      "limiting_magnitude": 15.999999999999996,
+      "telescope_diameter_mm": 50.0,
+      "telescope_diameter_m": 0.05,
+      "focal_length_mm": 250.0,
+      "pixel_size_um": 2.9,
+      "detector_width_px": 1080,
+      "detector_height_px": 1920,
+      "custom_conditions_url": "",
+      "preset_key": "custom"
+    },
+    {
+      "name": "Seestar S50 [WRO]",
+      "latitude": 51.108978,
+      "longitude": 17.032669,
+      "elevation": 126.0,
+      "limiting_magnitude": 16.0,
+      "telescope_diameter_mm": 50.0,
+      "telescope_diameter_m": 0.05,
+      "focal_length_mm": 250.0,
+      "pixel_size_um": 2.9,
+      "detector_width_px": 1080,
+      "detector_height_px": 1920,
+      "custom_conditions_url": "",
+      "preset_key": "custom"
+    },
+    {
+      "name": "Serra La Nave APT2 80-cm",
+      "latitude": 37.6932694,
+      "longitude": 14.974738888,
+      "elevation": 1720.0,
+      "limiting_magnitude": 19.000000000000043,
+      "telescope_diameter_mm": 800.0,
+      "telescope_diameter_m": 0.8,
+      "focal_length_mm": 6400.0,
+      "pixel_size_um": 12.0,
+      "detector_width_px": 0,
+      "detector_height_px": 0,
+      "custom_conditions_url": "",
+      "preset_key": "obs:155|cam:126"
     }
   ]
 }

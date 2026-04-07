@@ -1,0 +1,60 @@
+title = "AstroPlanner Seestar ALP"
+
+[network]
+ip_address = "0.0.0.0"
+port = 5555
+imgport = 7556
+stport = 8090
+sthost = "localhost"
+rtsp_udp = true
+
+[webui_settings]
+uiport = 5432
+uitheme = "dark"
+confirm = true
+text_color = ""
+font_family = ""
+font_url = ""
+link_color = ""
+accent_color = ""
+
+[server]
+location = "AstroPlanner Docker"
+verbose_driver_exceptions = true
+
+[device]
+can_reverse = true
+step_size = 1.0
+steps_per_sec = 6
+verify_injection = true
+
+[seestar_initialization]
+save_good_frames = true
+save_all_frames = false
+lat = 52.23
+long = 21.01
+gain = 80
+exposure_length_preview_ms = 500
+exposure_length_stack_ms = 10000
+dither_enabled = true
+dither_length_pixel = 50
+dither_frequency = 10
+activate_LP_filter = false
+dew_heater_power = 0
+guest_mode_init = true
+battery_low_limit = 3
+dec_pos_index = 3
+is_frame_calibrated = true
+
+[logging]
+log_level = "INFO"
+log_prefix = "data/"
+log_to_stdout = true
+max_size_mb = 5
+num_keep_logs = 10
+log_events_in_info = true
+
+[[seestars]]
+name = "Seestar Alpha"
+ip_address = "seestar.local"
+device_num = 1

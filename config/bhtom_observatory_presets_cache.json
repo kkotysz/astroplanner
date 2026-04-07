@@ -1,0 +1,3493 @@
+{
+  "version": 1,
+  "base_url": "https://bh-tom2.astrouw.edu.pl",
+  "token_hash": "aeacd8a202422afbdac585ee39823883e962bd938d6961a6d5c115058017245d",
+  "fetched_at_unix": 1775596429.859245,
+  "presets": [
+    {
+      "key": "obs:228|cam:226",
+      "label": "AAVSOnet_BSM-NM | AAVSOnet_BSM-NM_ASI533MM-Pro",
+      "site": {
+        "name": "AAVSOnet_BSM-NM [AAVSOnet_BSM-NM_ASI533MM-Pro]",
+        "latitude": 32.9122,
+        "longitude": -105.525,
+        "elevation": 2300.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 180.0,
+        "focal_length_mm": 500.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:41|cam:41",
+      "label": "Adiyaman 60-cm telescope | Adyu60_Andor-934",
+      "site": {
+        "name": "Adiyaman 60-cm telescope [Adyu60_Andor-934]",
+        "latitude": 37.751703,
+        "longitude": 38.22541,
+        "elevation": 600.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 3962.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:76|cam:76",
+      "label": "Adonis Observatory 25-cm Telescope | Adonis_G2-1600",
+      "site": {
+        "name": "Adonis Observatory 25-cm Telescope [Adonis_G2-1600]",
+        "latitude": 50.91524,
+        "longitude": 2.925382,
+        "elevation": 30.0,
+        "limiting_magnitude": 18.5,
+        "telescope_diameter_mm": 250.0,
+        "focal_length_mm": 1000.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:206|cam:194",
+      "label": "AGN-S50 5-cm | AGN-S50_IMX462",
+      "site": {
+        "name": "AGN-S50 5-cm [AGN-S50_IMX462]",
+        "latitude": 53.0939,
+        "longitude": 18.5567,
+        "elevation": 85.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 50.0,
+        "focal_length_mm": 250.0,
+        "pixel_size_um": 2.9,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:200|cam:188",
+      "label": "AITP-Observatory 43-cm | AITP-Observatory_QHY268M",
+      "site": {
+        "name": "AITP-Observatory 43-cm [AITP-Observatory_QHY268M]",
+        "latitude": -22.9534778,
+        "longitude": -68.1799944,
+        "elevation": 2399.0,
+        "limiting_magnitude": 21.5,
+        "telescope_diameter_mm": 432.0,
+        "focal_length_mm": 2934.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:192|cam:180",
+      "label": "AndreaObservatory | AndreaObservatory_Only instrumental photometry file camera",
+      "site": {
+        "name": "AndreaObservatory [AndreaObservatory_Only instrumental photometry file camera]",
+        "latitude": 45.542616,
+        "longitude": 9.222043,
+        "elevation": 200.0,
+        "limiting_magnitude": 18.7,
+        "telescope_diameter_mm": 60.0,
+        "focal_length_mm": 360.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:224|cam:221",
+      "label": "Andromeda Observatory | AndromedaC14_QHY600M",
+      "site": {
+        "name": "Andromeda Observatory [AndromedaC14_QHY600M]",
+        "latitude": 51.18,
+        "longitude": 5.07,
+        "elevation": 25.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 2750.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:35|cam:35",
+      "label": "Aristarchos 2.3-m Telescope | ARISTARCHOS_TEK2K",
+      "site": {
+        "name": "Aristarchos 2.3-m Telescope [ARISTARCHOS_TEK2K]",
+        "latitude": 37.985587,
+        "longitude": 22.198294,
+        "elevation": 2340.0,
+        "limiting_magnitude": 23.0,
+        "telescope_diameter_mm": 2300.0,
+        "focal_length_mm": 0.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:97|cam:97",
+      "label": "Asiago Astrophysical Observatory 67/92-cm Schmidt telescope | AsiagoAO-0.67_G4-16000",
+      "site": {
+        "name": "Asiago Astrophysical Observatory 67/92-cm Schmidt telescope [AsiagoAO-0.67_G4-16000]",
+        "latitude": 45.84944,
+        "longitude": 11.568825,
+        "elevation": 1370.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 910.0,
+        "focal_length_mm": 2150.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:32|cam:32",
+      "label": "Astrolab IRIS Observatory 68-cm Telescope | Astrolab-IRIS_SBIG",
+      "site": {
+        "name": "Astrolab IRIS Observatory 68-cm Telescope [Astrolab-IRIS_SBIG]",
+        "latitude": 50.818066,
+        "longitude": 2.909895,
+        "elevation": 49.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 680.0,
+        "focal_length_mm": 2736.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:89|cam:89",
+      "label": "ASV 1.4-m Milankovic Telescope | ASV1.4_Andor",
+      "site": {
+        "name": "ASV 1.4-m Milankovic Telescope [ASV1.4_Andor]",
+        "latitude": 43.140234,
+        "longitude": 21.555617,
+        "elevation": 1150.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 1400.0,
+        "focal_length_mm": 11200.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:180|cam:166",
+      "label": "ASV 40-cm Telescope | ASV0.4_SBIG6303",
+      "site": {
+        "name": "ASV 40-cm Telescope [ASV0.4_SBIG6303]",
+        "latitude": 43.140234,
+        "longitude": 21.555617,
+        "elevation": 1150.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 4064.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:100|cam:120",
+      "label": "ASV 60-cm Telescope | ASV60_FLI",
+      "site": {
+        "name": "ASV 60-cm Telescope [ASV60_FLI]",
+        "latitude": 43.140234,
+        "longitude": 21.555617,
+        "elevation": 1150.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 6000.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:112|cam:112",
+      "label": "Auger FRAM 30-cm | FRAM_G4",
+      "site": {
+        "name": "Auger FRAM 30-cm [FRAM_G4]",
+        "latitude": -35.496138,
+        "longitude": -69.449755,
+        "elevation": 1400.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 2040.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:186|cam:172",
+      "label": "Białków 32-cm RC Telescope | BIALKOW-BST32_G4-9000",
+      "site": {
+        "name": "Białków 32-cm RC Telescope [BIALKOW-BST32_G4-9000]",
+        "latitude": 51.47425,
+        "longitude": 16.657822,
+        "elevation": 150.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 320.0,
+        "focal_length_mm": 2862.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:1|cam:1",
+      "label": "Białków 60-cm Cassegrain Telescope | BIALKOW_ANDOR-DW432",
+      "site": {
+        "name": "Białków 60-cm Cassegrain Telescope [BIALKOW_ANDOR-DW432]",
+        "latitude": 51.47425,
+        "longitude": 16.657822,
+        "elevation": 150.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 22.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:233|cam:231",
+      "label": "Burke-Gaffney Observatory 60-cm | BGO_SBIG-AC4040-C1",
+      "site": {
+        "name": "Burke-Gaffney Observatory 60-cm [BGO_SBIG-AC4040-C1]",
+        "latitude": 44.630566,
+        "longitude": -63.580377,
+        "elevation": 92.6,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 610.0,
+        "focal_length_mm": 3962.0,
+        "pixel_size_um": 18.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:216|cam:213",
+      "label": "C9 Auzielle 23-cm Telescope | Auzielle_ASI-294mm",
+      "site": {
+        "name": "C9 Auzielle 23-cm Telescope [Auzielle_ASI-294mm]",
+        "latitude": 43.543286,
+        "longitude": 1.572046,
+        "elevation": 160.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 230.0,
+        "focal_length_mm": 2350.0,
+        "pixel_size_um": 4.63,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:160|cam:131",
+      "label": "CAHA 1.23-m Telescope | CAHA1.23_ASI461MM",
+      "site": {
+        "name": "CAHA 1.23-m Telescope [CAHA1.23_ASI461MM]",
+        "latitude": 37.2208,
+        "longitude": -2.5468,
+        "elevation": 2168.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1230.0,
+        "focal_length_mm": 9807.6,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:176|cam:157",
+      "label": "CASLEO HSH 60-cm | HSH_SBIG-STL1001E",
+      "site": {
+        "name": "CASLEO HSH 60-cm [HSH_SBIG-STL1001E]",
+        "latitude": -31.7873,
+        "longitude": -69.306638,
+        "elevation": 2591.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 609.6,
+        "focal_length_mm": 9126.77,
+        "pixel_size_um": 24.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:23|cam:23",
+      "label": "CASLEO SOLARIS4 50-cm | SOLARIS4_ANDOR-939",
+      "site": {
+        "name": "CASLEO SOLARIS4 50-cm [SOLARIS4_ANDOR-939]",
+        "latitude": -31.7999,
+        "longitude": -69.293456,
+        "elevation": 2552.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:86|cam:86",
+      "label": "Cote Azur Observatory C2PU Omicron 1.04-m | C2PU_QHY600M",
+      "site": {
+        "name": "Cote Azur Observatory C2PU Omicron 1.04-m [C2PU_QHY600M]",
+        "latitude": 43.753734,
+        "longitude": 6.923013,
+        "elevation": 1260.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1040.0,
+        "focal_length_mm": 3296.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:195|cam:183",
+      "label": "CTIO PROMPT2 41-cm | PROMPT2_FLI",
+      "site": {
+        "name": "CTIO PROMPT2 41-cm [PROMPT2_FLI]",
+        "latitude": -30.168,
+        "longitude": -70.805,
+        "elevation": 2286.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 410.0,
+        "focal_length_mm": 4572.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:111|cam:111",
+      "label": "CTIO PROMPT3 60-cm | PROMPT3_FLI",
+      "site": {
+        "name": "CTIO PROMPT3 60-cm [PROMPT3_FLI]",
+        "latitude": -30.167639,
+        "longitude": -70.805389,
+        "elevation": 2286.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 3967.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:53|cam:53",
+      "label": "CTIO PROMPT5 41-cm | PROMPT5_Apogee",
+      "site": {
+        "name": "CTIO PROMPT5 41-cm [PROMPT5_Apogee]",
+        "latitude": -30.167639,
+        "longitude": -70.805389,
+        "elevation": 2286.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 410.0,
+        "focal_length_mm": 4576.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:39|cam:39",
+      "label": "CTIO PROMPT6 40-cm | PROMPT6_FLI",
+      "site": {
+        "name": "CTIO PROMPT6 40-cm [PROMPT6_FLI]",
+        "latitude": -30.167639,
+        "longitude": -70.805389,
+        "elevation": 2286.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 7016.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:16|cam:16",
+      "label": "CTIO SMARTS 1.3-m Telescope | SMARTS1.3_ANDICAM",
+      "site": {
+        "name": "CTIO SMARTS 1.3-m Telescope [SMARTS1.3_ANDICAM]",
+        "latitude": -30.16745,
+        "longitude": -70.805,
+        "elevation": 2215.0,
+        "limiting_magnitude": 21.5,
+        "telescope_diameter_mm": 1300.0,
+        "focal_length_mm": 0.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:50|cam:50",
+      "label": "Danish 1.54-m telescope | DANISH_DFOSC-FASU",
+      "site": {
+        "name": "Danish 1.54-m telescope [DANISH_DFOSC-FASU]",
+        "latitude": -29.25773,
+        "longitude": -70.737437,
+        "elevation": 2375.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1540.0,
+        "focal_length_mm": 13000.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:199|cam:187",
+      "label": "Dark Sky Observatory DSO-14 | DSO-14_FLI",
+      "site": {
+        "name": "Dark Sky Observatory DSO-14 [DSO-14_FLI]",
+        "latitude": 36.253,
+        "longitude": -81.415,
+        "elevation": 4000.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 360.0,
+        "focal_length_mm": 4338.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:159|cam:130",
+      "label": "Dark Sky Observatory DSO-17 | DSO-17_SBIG",
+      "site": {
+        "name": "Dark Sky Observatory DSO-17 [DSO-17_SBIG]",
+        "latitude": 36.253,
+        "longitude": -81.415,
+        "elevation": 932.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 430.0,
+        "focal_length_mm": 2951.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:159|cam:146",
+      "label": "Dark Sky Observatory DSO-17 | DSO-17_STL-11000",
+      "site": {
+        "name": "Dark Sky Observatory DSO-17 [DSO-17_STL-11000]",
+        "latitude": 36.253,
+        "longitude": -81.415,
+        "elevation": 932.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 430.0,
+        "focal_length_mm": 2951.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:182|cam:168",
+      "label": "Dauban 40-cm Telescope | Dauban_QHY268MM",
+      "site": {
+        "name": "Dauban 40-cm Telescope [Dauban_QHY268MM]",
+        "latitude": 43.9997,
+        "longitude": 5.6475,
+        "elevation": 630.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 2730.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:85|cam:85",
+      "label": "Eastern Anatolia Observatory ATA50 | ATA50_AltaU230",
+      "site": {
+        "name": "Eastern Anatolia Observatory ATA50 [ATA50_AltaU230]",
+        "latitude": 39.904442,
+        "longitude": 41.244163,
+        "elevation": 1856.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 510.0,
+        "focal_length_mm": 4175.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:85|cam:138",
+      "label": "Eastern Anatolia Observatory ATA50 | ATA50_QHY298M",
+      "site": {
+        "name": "Eastern Anatolia Observatory ATA50 [ATA50_QHY298M]",
+        "latitude": 39.904442,
+        "longitude": 41.244163,
+        "elevation": 1856.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 510.0,
+        "focal_length_mm": 4175.0,
+        "pixel_size_um": 1.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:163|cam:135",
+      "label": "EEye 40-cm | EEye_QHY268M",
+      "site": {
+        "name": "EEye 40-cm [EEye_QHY268M]",
+        "latitude": 38.215801,
+        "longitude": -6.6275384,
+        "elevation": 560.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 2790.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:164|cam:136",
+      "label": "El Sauce CHI-1 60-cm Telescope | ElSauce_QHY600MPro",
+      "site": {
+        "name": "El Sauce CHI-1 60-cm Telescope [ElSauce_QHY600MPro]",
+        "latitude": -30.470967,
+        "longitude": -70.764995,
+        "elevation": 1525.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 610.0,
+        "focal_length_mm": 3962.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:227|cam:224",
+      "label": "ESO NTT-SOFI | NTT-SOFI_Hawaii",
+      "site": {
+        "name": "ESO NTT-SOFI [NTT-SOFI_Hawaii]",
+        "latitude": -29.2584,
+        "longitude": -70.7345,
+        "elevation": 51.937,
+        "limiting_magnitude": 20.7,
+        "telescope_diameter_mm": 3580.0,
+        "focal_length_mm": 0.0,
+        "pixel_size_um": 18.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:33|cam:33",
+      "label": "Flarestar Observatory 25-cm Telescope | Flarestar-MPC171_G2-1600",
+      "site": {
+        "name": "Flarestar Observatory 25-cm Telescope [Flarestar-MPC171_G2-1600]",
+        "latitude": 35.910192,
+        "longitude": 14.469711,
+        "elevation": 126.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 250.0,
+        "focal_length_mm": 1850.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:70|cam:70",
+      "label": "FMO RRRT 60-cm | RRRT_SBIG-STX16803",
+      "site": {
+        "name": "FMO RRRT 60-cm [RRRT_SBIG-STX16803]",
+        "latitude": 37.879064,
+        "longitude": -78.694178,
+        "elevation": 1683.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 4809.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:45|cam:45",
+      "label": "GeoNAO SCTelescope 36-cm | GeoNAO_SXVR-H36",
+      "site": {
+        "name": "GeoNAO SCTelescope 36-cm [GeoNAO_SXVR-H36]",
+        "latitude": 41.754378,
+        "longitude": 42.819426,
+        "elevation": 1650.0,
+        "limiting_magnitude": 18.5,
+        "telescope_diameter_mm": 355.0,
+        "focal_length_mm": 3960.0,
+        "pixel_size_um": 7.4,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:174|cam:155",
+      "label": "GNAO Abastumani ASA AZ1500 | GeoNAO-1.5_ANDOR-iKon-XL-230",
+      "site": {
+        "name": "GNAO Abastumani ASA AZ1500 [GeoNAO-1.5_ANDOR-iKon-XL-230]",
+        "latitude": 41.754378,
+        "longitude": 42.819426,
+        "elevation": 1650.0,
+        "limiting_magnitude": 22.5,
+        "telescope_diameter_mm": 1500.0,
+        "focal_length_mm": 9000.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:64|cam:64",
+      "label": "GoChile-GoT1 40-cm Telescope | GoChile-GoT1_ASI6200",
+      "site": {
+        "name": "GoChile-GoT1 40-cm Telescope [GoChile-GoT1_ASI6200]",
+        "latitude": -30.470713,
+        "longitude": -70.764969,
+        "elevation": 1560.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 2600.0,
+        "pixel_size_um": 7.52,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:235|cam:234",
+      "label": "Hakos Namibia 10-cm Telescope | Hakos_PlayerOne_ZEUS-455M-Pro",
+      "site": {
+        "name": "Hakos Namibia 10-cm Telescope [Hakos_PlayerOne_ZEUS-455M-Pro]",
+        "latitude": -23.237,
+        "longitude": 16.361,
+        "elevation": 1825.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 106.0,
+        "focal_length_mm": 530.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:219|cam:216",
+      "label": "Highland Road Park Observatory 50-cm Telescope | HRPO_APOGEE-AP47",
+      "site": {
+        "name": "Highland Road Park Observatory 50-cm Telescope [HRPO_APOGEE-AP47]",
+        "latitude": 30.346069,
+        "longitude": -91.070789,
+        "elevation": 5.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 4.05,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:225|cam:222",
+      "label": "Horten 50-cm Telescope | HAO50_QHY268M",
+      "site": {
+        "name": "Horten 50-cm Telescope [HAO50_QHY268M]",
+        "latitude": 59.48,
+        "longitude": 10.32,
+        "elevation": 70.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 1993.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:36|cam:233",
+      "label": "Horten 68-cm Telescope | HAO68_C3-26000",
+      "site": {
+        "name": "Horten 68-cm Telescope [HAO68_C3-26000]",
+        "latitude": 59.417135,
+        "longitude": 10.436847,
+        "elevation": 86.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 675.0,
+        "focal_length_mm": 2344.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:36|cam:36",
+      "label": "Horten 68-cm Telescope | HAO68_G2-1600",
+      "site": {
+        "name": "Horten 68-cm Telescope [HAO68_G2-1600]",
+        "latitude": 59.417135,
+        "longitude": 10.436847,
+        "elevation": 86.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 675.0,
+        "focal_length_mm": 2344.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:166|cam:139",
+      "label": "IAC 80-cm Telescope CARONTE | IAC 80-cm Telescope CARONTE_CARONTE instrument",
+      "site": {
+        "name": "IAC 80-cm Telescope CARONTE [IAC 80-cm Telescope CARONTE_CARONTE instrument]",
+        "latitude": 28.299677,
+        "longitude": -16.511016,
+        "elevation": 2381.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 0.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:38|cam:13",
+      "label": "IAC 80-cm Telescope | IAC80_CAMELOT",
+      "site": {
+        "name": "IAC 80-cm Telescope [IAC80_CAMELOT]",
+        "latitude": 28.299677,
+        "longitude": -16.511016,
+        "elevation": 2381.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 9040.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:38|cam:38",
+      "label": "IAC 80-cm Telescope | IAC80_CAMELOT2",
+      "site": {
+        "name": "IAC 80-cm Telescope [IAC80_CAMELOT2]",
+        "latitude": 28.299677,
+        "longitude": -16.511016,
+        "elevation": 2381.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 9040.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:72|cam:72",
+      "label": "Isaac Newton Telescope 2.54-m | INT_WFC",
+      "site": {
+        "name": "Isaac Newton Telescope 2.54-m [INT_WFC]",
+        "latitude": 28.762147,
+        "longitude": -17.877647,
+        "elevation": 2348.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 2540.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:113|cam:113",
+      "label": "Istanbul Observatory IST40 | IST40_G2",
+      "site": {
+        "name": "Istanbul Observatory IST40 [IST40_G2]",
+        "latitude": 41.011749,
+        "longitude": 28.965718,
+        "elevation": 60.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 4064.0,
+        "pixel_size_um": 5.4,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:95|cam:95",
+      "label": "Jacobus Kapteyn Telescope 1-m | JKT_ANDOR",
+      "site": {
+        "name": "Jacobus Kapteyn Telescope 1-m [JKT_ANDOR]",
+        "latitude": 28.76122,
+        "longitude": -17.878115,
+        "elevation": 2369.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 15000.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:3|cam:3",
+      "label": "Jena Observatory 90/60-cm Schmidt Telescope | JENA90_STK",
+      "site": {
+        "name": "Jena Observatory 90/60-cm Schmidt Telescope [JENA90_STK]",
+        "latitude": 50.928486,
+        "longitude": 11.482512,
+        "elevation": 370.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 1800.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:84|cam:84",
+      "label": "KAO 1.88-m | KAO1.88_KFISP",
+      "site": {
+        "name": "KAO 1.88-m [KAO1.88_KFISP]",
+        "latitude": 29.934021,
+        "longitude": 31.827722,
+        "elevation": 476.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 1880.0,
+        "focal_length_mm": 33984.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:19|cam:19",
+      "label": "Konkoly Observatory 90/60-cm Schmidt Telescope | KONKOLY90_FLI-Microline",
+      "site": {
+        "name": "Konkoly Observatory 90/60-cm Schmidt Telescope [KONKOLY90_FLI-Microline]",
+        "latitude": 47.917009,
+        "longitude": 19.894919,
+        "elevation": 124.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 900.0,
+        "focal_length_mm": 2700.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:210|cam:198",
+      "label": "Kreiken Observatory T80 Telescope | Kreiken-T80_ApogeeU47",
+      "site": {
+        "name": "Kreiken Observatory T80 Telescope [Kreiken-T80_ApogeeU47]",
+        "latitude": 39.8444,
+        "longitude": 32.7822,
+        "elevation": 1256.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 3864.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:60|cam:60",
+      "label": "Kryoneri 1.2 m Telescope | Kryoneri-1.2_Andor-Zyla",
+      "site": {
+        "name": "Kryoneri 1.2 m Telescope [Kryoneri-1.2_Andor-Zyla]",
+        "latitude": 37.971955,
+        "longitude": 22.618601,
+        "elevation": 930.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1200.0,
+        "focal_length_mm": 4030.0,
+        "pixel_size_um": 6.48,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:60|cam:90",
+      "label": "Kryoneri 1.2 m Telescope | Kryoneri-1.2_Apogee-Aspen-CG47",
+      "site": {
+        "name": "Kryoneri 1.2 m Telescope [Kryoneri-1.2_Apogee-Aspen-CG47]",
+        "latitude": 37.971955,
+        "longitude": 22.618601,
+        "elevation": 930.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1200.0,
+        "focal_length_mm": 4030.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:6|cam:6",
+      "label": "LCOGT CTIO 1-m (file code: lsc) | LCOGT-CTIO-1m_4K",
+      "site": {
+        "name": "LCOGT CTIO 1-m (file code: lsc) [LCOGT-CTIO-1m_4K]",
+        "latitude": -30.167383,
+        "longitude": -70.804789,
+        "elevation": 2201.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 7950.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:79|cam:148",
+      "label": "LCOGT CTIO 40-cm (file code: lsc) | LCOGT-CTIO-40cm_QHY600M",
+      "site": {
+        "name": "LCOGT CTIO 40-cm (file code: lsc) [LCOGT-CTIO-40cm_QHY600M]",
+        "latitude": -30.167703,
+        "longitude": -70.80466,
+        "elevation": 2201.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:79|cam:79",
+      "label": "LCOGT CTIO 40-cm (file code: lsc) | LCOGT-CTIO-40cm_SBIG6303",
+      "site": {
+        "name": "LCOGT CTIO 40-cm (file code: lsc) [LCOGT-CTIO-40cm_SBIG6303]",
+        "latitude": -30.167703,
+        "longitude": -70.80466,
+        "elevation": 2201.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:40|cam:199",
+      "label": "LCOGT Haleakala 2-m (file code: ogg) | LCOGT-HO-2m_Muscat",
+      "site": {
+        "name": "LCOGT Haleakala 2-m (file code: ogg) [LCOGT-HO-2m_Muscat]",
+        "latitude": 20.70702,
+        "longitude": -156.257514,
+        "elevation": 3034.0,
+        "limiting_magnitude": 23.0,
+        "telescope_diameter_mm": 2000.0,
+        "focal_length_mm": 20000.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:40|cam:40",
+      "label": "LCOGT Haleakala 2-m (file code: ogg) | LCOGT-HO-2m_Spectral",
+      "site": {
+        "name": "LCOGT Haleakala 2-m (file code: ogg) [LCOGT-HO-2m_Spectral]",
+        "latitude": 20.70702,
+        "longitude": -156.257514,
+        "elevation": 3034.0,
+        "limiting_magnitude": 23.0,
+        "telescope_diameter_mm": 2000.0,
+        "focal_length_mm": 20000.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:80|cam:152",
+      "label": "LCOGT Haleakala 40-cm (file code: ogg) | LCOGT-HO-40cm_QHY600M",
+      "site": {
+        "name": "LCOGT Haleakala 40-cm (file code: ogg) [LCOGT-HO-40cm_QHY600M]",
+        "latitude": 20.70702,
+        "longitude": -156.257514,
+        "elevation": 3034.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:80|cam:80",
+      "label": "LCOGT Haleakala 40-cm (file code: ogg) | LCOGT-HO-40cm_SBIG6303",
+      "site": {
+        "name": "LCOGT Haleakala 40-cm (file code: ogg) [LCOGT-HO-40cm_SBIG6303]",
+        "latitude": 20.70702,
+        "longitude": -156.257514,
+        "elevation": 3034.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:8|cam:8",
+      "label": "LCOGT McDonald Obs. 1-m (file code: elp) | LCOGT-MCD-1m_4K",
+      "site": {
+        "name": "LCOGT McDonald Obs. 1-m (file code: elp) [LCOGT-MCD-1m_4K]",
+        "latitude": 30.679852,
+        "longitude": -104.015175,
+        "elevation": 2077.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 7950.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:82|cam:149",
+      "label": "LCOGT McDonald Obs. 40-cm (file code: elp) | LCOGT-MCD-40cm_QHY600M",
+      "site": {
+        "name": "LCOGT McDonald Obs. 40-cm (file code: elp) [LCOGT-MCD-40cm_QHY600M]",
+        "latitude": 30.679852,
+        "longitude": -104.015175,
+        "elevation": 2077.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:82|cam:82",
+      "label": "LCOGT McDonald Obs. 40-cm (file code: elp) | LCOGT-MCD-40cm_SBIG6303",
+      "site": {
+        "name": "LCOGT McDonald Obs. 40-cm (file code: elp) [LCOGT-MCD-40cm_SBIG6303]",
+        "latitude": 30.679852,
+        "longitude": -104.015175,
+        "elevation": 2077.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:7|cam:7",
+      "label": "LCOGT SAAO 1-m (file code: cpt) | LCOGT-SAAO-1m_4K",
+      "site": {
+        "name": "LCOGT SAAO 1-m (file code: cpt) [LCOGT-SAAO-1m_4K]",
+        "latitude": -32.380633,
+        "longitude": 20.809888,
+        "elevation": 1760.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 7950.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:83|cam:151",
+      "label": "LCOGT SAAO 40-cm (file code: cpt) | LCOGT-SAAO-40cm_QHY600M",
+      "site": {
+        "name": "LCOGT SAAO 40-cm (file code: cpt) [LCOGT-SAAO-40cm_QHY600M]",
+        "latitude": -32.380633,
+        "longitude": 20.809888,
+        "elevation": 1760.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:83|cam:83",
+      "label": "LCOGT SAAO 40-cm (file code: cpt) | LCOGT-SAAO-40cm_SBIG6303",
+      "site": {
+        "name": "LCOGT SAAO 40-cm (file code: cpt) [LCOGT-SAAO-40cm_SBIG6303]",
+        "latitude": -32.380633,
+        "longitude": 20.809888,
+        "elevation": 1760.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:5|cam:5",
+      "label": "LCOGT Siding Spring 1-m (file code: coj) | LCOGT-SS-1m_4K",
+      "site": {
+        "name": "LCOGT Siding Spring 1-m (file code: coj) [LCOGT-SS-1m_4K]",
+        "latitude": -31.272802,
+        "longitude": 149.070777,
+        "elevation": 1165.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 7950.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:37|cam:200",
+      "label": "LCOGT Siding Spring 2-m (file code: coj) | LCOGT-SS-2m_Muscat",
+      "site": {
+        "name": "LCOGT Siding Spring 2-m (file code: coj) [LCOGT-SS-2m_Muscat]",
+        "latitude": -31.272802,
+        "longitude": 149.070777,
+        "elevation": 1165.0,
+        "limiting_magnitude": 23.0,
+        "telescope_diameter_mm": 2000.0,
+        "focal_length_mm": 20000.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:37|cam:37",
+      "label": "LCOGT Siding Spring 2-m (file code: coj) | LCOGT-SS-2m_Spectral",
+      "site": {
+        "name": "LCOGT Siding Spring 2-m (file code: coj) [LCOGT-SS-2m_Spectral]",
+        "latitude": -31.272802,
+        "longitude": 149.070777,
+        "elevation": 1165.0,
+        "limiting_magnitude": 23.0,
+        "telescope_diameter_mm": 2000.0,
+        "focal_length_mm": 20000.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:81|cam:150",
+      "label": "LCOGT Siding Spring 40-cm (file code: coj) | LCOGT-SS-40cm_QHY600M",
+      "site": {
+        "name": "LCOGT Siding Spring 40-cm (file code: coj) [LCOGT-SS-40cm_QHY600M]",
+        "latitude": -31.272802,
+        "longitude": 149.070777,
+        "elevation": 1130.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:81|cam:81",
+      "label": "LCOGT Siding Spring 40-cm (file code: coj) | LCOGT-SS-40cm_SBIG6303",
+      "site": {
+        "name": "LCOGT Siding Spring 40-cm (file code: coj) [LCOGT-SS-40cm_SBIG6303]",
+        "latitude": -31.272802,
+        "longitude": 149.070777,
+        "elevation": 1130.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:63|cam:63",
+      "label": "LCOGT Teide Obs. 1-m (file code: tfn) | LCOGT-Teide-1m_4K",
+      "site": {
+        "name": "LCOGT Teide Obs. 1-m (file code: tfn) [LCOGT-Teide-1m_4K]",
+        "latitude": 28.300435,
+        "longitude": -16.511654,
+        "elevation": 2390.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 7950.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:151|cam:147",
+      "label": "LCOGT Teide Obs. 40-cm (file code: tfn) | LCOGT-Teide-40cm_QHY600M",
+      "site": {
+        "name": "LCOGT Teide Obs. 40-cm (file code: tfn) [LCOGT-Teide-40cm_QHY600M]",
+        "latitude": 28.300435,
+        "longitude": -16.511654,
+        "elevation": 2390.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:151|cam:122",
+      "label": "LCOGT Teide Obs. 40-cm (file code: tfn) | LCOGT-Teide-40cm_SBIG6303",
+      "site": {
+        "name": "LCOGT Teide Obs. 40-cm (file code: tfn) [LCOGT-Teide-40cm_SBIG6303]",
+        "latitude": 28.300435,
+        "longitude": -16.511654,
+        "elevation": 2390.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 1050.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:93|cam:93",
+      "label": "Lisnyky Observatory AZT-8 70-cm | AZT-8_C4-16000",
+      "site": {
+        "name": "Lisnyky Observatory AZT-8 70-cm [AZT-8_C4-16000]",
+        "latitude": 50.297939,
+        "longitude": 30.524145,
+        "elevation": 165.0,
+        "limiting_magnitude": 18.5,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 11200.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:93|cam:133",
+      "label": "Lisnyky Observatory AZT-8 70-cm | AZT-8_PL-4710",
+      "site": {
+        "name": "Lisnyky Observatory AZT-8 70-cm [AZT-8_PL-4710]",
+        "latitude": 50.297939,
+        "longitude": 30.524145,
+        "elevation": 165.0,
+        "limiting_magnitude": 18.5,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 11200.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:11|cam:11",
+      "label": "Loiano Observatory 1.52-m Telescope | LOIANO1.52_BFOSC",
+      "site": {
+        "name": "Loiano Observatory 1.52-m Telescope [LOIANO1.52_BFOSC]",
+        "latitude": 44.259142,
+        "longitude": 11.334399,
+        "elevation": 785.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1520.0,
+        "focal_length_mm": 12000.0,
+        "pixel_size_um": 20.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:27|cam:27",
+      "label": "Lowell Observatory Hall 1.1-m Telescope | LOWELL1.1_NASACAM",
+      "site": {
+        "name": "Lowell Observatory Hall 1.1-m Telescope [LOWELL1.1_NASACAM]",
+        "latitude": 35.096768,
+        "longitude": -111.536329,
+        "elevation": 2210.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 1040.0,
+        "focal_length_mm": 8385.0,
+        "pixel_size_um": 24.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:179|cam:161",
+      "label": "Lund Observatory 60-cm Telescope | Lund_FLI-PL09000",
+      "site": {
+        "name": "Lund Observatory 60-cm Telescope [Lund_FLI-PL09000]",
+        "latitude": 55.70584,
+        "longitude": 13.19321,
+        "elevation": 50.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 3962.0,
+        "pixel_size_um": 12.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:229|cam:227",
+      "label": "MaciejS_DWARF3 | MaciejS_DWARF3_IMX678 STARVIS 2",
+      "site": {
+        "name": "MaciejS_DWARF3 [MaciejS_DWARF3_IMX678 STARVIS 2]",
+        "latitude": 6.7531088888889,
+        "longitude": 49.8221475,
+        "elevation": 133.0,
+        "limiting_magnitude": 17.5,
+        "telescope_diameter_mm": 35.0,
+        "focal_length_mm": 150.0,
+        "pixel_size_um": 2.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:230|cam:228",
+      "label": "MaciejS_SW_200_1000 | MaciejS_SW_200_1000_ASI 585 MC Pro Color",
+      "site": {
+        "name": "MaciejS_SW_200_1000 [MaciejS_SW_200_1000_ASI 585 MC Pro Color]",
+        "latitude": 6.7531088888889,
+        "longitude": 49.8221475,
+        "elevation": 133.0,
+        "limiting_magnitude": 17.5,
+        "telescope_diameter_mm": 200.0,
+        "focal_length_mm": 1000.0,
+        "pixel_size_um": 2.9,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:231|cam:229",
+      "label": "MaciejS_SW_72_420_ED | MaciejS_SW_72_420_ED_ASI 183 MC Pro Color",
+      "site": {
+        "name": "MaciejS_SW_72_420_ED [MaciejS_SW_72_420_ED_ASI 183 MC Pro Color]",
+        "latitude": 6.7531088888889,
+        "longitude": 49.8221475,
+        "elevation": 133.0,
+        "limiting_magnitude": 17.5,
+        "telescope_diameter_mm": 72.0,
+        "focal_length_mm": 420.0,
+        "pixel_size_um": 2.4,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:118|cam:118",
+      "label": "MARCOT Telescope Array | MARCOT_ZWO-ASI1600-GT",
+      "site": {
+        "name": "MARCOT Telescope Array [MARCOT_ZWO-ASI1600-GT]",
+        "latitude": 37.219087,
+        "longitude": -2.550799,
+        "elevation": 2168.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1060.0,
+        "focal_length_mm": 0.0,
+        "pixel_size_um": 7.6,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:162|cam:134",
+      "label": "Moletai Observatory 0.8-m Telescope | MOLETAI-80cm_SOPHIA-4096B",
+      "site": {
+        "name": "Moletai Observatory 0.8-m Telescope [MOLETAI-80cm_SOPHIA-4096B]",
+        "latitude": 55.315921,
+        "longitude": 25.563117,
+        "elevation": 200.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 5480.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:18|cam:18",
+      "label": "Moletai Observatory 1.65-m Telescope | MOLETAI-165cm_CCD4710",
+      "site": {
+        "name": "Moletai Observatory 1.65-m Telescope [MOLETAI-165cm_CCD4710]",
+        "latitude": 55.315921,
+        "longitude": 25.563117,
+        "elevation": 200.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1650.0,
+        "focal_length_mm": 1968.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:9|cam:9",
+      "label": "Moletai Observatory 35-cm Telescope | MOLETAI-35cm_CCD4710",
+      "site": {
+        "name": "Moletai Observatory 35-cm Telescope [MOLETAI-35cm_CCD4710]",
+        "latitude": 55.315921,
+        "longitude": 25.563117,
+        "elevation": 200.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 1785.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:57|cam:57",
+      "label": "Montarrenti Observatory 53-cm Telescope | Montarrenti-0.53_Alta-U47",
+      "site": {
+        "name": "Montarrenti Observatory 53-cm Telescope [Montarrenti-0.53_Alta-U47]",
+        "latitude": 43.23278,
+        "longitude": 11.1833,
+        "elevation": 800.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 530.0,
+        "focal_length_mm": 4611.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:194|cam:182",
+      "label": "MSU Observatory 61-cm Telescope | MSU-Observatory_QHY600PH",
+      "site": {
+        "name": "MSU Observatory 61-cm Telescope [MSU-Observatory_QHY600PH]",
+        "latitude": 42.706389,
+        "longitude": -84.4833,
+        "elevation": 273.1,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 609.6,
+        "focal_length_mm": 1823.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:211|cam:201",
+      "label": "Mt. Cuba AO 60-cm Telescope | MCAO_Andor-Aspen-47",
+      "site": {
+        "name": "Mt. Cuba AO 60-cm Telescope [MCAO_Andor-Aspen-47]",
+        "latitude": 39.78466888567693,
+        "longitude": -75.63329558922099,
+        "elevation": 90.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 2400.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:178|cam:160",
+      "label": "MUO Boyden 35-cm telescope | MUOSA_C3-26000Pro",
+      "site": {
+        "name": "MUO Boyden 35-cm telescope [MUOSA_C3-26000Pro]",
+        "latitude": -29.0,
+        "longitude": 26.0,
+        "elevation": 1400.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 2250.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:177|cam:159",
+      "label": "MUO Zdanice 80-cm telescope | MUOZdanice_C5A-150M",
+      "site": {
+        "name": "MUO Zdanice 80-cm telescope [MUOZdanice_C5A-150M]",
+        "latitude": 49.07,
+        "longitude": 17.04,
+        "elevation": 300.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 5480.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:222|cam:219",
+      "label": "MyBackyard | MyBackyard_Only instrumental photometry file camera",
+      "site": {
+        "name": "MyBackyard [MyBackyard_Only instrumental photometry file camera]",
+        "latitude": 44.8592,
+        "longitude": -0.4845,
+        "elevation": 70.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 200.0,
+        "focal_length_mm": 1350.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:193|cam:181",
+      "label": "Nube Blanca Observatory | Nube Blanca Observatory_Only instrumental photometry file camera",
+      "site": {
+        "name": "Nube Blanca Observatory [Nube Blanca Observatory_Only instrumental photometry file camera]",
+        "latitude": 40.315158,
+        "longitude": -105.163515,
+        "elevation": 1605.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 432.0,
+        "focal_length_mm": 2940.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:12|cam:12",
+      "label": "OAC 91-cm Telescope | OAC91_KAF1001E",
+      "site": {
+        "name": "OAC 91-cm Telescope [OAC91_KAF1001E]",
+        "latitude": 37.528761,
+        "longitude": 15.071584,
+        "elevation": 1375.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 910.0,
+        "focal_length_mm": 14275.0,
+        "pixel_size_um": 24.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:29|cam:58",
+      "label": "OAdM Telescope Joan Oró 80-cm | TJO_MEIA2",
+      "site": {
+        "name": "OAdM Telescope Joan Oró 80-cm [TJO_MEIA2]",
+        "latitude": 42.051652,
+        "longitude": 0.72969,
+        "elevation": 1570.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 7680.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:29|cam:29",
+      "label": "OAdM Telescope Joan Oró 80-cm | TJO_MEIA3",
+      "site": {
+        "name": "OAdM Telescope Joan Oró 80-cm [TJO_MEIA3]",
+        "latitude": 42.051652,
+        "longitude": 0.72969,
+        "elevation": 1570.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 7680.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:208|cam:196",
+      "label": "OARPAF 80-cm Telescope | OARPAF_STX-16081",
+      "site": {
+        "name": "OARPAF 80-cm Telescope [OARPAF_STX-16081]",
+        "latitude": 44.5912,
+        "longitude": 9.2034,
+        "elevation": 1469.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 6400.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:61|cam:61",
+      "label": "OASDG T1 50-cm | OASDG-T1_FLI24240",
+      "site": {
+        "name": "OASDG T1 50-cm [OASDG-T1_FLI24240]",
+        "latitude": 40.623967,
+        "longitude": 14.56396,
+        "elevation": 660.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 4000.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:102|cam:102",
+      "label": "OAUJ Cassegrain 50-cm Telescope | OAUJ-TEL50_ApogeeU42",
+      "site": {
+        "name": "OAUJ Cassegrain 50-cm Telescope [OAUJ-TEL50_ApogeeU42]",
+        "latitude": 50.053957,
+        "longitude": 19.824512,
+        "elevation": 315.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:102|cam:163",
+      "label": "OAUJ Cassegrain 50-cm Telescope | OAUJ-TEL50_ApogeeU47",
+      "site": {
+        "name": "OAUJ Cassegrain 50-cm Telescope [OAUJ-TEL50_ApogeeU47]",
+        "latitude": 50.053957,
+        "longitude": 19.824512,
+        "elevation": 315.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:102|cam:162",
+      "label": "OAUJ Cassegrain 50-cm Telescope | OAUJ-TEL50_F42",
+      "site": {
+        "name": "OAUJ Cassegrain 50-cm Telescope [OAUJ-TEL50_F42]",
+        "latitude": 50.053957,
+        "longitude": 19.824512,
+        "elevation": 315.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:102|cam:165",
+      "label": "OAUJ Cassegrain 50-cm Telescope | OAUJ-TEL50_IXON888",
+      "site": {
+        "name": "OAUJ Cassegrain 50-cm Telescope [OAUJ-TEL50_IXON888]",
+        "latitude": 50.053957,
+        "longitude": 19.824512,
+        "elevation": 315.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:51|cam:65",
+      "label": "OAUJ CDK 50-cm Telescope | OAUJ-CDK500_F42",
+      "site": {
+        "name": "OAUJ CDK 50-cm Telescope [OAUJ-CDK500_F42]",
+        "latitude": 50.053957,
+        "longitude": 19.824512,
+        "elevation": 318.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:51|cam:164",
+      "label": "OAUJ CDK 50-cm Telescope | OAUJ-CDK500_U42",
+      "site": {
+        "name": "OAUJ CDK 50-cm Telescope [OAUJ-CDK500_U42]",
+        "latitude": 50.053957,
+        "longitude": 19.824512,
+        "elevation": 318.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:51|cam:51",
+      "label": "OAUJ CDK 50-cm Telescope | OAUJ-CDK500_U47",
+      "site": {
+        "name": "OAUJ CDK 50-cm Telescope [OAUJ-CDK500_U47]",
+        "latitude": 50.053957,
+        "longitude": 19.824512,
+        "elevation": 318.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:184|cam:170",
+      "label": "Observatoire de Gravelle K07 | Observatoire de Gravelle K07_Only instrumental photometry file camera",
+      "site": {
+        "name": "Observatoire de Gravelle K07 [Observatoire de Gravelle K07_Only instrumental photometry file camera]",
+        "latitude": 48.0,
+        "longitude": 2.0,
+        "elevation": 96.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 200.0,
+        "focal_length_mm": 2000.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:73|cam:73",
+      "label": "Observatoire de Haute IRiS Telescope 50-cm | IRiS_FLI4240",
+      "site": {
+        "name": "Observatoire de Haute IRiS Telescope 50-cm [IRiS_FLI4240]",
+        "latitude": 43.932953,
+        "longitude": 5.714726,
+        "elevation": 650.0,
+        "limiting_magnitude": 21.5,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 4070.4,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:185|cam:171",
+      "label": "Observatoire JM Salomon | JM-Salomon_QHY268",
+      "site": {
+        "name": "Observatoire JM Salomon [JM-Salomon_QHY268]",
+        "latitude": 48.2916667,
+        "longitude": 2.438056,
+        "elevation": 92.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 1950.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:105|cam:105",
+      "label": "OCM zb08 80-cm | OCM-zb08_ANDOR-936",
+      "site": {
+        "name": "OCM zb08 80-cm [OCM-zb08_ANDOR-936]",
+        "latitude": -24.598056,
+        "longitude": -70.196389,
+        "elevation": 2817.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 5480.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:14|cam:14",
+      "label": "OHP 1.2-m Telescope | OHP2-T120_Andor-iKon-L-936",
+      "site": {
+        "name": "OHP 1.2-m Telescope [OHP2-T120_Andor-iKon-L-936]",
+        "latitude": 43.931446,
+        "longitude": 5.712534,
+        "elevation": 650.0,
+        "limiting_magnitude": 22.0,
+        "telescope_diameter_mm": 1200.0,
+        "focal_length_mm": 7232.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:181|cam:167",
+      "label": "OHP 1.93m Telescope | OHP1.93_ANDOR-936",
+      "site": {
+        "name": "OHP 1.93m Telescope [OHP1.93_ANDOR-936]",
+        "latitude": 43.931666,
+        "longitude": 5.712222,
+        "elevation": 630.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1930.0,
+        "focal_length_mm": 28600.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:75|cam:75",
+      "label": "Old Orchard Observatory 25-cm Telescope | Old-Orchard_SX694",
+      "site": {
+        "name": "Old Orchard Observatory 25-cm Telescope [Old-Orchard_SX694]",
+        "latitude": 51.159722,
+        "longitude": -3.121667,
+        "elevation": 30.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 250.0,
+        "focal_length_mm": 2500.0,
+        "pixel_size_um": 4.54,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:103|cam:121",
+      "label": "Ondrejov Observatory D50 | Ondrejov-D50_Andor-888",
+      "site": {
+        "name": "Ondrejov Observatory D50 [Ondrejov-D50_Andor-888]",
+        "latitude": 49.909376,
+        "longitude": 14.781358,
+        "elevation": 527.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 2277.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:157|cam:128",
+      "label": "Open University PIRATE Mark IV 60-cm | PIRATE_FLI",
+      "site": {
+        "name": "Open University PIRATE Mark IV 60-cm [PIRATE_FLI]",
+        "latitude": 28.29925,
+        "longitude": -16.510194,
+        "elevation": 2370.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 3974.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:2|cam:225",
+      "label": "Ostrowik 60-cm Cassegrain Telescope | Ostrowik-60-cm_SOFIA_E2V",
+      "site": {
+        "name": "Ostrowik 60-cm Cassegrain Telescope [Ostrowik-60-cm_SOFIA_E2V]",
+        "latitude": 52.087981,
+        "longitude": 21.41614,
+        "elevation": 200.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:2|cam:2",
+      "label": "Ostrowik 60-cm Cassegrain Telescope | Ostrowik-60-cm_TEK512",
+      "site": {
+        "name": "Ostrowik 60-cm Cassegrain Telescope [Ostrowik-60-cm_TEK512]",
+        "latitude": 52.087981,
+        "longitude": 21.41614,
+        "elevation": 200.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:74|cam:74",
+      "label": "Perth Observatory R-COP 35-cm | R-COP_SBIG-ST-10XME",
+      "site": {
+        "name": "Perth Observatory R-COP 35-cm [R-COP_SBIG-ST-10XME]",
+        "latitude": -32.007,
+        "longitude": 116.136,
+        "elevation": 1268.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 2011.0,
+        "pixel_size_um": 7.4,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:213|cam:207",
+      "label": "Piwnice second | Piwnice second_MoravianC4",
+      "site": {
+        "name": "Piwnice second [Piwnice second_MoravianC4]",
+        "latitude": 53.093999,
+        "longitude": 18.555925,
+        "elevation": 97.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 280.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:71|cam:71",
+      "label": "Piwnice TSC90 | PIWNICE90_C4-16000EC",
+      "site": {
+        "name": "Piwnice TSC90 [PIWNICE90_C4-16000EC]",
+        "latitude": 53.093999,
+        "longitude": 18.555925,
+        "elevation": 100.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 900.0,
+        "focal_length_mm": 1800.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:156|cam:127",
+      "label": "Planetarium Slaskie 70-cm Telescope | Planetarium_Slaskie_Kepler4040",
+      "site": {
+        "name": "Planetarium Slaskie 70-cm Telescope [Planetarium_Slaskie_Kepler4040]",
+        "latitude": 50.2909481,
+        "longitude": 18.9924414,
+        "elevation": 320.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 4540.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:188|cam:176",
+      "label": "Private Facility | Private Facility_Only instrumental photometry file camera",
+      "site": {
+        "name": "Private Facility [Private Facility_Only instrumental photometry file camera]",
+        "latitude": 22.994,
+        "longitude": 72.625,
+        "elevation": 10.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 150.0,
+        "focal_length_mm": 1370.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:189|cam:177",
+      "label": "Private Observatory | Private Observatory_Only instrumental photometry file camera",
+      "site": {
+        "name": "Private Observatory [Private Observatory_Only instrumental photometry file camera]",
+        "latitude": 23.05,
+        "longitude": 72.46,
+        "elevation": 10.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 280.0,
+        "focal_length_mm": 1980.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:69|cam:69",
+      "label": "PROMPT-MO-1 40-cm | PROMPT-MO-1_Apogee",
+      "site": {
+        "name": "PROMPT-MO-1 40-cm [PROMPT-MO-1_Apogee]",
+        "latitude": -31.638295,
+        "longitude": 116.988542,
+        "elevation": 650.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 4477.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:187|cam:175",
+      "label": "Purabiya Private Facility | Purabiya Private Facility_Only instrumental photometry file camera",
+      "site": {
+        "name": "Purabiya Private Facility [Purabiya Private Facility_Only instrumental photometry file camera]",
+        "latitude": 22.994,
+        "longitude": 72.625,
+        "elevation": 10.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 150.0,
+        "focal_length_mm": 1370.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:15|cam:91",
+      "label": "REM 60-cm Telescope | REM_REMIR",
+      "site": {
+        "name": "REM 60-cm Telescope [REM_REMIR]",
+        "latitude": -29.256387,
+        "longitude": -70.738636,
+        "elevation": 2400.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 1320.0,
+        "pixel_size_um": 18.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:15|cam:15",
+      "label": "REM 60-cm Telescope | REM_ROS2",
+      "site": {
+        "name": "REM 60-cm Telescope [REM_ROS2]",
+        "latitude": -29.256387,
+        "longitude": -70.738636,
+        "elevation": 2400.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 1320.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:96|cam:17",
+      "label": "ROAD Observatory 40-cm Telescope | ROAD40_FLI-KAF-16803",
+      "site": {
+        "name": "ROAD Observatory 40-cm Telescope [ROAD40_FLI-KAF-16803]",
+        "latitude": -22.953149,
+        "longitude": -68.179921,
+        "elevation": 2400.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 2720.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:96|cam:96",
+      "label": "ROAD Observatory 40-cm Telescope | ROAD40_QHY600M",
+      "site": {
+        "name": "ROAD Observatory 40-cm Telescope [ROAD40_QHY600M]",
+        "latitude": -22.953149,
+        "longitude": -68.179921,
+        "elevation": 2400.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 2720.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:223|cam:220",
+      "label": "ROAD Observatory C14 Telescope | ROADC14_QHY600M",
+      "site": {
+        "name": "ROAD Observatory C14 Telescope [ROADC14_QHY600M]",
+        "latitude": -22.9,
+        "longitude": -68.08,
+        "elevation": 2400.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 2670.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:190|cam:178",
+      "label": "S50-LidzbarkW | S50-LidzbarkW_S50-IMX462",
+      "site": {
+        "name": "S50-LidzbarkW [S50-LidzbarkW_S50-IMX462]",
+        "latitude": 54.1249,
+        "longitude": 20.586,
+        "elevation": 71.0,
+        "limiting_magnitude": 14.0,
+        "telescope_diameter_mm": 50.0,
+        "focal_length_mm": 250.0,
+        "pixel_size_um": 2.9,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:55|cam:55",
+      "label": "SAAO Lesedi 1-m | Lesedi-1m_Mookodi",
+      "site": {
+        "name": "SAAO Lesedi 1-m [Lesedi-1m_Mookodi]",
+        "latitude": -32.379759,
+        "longitude": 20.810676,
+        "elevation": 1800.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 8000.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:20|cam:20",
+      "label": "SAAO SOLARIS1 50-cm | SOLARIS1_ANDOR-939",
+      "site": {
+        "name": "SAAO SOLARIS1 50-cm [SOLARIS1_ANDOR-939]",
+        "latitude": -32.380325,
+        "longitude": 20.810922,
+        "elevation": 1842.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:21|cam:21",
+      "label": "SAAO SOLARIS2 50-cm | SOLARIS2_ANDOR-939",
+      "site": {
+        "name": "SAAO SOLARIS2 50-cm [SOLARIS2_ANDOR-939]",
+        "latitude": -32.380416,
+        "longitude": 20.810881,
+        "elevation": 1842.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:153|cam:124",
+      "label": "Salerno Observatory 60-cm Telescope | Salerno_Observatory_FLI",
+      "site": {
+        "name": "Salerno Observatory 60-cm Telescope [Salerno_Observatory_FLI]",
+        "latitude": 40.775,
+        "longitude": 14.7889,
+        "elevation": 300.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 4800.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:183|cam:169",
+      "label": "Salvia Observatory | Salvia-Observatory_ZWO6200MMPro",
+      "site": {
+        "name": "Salvia Observatory [Salvia-Observatory_ZWO6200MMPro]",
+        "latitude": 47.98265,
+        "longitude": -0.40733,
+        "elevation": 97.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 1415.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:104|cam:104",
+      "label": "SARA Observatory 90-cm Telescope | SARA90-KittPeak_ARC",
+      "site": {
+        "name": "SARA Observatory 90-cm Telescope [SARA90-KittPeak_ARC]",
+        "latitude": 31.960636,
+        "longitude": -111.599614,
+        "elevation": 2133.0,
+        "limiting_magnitude": 21.5,
+        "telescope_diameter_mm": 914.0,
+        "focal_length_mm": 6858.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:217|cam:214",
+      "label": "Scultetus Sternwarte 40-cm Telescope | Scultetus_QHY600M",
+      "site": {
+        "name": "Scultetus Sternwarte 40-cm Telescope [Scultetus_QHY600M]",
+        "latitude": 51.134487,
+        "longitude": 14.949223,
+        "elevation": 236.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 406.0,
+        "focal_length_mm": 3250.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:221|cam:218",
+      "label": "Seestar-S30 | Seestar-S30",
+      "site": {
+        "name": "Seestar-S30 [Seestar-S30]",
+        "latitude": 0.0,
+        "longitude": 0.0,
+        "elevation": 0.0,
+        "limiting_magnitude": 15.0,
+        "telescope_diameter_mm": 30.0,
+        "focal_length_mm": 150.0,
+        "pixel_size_um": 2.9,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:191|cam:179",
+      "label": "Seestar-S50 | Seestar-S50",
+      "site": {
+        "name": "Seestar-S50 [Seestar-S50]",
+        "latitude": 54.1369,
+        "longitude": 20.5886,
+        "elevation": 75.0,
+        "limiting_magnitude": 15.0,
+        "telescope_diameter_mm": 50.0,
+        "focal_length_mm": 250.0,
+        "pixel_size_um": 2.9,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:155|cam:126",
+      "label": "Serra La Nave APT2 80-cm | SLN_e2v",
+      "site": {
+        "name": "Serra La Nave APT2 80-cm [SLN_e2v]",
+        "latitude": 37.6932694,
+        "longitude": 14.974738888,
+        "elevation": 1720.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 6400.0,
+        "pixel_size_um": 12.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:232|cam:230",
+      "label": "SidzinaWP 12.7-cm Telescope | SidzinaWP_QHY600M",
+      "site": {
+        "name": "SidzinaWP 12.7-cm Telescope [SidzinaWP_QHY600M]",
+        "latitude": 49.605,
+        "longitude": 19.67055559,
+        "elevation": 780.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 127.0,
+        "focal_length_mm": 680.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:152|cam:123",
+      "label": "Skinakas Observatory 1.3-m Telescope | Skinakas1.3_Andor",
+      "site": {
+        "name": "Skinakas Observatory 1.3-m Telescope [Skinakas1.3_Andor]",
+        "latitude": 35.21194,
+        "longitude": 24.89917,
+        "elevation": 1750.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1300.0,
+        "focal_length_mm": 9857.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:152|cam:158",
+      "label": "Skinakas Observatory 1.3-m Telescope | Skinakas1.3_Andor_fr",
+      "site": {
+        "name": "Skinakas Observatory 1.3-m Telescope [Skinakas1.3_Andor_fr]",
+        "latitude": 35.21194,
+        "longitude": 24.89917,
+        "elevation": 1750.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1300.0,
+        "focal_length_mm": 9857.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:209|cam:197",
+      "label": "Skynet-MLC-RCOS16 | MLC-RCOS16_SBIG-STXL-11002",
+      "site": {
+        "name": "Skynet-MLC-RCOS16 [MLC-RCOS16_SBIG-STXL-11002]",
+        "latitude": 32.902,
+        "longitude": -105.53,
+        "elevation": 2225.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 400.0,
+        "focal_length_mm": 3638.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:201|cam:189",
+      "label": "Slooh Australia 51-cm Telescope | Slooh-AU_FLI-KAF-16803",
+      "site": {
+        "name": "Slooh Australia 51-cm Telescope [Slooh-AU_FLI-KAF-16803]",
+        "latitude": -31.2816709,
+        "longitude": 149.0801825,
+        "elevation": 805.0,
+        "limiting_magnitude": 15.0,
+        "telescope_diameter_mm": 508.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:207|cam:195",
+      "label": "Slooh Canary 50-cm Telescope | Slooh-Canary_KAF-09000",
+      "site": {
+        "name": "Slooh Canary 50-cm Telescope [Slooh-Canary_KAF-09000]",
+        "latitude": 28.2997,
+        "longitude": -16.50826,
+        "elevation": 2372.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 508.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 12.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:212|cam:202",
+      "label": "Slooh Canary Two 43-cm Telescope | Slooh-Canary-Two_KAF-16083",
+      "site": {
+        "name": "Slooh Canary Two 43-cm Telescope [Slooh-Canary-Two_KAF-16083]",
+        "latitude": 28.2997,
+        "longitude": -16.50826,
+        "elevation": 2372.298,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 432.0,
+        "focal_length_mm": 2938.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:198|cam:186",
+      "label": "Slooh Chile 43-cm Telescope | Slooh-CL_FLI-KAF-16803",
+      "site": {
+        "name": "Slooh Chile 43-cm Telescope [Slooh-CL_FLI-KAF-16803]",
+        "latitude": -33.269,
+        "longitude": -70.534,
+        "elevation": 1449.7,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 432.0,
+        "focal_length_mm": 2938.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:94|cam:94",
+      "label": "SMARTS 1-m | SMARTS1.0_Apogee-F42",
+      "site": {
+        "name": "SMARTS 1-m [SMARTS1.0_Apogee-F42]",
+        "latitude": -30.16886,
+        "longitude": -70.806052,
+        "elevation": 2240.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 900.0,
+        "focal_length_mm": 12150.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:172|cam:173",
+      "label": "SOA Bolecina | SOAB_ZWO-ASI183MM",
+      "site": {
+        "name": "SOA Bolecina [SOAB_ZWO-ASI183MM]",
+        "latitude": 49.81982694,
+        "longitude": 19.37052083,
+        "elevation": 398.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 406.0,
+        "focal_length_mm": 3250.0,
+        "pixel_size_um": 2.4,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:172|cam:174",
+      "label": "SOA Bolecina | SOAB_ZWO-ASI2600MM",
+      "site": {
+        "name": "SOA Bolecina [SOAB_ZWO-ASI2600MM]",
+        "latitude": 49.81982694,
+        "longitude": 19.37052083,
+        "elevation": 398.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 406.0,
+        "focal_length_mm": 3250.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:172|cam:145",
+      "label": "SOA Bolecina | SOAB_ZWO-ASI294MC-Pro",
+      "site": {
+        "name": "SOA Bolecina [SOAB_ZWO-ASI294MC-Pro]",
+        "latitude": 49.81982694,
+        "longitude": 19.37052083,
+        "elevation": 398.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 406.0,
+        "focal_length_mm": 3250.0,
+        "pixel_size_um": 4.63,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:22|cam:22",
+      "label": "SSO SOLARIS3 50-cm | SOLARIS3_ANDOR-939",
+      "site": {
+        "name": "SSO SOLARIS3 50-cm [SOLARIS3_ANDOR-939]",
+        "latitude": -31.273225,
+        "longitude": 149.064117,
+        "elevation": 1165.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 4500.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:197|cam:185",
+      "label": "Suhora 60-cm Telescope Moravian | Suhora 60-cm Telescope Moravian_Moravian C3-61000 PRO",
+      "site": {
+        "name": "Suhora 60-cm Telescope Moravian [Suhora 60-cm Telescope Moravian_Moravian C3-61000 PRO]",
+        "latitude": 49.5692,
+        "longitude": 20.067293,
+        "elevation": 1009.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 0.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:25|cam:25",
+      "label": "Suhora 60-cm Telescope | Apogee_Aspen_47",
+      "site": {
+        "name": "Suhora 60-cm Telescope [Apogee_Aspen_47]",
+        "latitude": 49.5692,
+        "longitude": 20.067293,
+        "elevation": 1009.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:25|cam:206",
+      "label": "Suhora 60-cm Telescope | Moravian_C3-61000_PRO",
+      "site": {
+        "name": "Suhora 60-cm Telescope [Moravian_C3-61000_PRO]",
+        "latitude": 49.5692,
+        "longitude": 20.067293,
+        "elevation": 1009.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 7500.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:67|cam:67",
+      "label": "SUTO-Otivar 30-cm Telescope | SUTO-Otivar_ASI1600MM",
+      "site": {
+        "name": "SUTO-Otivar 30-cm Telescope [SUTO-Otivar_ASI1600MM]",
+        "latitude": 36.82818,
+        "longitude": -3.703161,
+        "elevation": 200.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 1140.0,
+        "pixel_size_um": 3.8,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:67|cam:208",
+      "label": "SUTO-Otivar 30-cm Telescope | SUTO-Otivar_ASI2600MM",
+      "site": {
+        "name": "SUTO-Otivar 30-cm Telescope [SUTO-Otivar_ASI2600MM]",
+        "latitude": 36.82818,
+        "longitude": -3.703161,
+        "elevation": 200.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 1140.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:68|cam:68",
+      "label": "SUTO-Pyskowice 30-cm Telescope | SUTO-Pyskowice_ATIK11000M",
+      "site": {
+        "name": "SUTO-Pyskowice 30-cm Telescope [SUTO-Pyskowice_ATIK11000M]",
+        "latitude": 50.398179,
+        "longitude": 18.713964,
+        "elevation": 240.0,
+        "limiting_magnitude": 18.5,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 2432.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:106|cam:106",
+      "label": "T80-South Telescope | T80_Cam-S",
+      "site": {
+        "name": "T80-South Telescope [T80_Cam-S]",
+        "latitude": -30.167842,
+        "longitude": -70.80568,
+        "elevation": 2178.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 826.0,
+        "focal_length_mm": 3717.0,
+        "pixel_size_um": 10.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:101|cam:101",
+      "label": "TCMT C3 Paracorr 30-cm | TCMT_C3-61000",
+      "site": {
+        "name": "TCMT C3 Paracorr 30-cm [TCMT_C3-61000]",
+        "latitude": 49.201019,
+        "longitude": 17.681797,
+        "elevation": 404.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 1408.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:92|cam:92",
+      "label": "Telescopio Carlos Sanchez 1.52-m | TCS_MuSCAT2",
+      "site": {
+        "name": "Telescopio Carlos Sanchez 1.52-m [TCS_MuSCAT2]",
+        "latitude": 28.300532,
+        "longitude": -16.510877,
+        "elevation": 2400.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1520.0,
+        "focal_length_mm": 15898.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:26|cam:26",
+      "label": "Terskol Observatory 2-m Telescope | TERSKOL-2m_FLI-PL4301",
+      "site": {
+        "name": "Terskol Observatory 2-m Telescope [TERSKOL-2m_FLI-PL4301]",
+        "latitude": 43.276381,
+        "longitude": 42.499447,
+        "elevation": 3143.0,
+        "limiting_magnitude": 21.5,
+        "telescope_diameter_mm": 2000.0,
+        "focal_length_mm": 16000.0,
+        "pixel_size_um": 24.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:56|cam:56",
+      "label": "Terskol Observatory 60-cm Telescope | TERSKOL-60_SBIG-STL-1001",
+      "site": {
+        "name": "Terskol Observatory 60-cm Telescope [TERSKOL-60_SBIG-STL-1001]",
+        "latitude": 43.274751,
+        "longitude": 42.500014,
+        "elevation": 3143.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 7776.0,
+        "pixel_size_um": 24.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:218|cam:215",
+      "label": "Texas Tech University Skyview Observatory 30-cm Telescope | TTUSO_SBIG-STC-428P",
+      "site": {
+        "name": "Texas Tech University Skyview Observatory 30-cm Telescope [TTUSO_SBIG-STC-428P]",
+        "latitude": 33.748053,
+        "longitude": -101.9592141,
+        "elevation": 252.0,
+        "limiting_magnitude": 16.0,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 3048.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:99|cam:99",
+      "label": "The Garden To The Sky Facility Newton 25-cm | TheGardenToTheSky_QHY268M",
+      "site": {
+        "name": "The Garden To The Sky Facility Newton 25-cm [TheGardenToTheSky_QHY268M]",
+        "latitude": 50.77066,
+        "longitude": 4.86931,
+        "elevation": 70.0,
+        "limiting_magnitude": 16.5,
+        "telescope_diameter_mm": 250.0,
+        "focal_length_mm": 1175.0,
+        "pixel_size_um": 3.7,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:116|cam:116",
+      "label": "TRT-CTO 0.7-m | TRT-CTO-0.7_Andor-934",
+      "site": {
+        "name": "TRT-CTO 0.7-m [TRT-CTO-0.7_Andor-934]",
+        "latitude": -30.167847,
+        "longitude": -70.805393,
+        "elevation": 2200.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 4540.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:42|cam:42",
+      "label": "TRT-GAO 0.7m | TRT-GAO-0.7_Andor-936",
+      "site": {
+        "name": "TRT-GAO 0.7m [TRT-GAO-0.7_Andor-936]",
+        "latitude": 26.695533,
+        "longitude": 100.031051,
+        "elevation": 3193.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 4540.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:115|cam:115",
+      "label": "TRT-SBO 0.7-m | TRT-SBO-0.7_Andor-934",
+      "site": {
+        "name": "TRT-SBO 0.7-m [TRT-SBO-0.7_Andor-934]",
+        "latitude": -31.28166,
+        "longitude": 149.081466,
+        "elevation": 1020.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 4540.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:114|cam:114",
+      "label": "TRT-SRO 0.7-m | TRT-SRO-0.7_Andor-934",
+      "site": {
+        "name": "TRT-SRO 0.7-m [TRT-SRO-0.7_Andor-934]",
+        "latitude": 37.070267,
+        "longitude": -119.413034,
+        "elevation": 1405.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 4540.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:107|cam:107",
+      "label": "Tubitak Observatory 1-m Telescope | T100_SI1100",
+      "site": {
+        "name": "Tubitak Observatory 1-m Telescope [T100_SI1100]",
+        "latitude": 36.82416,
+        "longitude": 30.33555,
+        "elevation": 2500.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1000.0,
+        "focal_length_mm": 10000.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:66|cam:66",
+      "label": "Tubitak RTT150 | RTT150_TFOSC",
+      "site": {
+        "name": "Tubitak RTT150 [RTT150_TFOSC]",
+        "latitude": 36.82416,
+        "longitude": 30.33556,
+        "elevation": 2500.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 1500.0,
+        "focal_length_mm": 116111.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:226|cam:223",
+      "label": "Two-meter Twin Telescope 80-cm | TTT_QHY600MPCIE",
+      "site": {
+        "name": "Two-meter Twin Telescope 80-cm [TTT_QHY600MPCIE]",
+        "latitude": 28.29870266666667,
+        "longitude": -16.50940833333333,
+        "elevation": 2360.0,
+        "limiting_magnitude": 21.5,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 5480.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:158|cam:129",
+      "label": "UAM PST3A 70-cm | PST3A_Andor",
+      "site": {
+        "name": "UAM PST3A 70-cm [PST3A_Andor]",
+        "latitude": 52.601944,
+        "longitude": 16.038056,
+        "elevation": 100.0,
+        "limiting_magnitude": 18.0,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 4540.0,
+        "pixel_size_um": 13.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:168|cam:141",
+      "label": "UAM PST3B 32-cm | UAM-PST3B_ANDOR",
+      "site": {
+        "name": "UAM PST3B 32-cm [UAM-PST3B_ANDOR]",
+        "latitude": 52.601944,
+        "longitude": 16.038056,
+        "elevation": 100.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 320.0,
+        "focal_length_mm": 1680.0,
+        "pixel_size_um": 6.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:169|cam:142",
+      "label": "UAM PST3C 32-cm | UAM PST3C 32-cm_Andor Zyla 5.5",
+      "site": {
+        "name": "UAM PST3C 32-cm [UAM PST3C 32-cm_Andor Zyla 5.5]",
+        "latitude": 52.601944,
+        "longitude": 16.038056,
+        "elevation": 100.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 320.0,
+        "focal_length_mm": 1680.0,
+        "pixel_size_um": 6.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:170|cam:143",
+      "label": "UAM PST3D 30-cm | UAM PST3D 30-cm_Andor Zyla 5.5",
+      "site": {
+        "name": "UAM PST3D 30-cm [UAM PST3D 30-cm_Andor Zyla 5.5]",
+        "latitude": 52.601944,
+        "longitude": 16.038056,
+        "elevation": 100.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 300.0,
+        "pixel_size_um": 6.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:171|cam:144",
+      "label": "UAM PST3E 30-cm | UAM PST3E 30-cm_Andor Zyla 5.5",
+      "site": {
+        "name": "UAM PST3E 30-cm [UAM PST3E 30-cm_Andor Zyla 5.5]",
+        "latitude": 52.601944,
+        "longitude": 16.038056,
+        "elevation": 100.0,
+        "limiting_magnitude": 17.0,
+        "telescope_diameter_mm": 300.0,
+        "focal_length_mm": 300.0,
+        "pixel_size_um": 6.5,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:47|cam:203",
+      "label": "UCLO C14 EAST 36-cm | UCLO-C14EAST_PL16803",
+      "site": {
+        "name": "UCLO C14 EAST 36-cm [UCLO-C14EAST_PL16803]",
+        "latitude": 51.613297,
+        "longitude": -0.242266,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 356.0,
+        "focal_length_mm": 3910.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:47|cam:47",
+      "label": "UCLO C14 EAST 36-cm | UCLO-C14EAST_PL9000",
+      "site": {
+        "name": "UCLO C14 EAST 36-cm [UCLO-C14EAST_PL9000]",
+        "latitude": 51.613297,
+        "longitude": -0.242266,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 356.0,
+        "focal_length_mm": 3910.0,
+        "pixel_size_um": 12.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:47|cam:204",
+      "label": "UCLO C14 EAST 36-cm | UCLO-C14EAST_STL6303E",
+      "site": {
+        "name": "UCLO C14 EAST 36-cm [UCLO-C14EAST_STL6303E]",
+        "latitude": 51.613297,
+        "longitude": -0.242266,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 356.0,
+        "focal_length_mm": 3910.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:203|cam:191",
+      "label": "UCLO C14 WEST 36-cm | UCLO-C14WEST_QHY600M-PH",
+      "site": {
+        "name": "UCLO C14 WEST 36-cm [UCLO-C14WEST_QHY600M-PH]",
+        "latitude": 51.6133,
+        "longitude": -0.24,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 4310.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:203|cam:205",
+      "label": "UCLO C14 WEST 36-cm | UCLO-C14WEST_STL6303E",
+      "site": {
+        "name": "UCLO C14 WEST 36-cm [UCLO-C14WEST_STL6303E]",
+        "latitude": 51.6133,
+        "longitude": -0.24,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 4310.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:202|cam:190",
+      "label": "UCLO-C14EAST_PL16803 | UCLO-C14EAST_PL16803_FLI ProLine 16803",
+      "site": {
+        "name": "UCLO-C14EAST_PL16803 [UCLO-C14EAST_PL16803_FLI ProLine 16803]",
+        "latitude": 51.6133,
+        "longitude": -0.24,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 4310.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:205|cam:193",
+      "label": "UCLO-C14EAST_STL6303E | UCLO-C14EAST_STL6303E_STL6303E",
+      "site": {
+        "name": "UCLO-C14EAST_STL6303E [UCLO-C14EAST_STL6303E_STL6303E]",
+        "latitude": 51.6133,
+        "longitude": -0.24,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 4350.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:204|cam:192",
+      "label": "UCLO-C14WEST_STL6303E | UCLO-C14WEST_STL6303E_SBIG STL6303E",
+      "site": {
+        "name": "UCLO-C14WEST_STL6303E [UCLO-C14WEST_STL6303E_SBIG STL6303E]",
+        "latitude": 51.6133,
+        "longitude": -0.24,
+        "elevation": 82.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 350.0,
+        "focal_length_mm": 4300.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:46|cam:46",
+      "label": "Ulupınar Observatory IST60 | IST60_Andor-888",
+      "site": {
+        "name": "Ulupınar Observatory IST60 [IST60_Andor-888]",
+        "latitude": 40.099339,
+        "longitude": 26.475348,
+        "elevation": 410.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 4800.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:214|cam:209",
+      "label": "UTAS Greenhill Observatory 50-cm Telescope | UTAS_ALTA-U42",
+      "site": {
+        "name": "UTAS Greenhill Observatory 50-cm Telescope [UTAS_ALTA-U42]",
+        "latitude": -42.4311,
+        "longitude": 147.2878,
+        "elevation": 646.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:196|cam:184",
+      "label": "UwB Astronomical Observatory 60-cm Telescope | UwB_SBIG-4040",
+      "site": {
+        "name": "UwB Astronomical Observatory 60-cm Telescope [UwB_SBIG-4040]",
+        "latitude": 53.108963,
+        "longitude": 23.155881,
+        "elevation": 176.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 600.0,
+        "focal_length_mm": 4.2,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:88|cam:88",
+      "label": "UZO 50-cm Telescope | UZPW50_Chile_QHY268PRO",
+      "site": {
+        "name": "UZO 50-cm Telescope [UZPW50_Chile_QHY268PRO]",
+        "latitude": -30.526396,
+        "longitude": -70.853283,
+        "elevation": 1700.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 3.76,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:52|cam:52",
+      "label": "UZPW 50-cm Telescope | UZPW50_G4-9000",
+      "site": {
+        "name": "UZPW 50-cm Telescope [UZPW50_G4-9000]",
+        "latitude": 38.215556,
+        "longitude": -6.6269444,
+        "elevation": 560.0,
+        "limiting_magnitude": 19.5,
+        "telescope_diameter_mm": 500.0,
+        "focal_length_mm": 3454.0,
+        "pixel_size_um": 12.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:4|cam:4",
+      "label": "Vatican Advanced Technology Telescope 1.83-m | VATT_Vatt4k",
+      "site": {
+        "name": "Vatican Advanced Technology Telescope 1.83-m [VATT_Vatt4k]",
+        "latitude": 32.701258,
+        "longitude": -109.892051,
+        "elevation": 3191.0,
+        "limiting_magnitude": 21.0,
+        "telescope_diameter_mm": 1830.0,
+        "focal_length_mm": 16480.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:10|cam:10",
+      "label": "VLT (Vienna Little Telescope) 0.8-m | WIEN0.8_SBIG",
+      "site": {
+        "name": "VLT (Vienna Little Telescope) 0.8-m [WIEN0.8_SBIG]",
+        "latitude": 48.231963,
+        "longitude": 16.334186,
+        "elevation": 240.0,
+        "limiting_magnitude": 17.5,
+        "telescope_diameter_mm": 800.0,
+        "focal_length_mm": 6640.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:34|cam:34",
+      "label": "Warrumbungle 51-cm Telescope | Warrumbungle0.51_SBIG6303E",
+      "site": {
+        "name": "Warrumbungle 51-cm Telescope [Warrumbungle0.51_SBIG6303E]",
+        "latitude": -31.276249,
+        "longitude": 149.193272,
+        "elevation": 552.0,
+        "limiting_magnitude": 20.5,
+        "telescope_diameter_mm": 510.0,
+        "focal_length_mm": 3408.6,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:215|cam:210",
+      "label": "Wendelstein Observatory | Wendelstein Observatory3KK_BLUE",
+      "site": {
+        "name": "Wendelstein Observatory [Wendelstein Observatory3KK_BLUE]",
+        "latitude": 47.70363888888887,
+        "longitude": 12.012055555555557,
+        "elevation": 1838.0,
+        "limiting_magnitude": 24.0,
+        "telescope_diameter_mm": 2100.0,
+        "focal_length_mm": 15600.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:215|cam:211",
+      "label": "Wendelstein Observatory | Wendelstein Observatory3KK_RED",
+      "site": {
+        "name": "Wendelstein Observatory [Wendelstein Observatory3KK_RED]",
+        "latitude": 47.70363888888887,
+        "longitude": 12.012055555555557,
+        "elevation": 1838.0,
+        "limiting_magnitude": 24.0,
+        "telescope_diameter_mm": 2100.0,
+        "focal_length_mm": 15600.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:215|cam:212",
+      "label": "Wendelstein Observatory | Wendelstein ObservatoryNIR_JHK",
+      "site": {
+        "name": "Wendelstein Observatory [Wendelstein ObservatoryNIR_JHK]",
+        "latitude": 47.70363888888887,
+        "longitude": 12.012055555555557,
+        "elevation": 1838.0,
+        "limiting_magnitude": 24.0,
+        "telescope_diameter_mm": 2100.0,
+        "focal_length_mm": 15600.0,
+        "pixel_size_um": 15.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:24|cam:24",
+      "label": "Wiener Observatory 70-cm Telescope | PST2_ANDOR-888",
+      "site": {
+        "name": "Wiener Observatory 70-cm Telescope [PST2_ANDOR-888]",
+        "latitude": 31.665592,
+        "longitude": -110.601785,
+        "elevation": 1515.0,
+        "limiting_magnitude": 20.0,
+        "telescope_diameter_mm": 700.0,
+        "focal_length_mm": 4540.0,
+        "pixel_size_um": 13.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    },
+    {
+      "key": "obs:43|cam:43",
+      "label": "ZAO 20-cm Telescope | ZAO_G2-1600",
+      "site": {
+        "name": "ZAO 20-cm Telescope [ZAO_G2-1600]",
+        "latitude": 35.920412,
+        "longitude": 14.440003,
+        "elevation": 113.0,
+        "limiting_magnitude": 19.0,
+        "telescope_diameter_mm": 200.0,
+        "focal_length_mm": 1260.0,
+        "pixel_size_um": 9.0,
+        "detector_width_px": 0,
+        "detector_height_px": 0,
+        "custom_conditions_url": ""
+      }
+    }
+  ]
+}

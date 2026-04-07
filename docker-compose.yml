@@ -1,0 +1,56 @@
+name: astroplanner
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      TZ: ${TZ:-Europe/Warsaw}
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  seestar-alp:
+    image: ${SEESTAR_ALP_IMAGE:-astroplanner-seestar-alp:local}
+    build: &seestar-alp-build
+      context: "${SEESTAR_ALP_BUILD_CONTEXT:-https://github.com/smart-underworld/seestar_alp.git#main}"
+      dockerfile: docker/Dockerfile
+      args:
+        ASTRO_PLATFORM: ALPACA
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+    volumes:
+      - ${SEESTAR_ALP_CONFIG:-./docker/seestar_alp/config.toml}:/home/seestar/seestar_alp/device/config.toml:ro
+      - ./docker/seestar_alp/data:/home/seestar/seestar_alp/data
+    ports:
+      - "5432:5432"
+      - "5555:5555"
+      - "7556:7556"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5555/management/v1/description >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  seestar-simulator:
+    image: ${SEESTAR_ALP_IMAGE:-astroplanner-seestar-alp:local}
+    build: *seestar-alp-build
+    profiles: ["simulator"]
+    restart: unless-stopped
+    working_dir: /home/seestar/seestar_alp/simulator/src
+    entrypoint: ["python3", "main.py"]
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+    volumes:
+      - ./docker/seestar_alp/simulator.config.toml:/home/seestar/seestar_alp/simulator/src/config.toml:ro
+    ports:
+      - "4700:4700"
+      - "4720:4720/udp"
+
+volumes:
+  ollama_data:
