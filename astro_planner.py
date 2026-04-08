@@ -163,6 +163,7 @@ from astroplanner.theme import (
     normalize_theme_key,
     resolve_theme_tokens,
 )
+from astroplanner.storage import AppStorage, SettingsAdapter
 
 try:
     from PIL import Image, ImageDraw
@@ -265,6 +266,8 @@ BHTOM_PAGE_SIZE = 200
 BHTOM_SUGGESTION_MIN_IMPORTANCE = 2.0
 BHTOM_SUGGESTION_CACHE_TTL_S = 60 * 60
 BHTOM_OBSERVATORY_CACHE_TTL_S = 60 * 60
+SIMBAD_COMPACT_CACHE_TTL_S = 30 * 24 * 60 * 60
+SIMBAD_COMPACT_NEGATIVE_CACHE_TTL_S = 6 * 60 * 60
 DEFAULT_LIMITING_MAGNITUDE = 19.0
 QUICK_TARGETS_DEFAULT_COUNT = 10
 QUICK_TARGETS_MIN_COUNT = 1
@@ -1414,6 +1417,19 @@ APP_SETTINGS_ENV_KEY = "ASTROPLANNER_CONFIG_DIR"
 APP_SETTINGS_FILE_NAME = "settings.ini"
 
 
+def _config_root_dir() -> Path:
+    """Return a stable config root independent from current executable name."""
+    generic_cfg = str(QStandardPaths.writableLocation(QStandardPaths.GenericConfigLocation) or "").strip()
+    if generic_cfg:
+        return Path(generic_cfg).expanduser()
+    xdg_cfg = str(os.getenv("XDG_CONFIG_HOME", "") or "").strip()
+    if xdg_cfg:
+        return Path(xdg_cfg).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Preferences"
+    return Path.home() / ".config"
+
+
 def _resolve_settings_dir() -> Path:
     """Return a stable writable directory for app settings."""
     try:
@@ -1425,65 +1441,114 @@ def _resolve_settings_dir() -> Path:
     env_override = str(os.getenv(APP_SETTINGS_ENV_KEY, "") or "").strip()
     if env_override:
         return Path(env_override).expanduser()
+    return _config_root_dir() / APP_SETTINGS_ORG / APP_SETTINGS_APP
+
+
+def _legacy_settings_ini_candidates(target_ini_path: Path) -> list[Path]:
+    """Return historical INI locations to migrate from, excluding current target path."""
+    candidates: list[Path] = []
+
+    def _add(path: Path) -> None:
+        try:
+            normalized = path.expanduser().resolve()
+        except Exception:
+            normalized = path.expanduser()
+        if normalized == target_ini_path:
+            return
+        if normalized not in candidates:
+            candidates.append(normalized)
+
+    root = _config_root_dir()
+    _add(root / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
+    _add(root / APP_SETTINGS_ORG / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
+
     app_cfg = str(QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation) or "").strip()
     if app_cfg:
-        app_cfg_path = Path(app_cfg)
-        tail = [part.lower() for part in app_cfg_path.parts[-3:]]
-        if APP_SETTINGS_APP.lower() not in tail:
-            return app_cfg_path / APP_SETTINGS_ORG / APP_SETTINGS_APP
-        return app_cfg_path
-    xdg_cfg = str(os.getenv("XDG_CONFIG_HOME", "") or "").strip()
-    if xdg_cfg:
-        return Path(xdg_cfg).expanduser() / APP_SETTINGS_APP
-    return Path.home() / ".config" / APP_SETTINGS_APP
+        app_cfg_path = Path(app_cfg).expanduser()
+        _add(app_cfg_path / APP_SETTINGS_FILE_NAME)
+        _add(app_cfg_path / APP_SETTINGS_ORG / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
 
-
-def _copy_settings_if_missing(src: QSettings, dst: QSettings) -> int:
-    copied = 0
-    for key in src.allKeys():
-        if dst.contains(key):
+    process_name = str(Path(str(sys.argv[0] or "")).stem or "").strip()
+    for name in (process_name, "python3", "python", "pythonw"):
+        if not name:
             continue
-        dst.setValue(key, src.value(key))
+        _add(root / name / APP_SETTINGS_ORG / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
+        _add(root / name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
+    return candidates
+
+
+def _copy_settings_if_missing(src: object, dst: object) -> int:
+    copied = 0
+    all_keys = getattr(src, "allKeys", None)
+    src_value = getattr(src, "value", None)
+    dst_contains = getattr(dst, "contains", None)
+    dst_set = getattr(dst, "setValue", None)
+    if not callable(all_keys) or not callable(src_value) or not callable(dst_contains) or not callable(dst_set):
+        return 0
+    for key in all_keys():
+        if dst_contains(key):
+            continue
+        dst_set(key, src_value(key))
         copied += 1
     return copied
 
 
-def _sync_settings(settings: QSettings) -> None:
+def _sync_settings(settings: object) -> None:
     try:
-        settings.sync()
-        status = settings.status()
+        sync = getattr(settings, "sync", None)
+        if callable(sync):
+            sync()
+        status_getter = getattr(settings, "status", None)
+        status = status_getter() if callable(status_getter) else QSettings.Status.NoError
         if status != QSettings.Status.NoError:
-            logger.warning("QSettings sync status=%s file=%s", int(status), settings.fileName())
+            file_name_getter = getattr(settings, "fileName", None)
+            file_name = file_name_getter() if callable(file_name_getter) else ""
+            logger.warning("QSettings sync status=%s file=%s", int(status), file_name)
     except Exception as exc:  # noqa: BLE001
         logger.warning("QSettings sync failed: %s", exc)
 
 
-def _create_app_settings() -> QSettings:
-    """Create QSettings backed by a deterministic INI file (cross-platform friendly)."""
+def _create_app_settings() -> SettingsAdapter:
+    """Create SQLite-backed settings storage with best-effort legacy import."""
     settings_dir = _resolve_settings_dir()
     try:
         settings_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+    storage = AppStorage(settings_dir)
+    settings = SettingsAdapter(storage)
     ini_path = settings_dir / APP_SETTINGS_FILE_NAME
-    settings = QSettings(str(ini_path), QSettings.IniFormat)
-
-    # One-time best-effort migration from legacy native backend keys.
-    try:
-        if not settings.allKeys():
+    if not bool(storage.state.get("legacy/settings/imported", False, type_hint=bool)):
+        copied_total = 0
+        try:
             legacy = QSettings(APP_SETTINGS_ORG, APP_SETTINGS_APP)
-            same_store = False
-            try:
-                same_store = bool(legacy.fileName()) and (legacy.fileName() == settings.fileName())
-            except Exception:
-                same_store = False
-            if not same_store:
-                copied = _copy_settings_if_missing(legacy, settings)
-                if copied > 0:
-                    settings.setValue("__meta/legacyMigrated", True)
-                    _sync_settings(settings)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Settings migration skipped: %s", exc)
+            copied = settings.import_from_source(legacy)
+            if copied > 0:
+                copied_total += copied
+                settings.setValue("__meta/legacyMigrated", True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Settings migration skipped: %s", exc)
+        try:
+            for candidate in _legacy_settings_ini_candidates(ini_path.resolve()):
+                if not candidate.exists():
+                    continue
+                source = QSettings(str(candidate), QSettings.IniFormat)
+                copied = settings.import_from_source(source)
+                if copied <= 0:
+                    continue
+                copied_total += copied
+                settings.setValue("__meta/legacyIniMigratedFrom", str(candidate))
+            if copied_total > 0:
+                settings.setValue("__meta/legacyIniMigrated", True)
+                settings.setValue("__meta/legacyIniMigratedCount", int(copied_total))
+                _sync_settings(settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Legacy INI migration skipped: %s", exc)
+        storage.state.set("legacy/settings/imported", True)
+    try:
+        settings.setValue("__meta/storageBackend", "sqlite")
+    except Exception:
+        pass
     return settings
 
 
@@ -4068,6 +4133,7 @@ class SeestarSessionPlanDialog(QDialog):
         super().__init__(parent)
         self._planner = parent
         self._settings = parent.settings
+        self._storage = getattr(parent, "app_storage", None)
         self._builtin_session_templates = builtin_seestar_session_templates()
         self._user_session_templates = self._load_user_session_templates()
         self._current_settings_template = self._load_current_settings_template()
@@ -4579,17 +4645,49 @@ class SeestarSessionPlanDialog(QDialog):
         QTimer.singleShot(0, self._adjust_session_splitter_sizes)
 
     def _load_user_session_templates(self) -> dict[str, SeestarSessionTemplate]:
+        storage = getattr(self, "_storage", None)
+        if storage is not None:
+            try:
+                stored_items = storage.session_templates.list_all()
+                if stored_items:
+                    templates: dict[str, SeestarSessionTemplate] = {}
+                    for item in stored_items:
+                        try:
+                            template = SeestarSessionTemplate.model_validate(item)
+                        except Exception:
+                            continue
+                        templates[str(template.key)] = template
+                    if templates:
+                        return templates
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to load session templates from storage: %s", exc)
+
         raw_templates = self._settings.value("general/seestarSessionUserTemplates", "", type=str)
         templates = load_user_seestar_session_templates(raw_templates)
         if templates or str(raw_templates or "").strip():
+            if templates and storage is not None:
+                try:
+                    storage.session_templates.replace_all(
+                        [template.model_dump(mode="json") for template in templates.values()]
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to migrate session templates into storage: %s", exc)
             return templates
         legacy_raw = self._settings.value("general/seestarCampaignUserPresets", "", type=str)
         migrated = load_user_seestar_session_templates(legacy_raw)
         if migrated:
-            self._settings.setValue(
-                "general/seestarSessionUserTemplates",
-                dump_user_seestar_session_templates(migrated),
-            )
+            if storage is not None:
+                try:
+                    storage.session_templates.replace_all(
+                        [template.model_dump(mode="json") for template in migrated.values()]
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to migrate legacy session templates into storage: %s", exc)
+            else:
+                self._settings.setValue(
+                    "general/seestarSessionUserTemplates",
+                    dump_user_seestar_session_templates(migrated),
+                )
         return migrated
 
     def _load_current_settings_template(self) -> SeestarSessionTemplate:
@@ -5416,7 +5514,17 @@ class SeestarSessionPlanDialog(QDialog):
         current_template = self._current_template_from_fields()
         s.setValue("general/seestarMethod", self.method())
         s.setValue("general/seestarSessionTemplateKey", selected_template_key)
-        s.setValue("general/seestarSessionUserTemplates", dump_user_seestar_session_templates(self._user_session_templates))
+        storage = getattr(self, "_storage", None)
+        if storage is not None:
+            try:
+                storage.session_templates.replace_all(
+                    [template.model_dump(mode="json") for template in self._user_session_templates.values()]
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to save session templates to storage, falling back to settings: %s", exc)
+                s.setValue("general/seestarSessionUserTemplates", dump_user_seestar_session_templates(self._user_session_templates))
+        else:
+            s.setValue("general/seestarSessionUserTemplates", dump_user_seestar_session_templates(self._user_session_templates))
         if not selected_template_key:
             s.setValue("general/seestarSessionRepeatCount", max(1, int(self.seestar_session_repeat_spin.value())))
             s.setValue("general/seestarSessionMinutesPerRun", max(1, int(self.seestar_session_minutes_spin.value())))
@@ -5516,6 +5624,7 @@ class WeatherLiveWorker(QThread):
         force_refresh: bool = False,
         include_cloud_map: bool = True,
         include_satellite: bool = True,
+        storage: AppStorage | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -5529,6 +5638,7 @@ class WeatherLiveWorker(QThread):
         self.force_refresh = bool(force_refresh)
         self.include_cloud_map = bool(include_cloud_map)
         self.include_satellite = bool(include_satellite)
+        self.storage = storage
 
     @staticmethod
     def _http_get_text(url: str, timeout_s: float = 20.0) -> str:
@@ -5620,24 +5730,33 @@ class WeatherLiveWorker(QThread):
                 out[name] = data
         return out
 
-    @staticmethod
-    def _cache_get(cache_key: str, ttl_s: float) -> Optional[dict[str, object]]:
+    def _cache_get(self, cache_key: str, ttl_s: float) -> Optional[dict[str, object]]:
         now = perf_counter()
         with WeatherLiveWorker._CACHE_LOCK:
             bucket = WeatherLiveWorker._CACHE.get(str(cache_key))
-        if not isinstance(bucket, tuple) or len(bucket) != 2:
+        if isinstance(bucket, tuple) and len(bucket) == 2:
+            stamp, payload = bucket
+            if now - float(stamp) <= float(ttl_s) and isinstance(payload, dict):
+                return copy.deepcopy(payload)
+        storage = getattr(self, "storage", None)
+        if storage is None:
             return None
-        stamp, payload = bucket
-        if now - float(stamp) > float(ttl_s):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        return copy.deepcopy(payload)
+        cached = storage.cache.get_json("weather", str(cache_key))
+        if isinstance(cached, dict):
+            with WeatherLiveWorker._CACHE_LOCK:
+                WeatherLiveWorker._CACHE[str(cache_key)] = (perf_counter(), copy.deepcopy(cached))
+            return copy.deepcopy(cached)
+        return None
 
-    @staticmethod
-    def _cache_set(cache_key: str, payload: dict[str, object]) -> None:
+    def _cache_set(self, cache_key: str, payload: dict[str, object], ttl_s: float | None = None) -> None:
         with WeatherLiveWorker._CACHE_LOCK:
             WeatherLiveWorker._CACHE[str(cache_key)] = (perf_counter(), copy.deepcopy(payload))
+        storage = getattr(self, "storage", None)
+        if storage is not None:
+            try:
+                storage.cache.set_json("weather", str(cache_key), payload, ttl_s=ttl_s)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to persist weather cache %s: %s", cache_key, exc)
 
     def _run_cached(
         self,
@@ -5651,7 +5770,7 @@ class WeatherLiveWorker(QThread):
             if cached is not None:
                 return cached, True
         payload = fetcher()
-        self._cache_set(cache_key, payload)
+        self._cache_set(cache_key, payload, ttl_s=ttl_s)
         return copy.deepcopy(payload), False
 
     @staticmethod
@@ -6997,6 +7116,7 @@ class WeatherDialog(QDialog):
             str(getattr(parent, "_theme_name", DEFAULT_UI_THEME) if parent is not None else DEFAULT_UI_THEME)
         )
         self._dark_enabled = bool(getattr(parent, "_dark_enabled", False))
+        self._storage = getattr(parent, "app_storage", None)
 
         self._site: Optional[Site] = None
         self._obs_name = "-"
@@ -8155,6 +8275,7 @@ class WeatherDialog(QDialog):
             force_refresh=force,
             include_cloud_map=bool(include_cloud_map),
             include_satellite=bool(include_satellite),
+            storage=self._storage,
             parent=self,
         )
         worker.progress.connect(self._on_live_progress)
@@ -15721,6 +15842,15 @@ class MainWindow(QMainWindow):
         return loaded, preset_keys
 
     def _load_custom_observatories(self) -> tuple[dict[str, Site], dict[str, str]]:
+        storage = getattr(self, "app_storage", None)
+        if storage is not None:
+            try:
+                stored_items = storage.observatories.list_all()
+                if stored_items:
+                    return self._parse_custom_observatories_payload({"observatories": stored_items})
+            except Exception as exc:
+                logger.warning("Failed to load observatories from storage: %s", exc)
+
         cfg_path = self._observatories_config_path()
         loaded: dict[str, Site] = {}
         preset_keys: dict[str, str] = {}
@@ -15730,10 +15860,14 @@ class MainWindow(QMainWindow):
                 loaded, preset_keys = self._parse_custom_observatories_payload(payload)
             except Exception as exc:
                 logger.warning("Failed to parse %s: %s", cfg_path, exc)
-
-        # One-time migration from older QSettings location.
         if loaded:
+            if storage is not None:
+                try:
+                    self._save_custom_observatories(loaded, preset_keys=preset_keys)
+                except Exception as exc:
+                    logger.warning("Failed to migrate observatories into storage: %s", exc)
             return loaded, preset_keys
+
         raw = self.settings.value("general/customObservatories", "", type=str)
         if not raw:
             return {}, {}
@@ -15747,7 +15881,7 @@ class MainWindow(QMainWindow):
             preset_keys = migrated_preset_keys
             self._save_custom_observatories(migrated, preset_keys=preset_keys)
             self.settings.remove("general/customObservatories")
-            logger.info("Migrated %d observatories to %s", len(migrated), cfg_path)
+            logger.info("Migrated %d observatories to SQLite storage", len(migrated))
         return loaded, preset_keys
 
     def _save_custom_observatories(
@@ -15785,16 +15919,20 @@ class MainWindow(QMainWindow):
                     "preset_key": preset_key,
                 }
             )
-        cfg_path = self._observatories_config_path()
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 3,
             "observatories": observatory_items,
         }
-        cfg_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        storage = getattr(self, "app_storage", None)
+        if storage is not None:
+            try:
+                storage.observatories.replace_all(observatory_items)
+                return
+            except Exception as exc:
+                logger.warning("Failed to save observatories to storage, falling back to JSON: %s", exc)
+        cfg_path = self._observatories_config_path()
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _refresh_observatory_combo(self, selected_name: Optional[str] = None):
         current = selected_name or self.obs_combo.currentText()
@@ -16036,6 +16174,7 @@ class MainWindow(QMainWindow):
 
         # Persistent user settings
         self.settings = _create_app_settings()
+        self.app_storage = getattr(self.settings, "storage", None)
         logger.info("Using settings file: %s", self.settings.fileName())
         self._migrate_table_settings_schema()
         self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
@@ -21552,11 +21691,21 @@ class MainWindow(QMainWindow):
             target.name.strip().lower(),
             target.source_object_id.strip().lower(),
         ]
+        storage = getattr(self, "app_storage", None)
         primary_key = cache_keys[0]
         if primary_key:
             primary_cached = self._simbad_compact_cache.get(primary_key)
             if primary_cached is not None:
                 return dict(primary_cached)
+            if storage is not None:
+                try:
+                    persisted = storage.cache.get_json("simbad_compact", primary_key)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to read SIMBAD compact cache for '%s': %s", target.name, exc)
+                else:
+                    if isinstance(persisted, dict):
+                        self._simbad_compact_cache[primary_key] = dict(persisted)
+                        return dict(persisted)
         secondary_key = cache_keys[1]
         if secondary_key and secondary_key != primary_key:
             secondary_cached = self._simbad_compact_cache.get(secondary_key)
@@ -21564,6 +21713,16 @@ class MainWindow(QMainWindow):
                 secondary_status = str(secondary_cached.get("_simbad_status", "")).strip().lower()
                 if secondary_status == "matched":
                     return dict(secondary_cached)
+            if storage is not None:
+                try:
+                    persisted = storage.cache.get_json("simbad_compact", secondary_key)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to read SIMBAD compact cache for '%s': %s", target.name, exc)
+                else:
+                    if isinstance(persisted, dict):
+                        self._simbad_compact_cache[secondary_key] = dict(persisted)
+                        if str(persisted.get("_simbad_status", "")).strip().lower() == "matched":
+                            return dict(persisted)
 
         query_candidates: list[str] = []
         for candidate in (target.name, target.source_object_id):
@@ -21604,13 +21763,27 @@ class MainWindow(QMainWindow):
                     match_mode = "coordinates"
         except Exception as exc:  # noqa: BLE001
             logger.warning("SIMBAD compact lookup failed for '%s': %s", target.name, exc)
-            return {"_simbad_status": "lookup_failed"}
+            payload = {"_simbad_status": "lookup_failed"}
+            if storage is not None:
+                for key in cache_keys:
+                    if not key:
+                        continue
+                    try:
+                        storage.cache.set_json("simbad_compact", key, payload, ttl_s=SIMBAD_COMPACT_NEGATIVE_CACHE_TTL_S)
+                    except Exception:
+                        pass
+            return payload
 
         if not _simbad_has_row(result):
             compact_data = {"_simbad_status": "not_found"}
             for key in cache_keys:
                 if key:
                     self._simbad_compact_cache[key] = dict(compact_data)
+                    if storage is not None:
+                        try:
+                            storage.cache.set_json("simbad_compact", key, compact_data, ttl_s=SIMBAD_COMPACT_NEGATIVE_CACHE_TTL_S)
+                        except Exception:
+                            pass
             return compact_data
 
         compact_data = _extract_simbad_compact_measurements(result, row_idx=row_idx)
@@ -21628,6 +21801,11 @@ class MainWindow(QMainWindow):
         for key in (*cache_keys, main_id):
             if key:
                 self._simbad_compact_cache[key] = dict(compact_data)
+                if storage is not None:
+                    try:
+                        storage.cache.set_json("simbad_compact", key, compact_data, ttl_s=SIMBAD_COMPACT_CACHE_TTL_S)
+                    except Exception:
+                        pass
         return compact_data
 
     def _build_compact_target_description(self, target: Target) -> str:
@@ -21746,6 +21924,9 @@ class MainWindow(QMainWindow):
     def _bhtom_token_hash(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+    def _bhtom_storage_cache_key(self, *, token: str, base_url: str) -> str:
+        return f"{str(base_url).strip().rstrip('/')}::{self._bhtom_token_hash(token)}"
+
     def _clone_bhtom_observatory_presets(self, presets: list[dict[str, object]]) -> list[dict[str, object]]:
         cloned: list[dict[str, object]] = []
         for item in presets:
@@ -21758,10 +21939,29 @@ class MainWindow(QMainWindow):
                 {
                     "key": str(item.get("key", "")),
                     "label": str(item.get("label", "")),
+                    "source": str(item.get("source", "bhtom") or "bhtom"),
                     "site": Site(**site.model_dump()),
                 }
             )
         return cloned
+
+    def _serialize_bhtom_observatory_presets(self, presets: list[dict[str, object]]) -> list[dict[str, object]]:
+        serializable: list[dict[str, object]] = []
+        for item in presets:
+            if not isinstance(item, dict):
+                continue
+            site = item.get("site")
+            if not isinstance(site, Site):
+                continue
+            serializable.append(
+                {
+                    "key": str(item.get("key", "")),
+                    "label": str(item.get("label", "")),
+                    "source": str(item.get("source", "bhtom") or "bhtom"),
+                    "site": site.model_dump(mode="json"),
+                }
+            )
+        return serializable
 
     def _deserialize_bhtom_observatory_presets(self, payload: object) -> list[dict[str, object]]:
         if not isinstance(payload, list):
@@ -21779,8 +21979,50 @@ class MainWindow(QMainWindow):
                 site = Site(**site_payload)
             except Exception:
                 continue
-            parsed.append({"key": key, "label": label, "site": site})
+            parsed.append({"key": key, "label": label, "source": str(item.get("source", "bhtom") or "bhtom"), "site": site})
         return parsed
+
+    def _serialize_bhtom_candidates(self, candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+        serializable: list[dict[str, object]] = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("target")
+            if not isinstance(target, Target):
+                continue
+            serializable.append(
+                {
+                    "target": target.model_dump(mode="json"),
+                    "importance": float(item.get("importance", 0.0) or 0.0),
+                    "bhtom_priority": int(item.get("bhtom_priority", 0) or 0),
+                    "sun_separation": _safe_float(item.get("sun_separation")),
+                }
+            )
+        return serializable
+
+    def _deserialize_bhtom_candidates(self, payload: object) -> list[dict[str, object]]:
+        if not isinstance(payload, list):
+            return []
+        candidates: list[dict[str, object]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            target_payload = item.get("target")
+            if not isinstance(target_payload, dict):
+                continue
+            try:
+                target = Target(**target_payload)
+            except Exception:
+                continue
+            candidates.append(
+                {
+                    "target": target,
+                    "importance": float(item.get("importance", 0.0) or 0.0),
+                    "bhtom_priority": int(item.get("bhtom_priority", 0) or 0),
+                    "sun_separation": _safe_float(item.get("sun_separation")),
+                }
+            )
+        return candidates
 
     def _load_bhtom_observatory_disk_cache(
         self,
@@ -21788,6 +22030,17 @@ class MainWindow(QMainWindow):
         token: str,
         base_url: str,
     ) -> Optional[list[dict[str, object]]]:
+        storage = getattr(self, "app_storage", None)
+        cache_key = self._bhtom_storage_cache_key(token=token, base_url=base_url)
+        if storage is not None:
+            try:
+                cached = storage.cache.get_json("bhtom_observatory_presets", cache_key)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to read BHTOM observatory cache from storage: %s", exc)
+            else:
+                presets = self._deserialize_bhtom_observatory_presets(cached)
+                if presets:
+                    return presets
         cache_path = self._bhtom_observatory_cache_path()
         if not cache_path.exists():
             return None
@@ -21812,6 +22065,16 @@ class MainWindow(QMainWindow):
         presets = self._deserialize_bhtom_observatory_presets(payload.get("presets"))
         if not presets:
             return None
+        if storage is not None:
+            try:
+                storage.cache.set_json(
+                    "bhtom_observatory_presets",
+                    cache_key,
+                    self._serialize_bhtom_observatory_presets(presets),
+                    ttl_s=BHTOM_OBSERVATORY_CACHE_TTL_S,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to migrate BHTOM observatory cache into storage: %s", exc)
         return presets
 
     def _save_bhtom_observatory_disk_cache(
@@ -21821,21 +22084,18 @@ class MainWindow(QMainWindow):
         token: str,
         base_url: str,
     ) -> None:
-        serializable: list[dict[str, object]] = []
-        for item in presets:
-            if not isinstance(item, dict):
-                continue
-            site = item.get("site")
-            if not isinstance(site, Site):
-                continue
-            serializable.append(
-                {
-                    "key": str(item.get("key", "")),
-                    "label": str(item.get("label", "")),
-                    "site": site.model_dump(),
-                }
-            )
+        serializable = self._serialize_bhtom_observatory_presets(presets)
         if not serializable:
+            return
+        storage = getattr(self, "app_storage", None)
+        cache_key = self._bhtom_storage_cache_key(token=token, base_url=base_url)
+        if storage is not None:
+            storage.cache.set_json(
+                "bhtom_observatory_presets",
+                cache_key,
+                serializable,
+                ttl_s=BHTOM_OBSERVATORY_CACHE_TTL_S,
+            )
             return
         payload = {
             "version": 1,
@@ -22072,6 +22332,22 @@ class MainWindow(QMainWindow):
             and cache_age < BHTOM_SUGGESTION_CACHE_TTL_S
         ):
             return list(self._bhtom_candidate_cache)
+        storage = getattr(self, "app_storage", None)
+        if storage is not None:
+            try:
+                persisted = storage.cache.get_json(
+                    "bhtom_candidates",
+                    self._bhtom_storage_cache_key(token=resolved_token, base_url=resolved_base_url),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to read BHTOM candidate cache from storage: %s", exc)
+            else:
+                candidates = self._deserialize_bhtom_candidates(persisted)
+                if candidates:
+                    self._bhtom_candidate_cache_key = cache_key
+                    self._bhtom_candidate_cache = list(candidates)
+                    self._bhtom_candidate_cache_loaded_at = perf_counter()
+                    return list(candidates)
         return None
 
     def _fetch_bhtom_target_candidates(self) -> list[dict[str, object]]:
@@ -22116,6 +22392,17 @@ class MainWindow(QMainWindow):
         self._bhtom_candidate_cache_key = cache_key
         self._bhtom_candidate_cache = list(candidates)
         self._bhtom_candidate_cache_loaded_at = perf_counter()
+        storage = getattr(self, "app_storage", None)
+        if storage is not None:
+            try:
+                storage.cache.set_json(
+                    "bhtom_candidates",
+                    self._bhtom_storage_cache_key(token=token, base_url=base_url),
+                    self._serialize_bhtom_candidates(candidates),
+                    ttl_s=BHTOM_SUGGESTION_CACHE_TTL_S,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to persist BHTOM candidates: %s", exc)
         return list(candidates)
 
     def _bhtom_type_for_target(self, target: Target) -> str:
@@ -22334,6 +22621,17 @@ class MainWindow(QMainWindow):
             self._bhtom_candidate_cache_key = cache_key
             self._bhtom_candidate_cache = list(raw_candidates)
             self._bhtom_candidate_cache_loaded_at = perf_counter()
+            storage = getattr(self, "app_storage", None)
+            if storage is not None:
+                try:
+                    storage.cache.set_json(
+                        "bhtom_candidates",
+                        self._bhtom_storage_cache_key(token=cache_key[1], base_url=cache_key[0]),
+                        self._serialize_bhtom_candidates(raw_candidates),
+                        ttl_s=BHTOM_SUGGESTION_CACHE_TTL_S,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to persist BHTOM candidates from worker: %s", exc)
         self._bhtom_ranked_suggestions_cache = list(suggestions)
 
         if mode == "suggest":
