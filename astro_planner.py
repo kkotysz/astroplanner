@@ -3305,8 +3305,27 @@ class TableSettingsDialog(QDialog):
         s.setValue("table/fontSize", self.font_spin.value())
         s.setValue("table/colorMode", _normalize_table_color_mode(self.color_mode_combo.currentData(), default="background"))
         s.setValue("table/colorModeExplicit", True)
+        selected_columns: set[int] = set()
         for idx, chk in self.col_checks.items():
             s.setValue(f"table/col{idx}", chk.isChecked())
+            if chk.isChecked():
+                selected_columns.add(idx)
+        observation_columns = {
+            TargetTableModel.COL_ORDER,
+            TargetTableModel.COL_NAME,
+            TargetTableModel.COL_ALT,
+            TargetTableModel.COL_AZ,
+            TargetTableModel.COL_MOON_SEP,
+            TargetTableModel.COL_SCORE,
+            TargetTableModel.COL_HOURS,
+            TargetTableModel.COL_MAG,
+            TargetTableModel.COL_PRIORITY,
+            TargetTableModel.COL_OBSERVED,
+        }
+        s.setValue(
+            "table/viewPreset",
+            "observation" if selected_columns == observation_columns else "full",
+        )
         for key in ("below","limit","above"):
             s.setValue(f"table/color/{key}", self.selected_colors.get(key))
         # Save default sort column
@@ -17952,7 +17971,7 @@ class MainWindow(QMainWindow):
         preset_group.setExclusive(True)
         preset_group.addAction(self.view_obs_preset_act)
         preset_group.addAction(self.view_full_preset_act)
-        current_preset = self.settings.value("table/viewPreset", "observation", type=str)
+        current_preset = self.settings.value("table/viewPreset", "full", type=str)
         if current_preset == "full":
             self.view_full_preset_act.setChecked(True)
         else:
@@ -18184,7 +18203,7 @@ class MainWindow(QMainWindow):
         )
         self.table_model.color_mode = table_color_mode
         self.table_view.setProperty("table_color_mode", table_color_mode)
-        self._apply_column_preset(self.settings.value("table/viewPreset", "observation", type=str), save=False)
+        self._apply_column_preset(self.settings.value("table/viewPreset", "full", type=str), save=False)
         self.table_view.doItemsLayout()
         self.table_view.viewport().update()
         self.table_view.horizontalHeader().viewport().update()
@@ -18192,10 +18211,9 @@ class MainWindow(QMainWindow):
         self.table_view.viewport().update()
         self._schedule_table_column_width_refresh(reset_widths=True)
 
-    def _apply_column_preset(self, preset: str, save: bool = True):
-        if preset not in {"observation", "full"}:
-            preset = "observation"
-        obs_visible = {
+    @staticmethod
+    def _observation_visible_columns() -> set[int]:
+        return {
             TargetTableModel.COL_ORDER,
             TargetTableModel.COL_NAME,
             TargetTableModel.COL_ALT,
@@ -18207,6 +18225,26 @@ class MainWindow(QMainWindow):
             TargetTableModel.COL_PRIORITY,
             TargetTableModel.COL_OBSERVED,
         }
+
+    def _table_matches_observation_preset(self) -> bool:
+        if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
+            return False
+        obs_visible = self._observation_visible_columns()
+        for col in range(self.table_model.columnCount()):
+            hidden = bool(self.table_view.isColumnHidden(col))
+            if col == TargetTableModel.COL_ACTIONS:
+                if not hidden:
+                    return False
+                continue
+            should_be_hidden = col not in obs_visible
+            if hidden != should_be_hidden:
+                return False
+        return True
+
+    def _apply_column_preset(self, preset: str, save: bool = True):
+        if preset not in {"observation", "full"}:
+            preset = "full"
+        obs_visible = self._observation_visible_columns()
         for col in range(self.table_model.columnCount()):
             if col == TargetTableModel.COL_ACTIONS:
                 self.table_view.setColumnHidden(col, True)
@@ -19210,7 +19248,7 @@ class MainWindow(QMainWindow):
             "min_score": float(self.min_score_spin.value()) if hasattr(self, "min_score_spin") else 0.0,
             "hide_observed": bool(self.hide_observed_chk.isChecked()) if hasattr(self, "hide_observed_chk") else False,
             "selected_target_name": str(selected.name if isinstance(selected, Target) else ""),
-            "view_preset": "full" if hasattr(self, "view_full_preset_act") and self.view_full_preset_act.isChecked() else "observation",
+            "view_preset": "observation" if self._table_matches_observation_preset() else "full",
             "default_sort_column": int(default_sort_column),
         }
 
@@ -19580,7 +19618,8 @@ class MainWindow(QMainWindow):
         self.table_model.reset_targets(loaded_targets)
         self._recompute_recommended_order_cache()
         self._apply_table_settings()
-        preset = str(snapshot.get("view_preset", "observation") or "observation")
+        default_preset = str(self.settings.value("table/viewPreset", "full", type=str) or "full")
+        preset = str(snapshot.get("view_preset", default_preset) or default_preset)
         self._apply_column_preset(preset, save=False)
         sort_col_raw = snapshot.get("default_sort_column", TargetTableModel.COL_SCORE)
         try:
