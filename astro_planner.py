@@ -269,6 +269,9 @@ DEFAULT_LIMITING_MAGNITUDE = 19.0
 QUICK_TARGETS_DEFAULT_COUNT = 10
 QUICK_TARGETS_MIN_COUNT = 1
 QUICK_TARGETS_MAX_COUNT = 50
+VISIBILITY_AIRMASS_Y_MIN = 0.9
+VISIBILITY_AIRMASS_Y_MAX = 2.1
+VISIBILITY_AIRMASS_Y_TICKS = [0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.7, 1.9, 2.1]
 
 
 @dataclass(frozen=True)
@@ -1678,6 +1681,16 @@ def _build_button_icon_pixmap(kind: str, fg: QColor, accent: QColor, accent_seco
     def ellipse(x: float, y: float, w: float, h: float) -> None:
         painter.drawEllipse(int(round(x)), int(round(y)), int(round(w)), int(round(h)))
 
+    def arc(x: float, y: float, w: float, h: float, start_deg: float, span_deg: float) -> None:
+        painter.drawArc(
+            int(round(x)),
+            int(round(y)),
+            int(round(w)),
+            int(round(h)),
+            int(round(start_deg * 16)),
+            int(round(span_deg * 16)),
+        )
+
     def dot(x: float, y: float, r: float = 1.7) -> None:
         painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
@@ -1754,6 +1767,78 @@ def _build_button_icon_pixmap(kind: str, fg: QColor, accent: QColor, accent_seco
         painter.drawArc(int(round(m)), int(round(m)), int(round(s - 2 * m)), int(round(s - 2 * m)), int(25 * 16), int(280 * 16))
         line(s * 0.72, s * 0.18, s * 0.82, s * 0.18)
         line(s * 0.82, s * 0.18, s * 0.82, s * 0.30)
+    elif kind in {"clock", "localtime"}:
+        ellipse(s * 0.18, s * 0.18, s * 0.64, s * 0.64)
+        line(s * 0.50, s * 0.50, s * 0.50, s * 0.30)
+        line(s * 0.50, s * 0.50, s * 0.66, s * 0.58)
+        dot(s * 0.74, s * 0.24)
+    elif kind in {"utc", "globe"}:
+        ellipse(s * 0.18, s * 0.18, s * 0.64, s * 0.64)
+        arc(s * 0.18, s * 0.18, s * 0.64, s * 0.64, 0, 180)
+        arc(s * 0.18, s * 0.18, s * 0.64, s * 0.64, 180, 180)
+        line(s * 0.50, s * 0.20, s * 0.50, s * 0.80)
+        arc(s * 0.30, s * 0.18, s * 0.40, s * 0.64, 90, 180)
+        arc(s * 0.30, s * 0.18, s * 0.40, s * 0.64, 270, 180)
+    elif kind in {"sidereal", "star"}:
+        line(s * 0.50, m, s * 0.50, s - m)
+        line(m, s * 0.50, s - m, s * 0.50)
+        line(s * 0.26, s * 0.26, s * 0.74, s * 0.74)
+        line(s * 0.74, s * 0.26, s * 0.26, s * 0.74)
+        dot(s * 0.78, s * 0.24)
+    elif kind in {"sun", "sun_alt"}:
+        ellipse(s * 0.31, s * 0.31, s * 0.38, s * 0.38)
+        line(s * 0.50, m, s * 0.50, s * 0.20)
+        line(s * 0.50, s * 0.80, s * 0.50, s - m)
+        line(m, s * 0.50, s * 0.20, s * 0.50)
+        line(s * 0.80, s * 0.50, s - m, s * 0.50)
+        line(s * 0.25, s * 0.25, s * 0.34, s * 0.34)
+        line(s * 0.66, s * 0.66, s * 0.75, s * 0.75)
+        line(s * 0.66, s * 0.34, s * 0.75, s * 0.25)
+        line(s * 0.25, s * 0.75, s * 0.34, s * 0.66)
+    elif kind in {"moon", "moon_alt"}:
+        arc(s * 0.18, s * 0.16, s * 0.52, s * 0.68, 58, 244)
+        arc(s * 0.34, s * 0.16, s * 0.36, s * 0.68, 110, 140)
+        dot(s * 0.78, s * 0.28)
+    elif kind in {"sunrise"}:
+        line(m, s * 0.70, s - m, s * 0.70)
+        arc(s * 0.28, s * 0.40, s * 0.44, s * 0.44, 0, 180)
+        line(s * 0.50, s * 0.18, s * 0.50, s * 0.34)
+        line(s * 0.34, s * 0.30, s * 0.40, s * 0.38)
+        line(s * 0.66, s * 0.30, s * 0.60, s * 0.38)
+    elif kind in {"sunset"}:
+        line(m, s * 0.70, s - m, s * 0.70)
+        arc(s * 0.28, s * 0.48, s * 0.44, s * 0.40, 180, 180)
+        line(s * 0.50, s * 0.22, s * 0.50, s * 0.38)
+        line(s * 0.50, s * 0.38, s * 0.42, s * 0.30)
+        line(s * 0.50, s * 0.38, s * 0.58, s * 0.30)
+    elif kind in {"moonphase", "phase"}:
+        ellipse(s * 0.22, s * 0.18, s * 0.56, s * 0.56)
+        arc(s * 0.34, s * 0.18, s * 0.34, s * 0.56, 90, 180)
+        dot(s * 0.76, s * 0.26)
+    elif kind in {"moonrise"}:
+        arc(s * 0.18, s * 0.18, s * 0.52, s * 0.64, 58, 244)
+        arc(s * 0.34, s * 0.18, s * 0.36, s * 0.64, 110, 140)
+        line(s * 0.72, s * 0.74, s * 0.72, s * 0.36)
+        line(s * 0.72, s * 0.36, s * 0.64, s * 0.44)
+        line(s * 0.72, s * 0.36, s * 0.80, s * 0.44)
+    elif kind in {"moonset"}:
+        arc(s * 0.18, s * 0.18, s * 0.52, s * 0.64, 58, 244)
+        arc(s * 0.34, s * 0.18, s * 0.36, s * 0.64, 110, 140)
+        line(s * 0.72, s * 0.30, s * 0.72, s * 0.68)
+        line(s * 0.72, s * 0.68, s * 0.64, s * 0.60)
+        line(s * 0.72, s * 0.68, s * 0.80, s * 0.60)
+    elif kind in {"window", "best_window"}:
+        line(s * 0.24, s * 0.28, s * 0.24, s * 0.72)
+        line(s * 0.76, s * 0.28, s * 0.76, s * 0.72)
+        line(s * 0.24, s * 0.28, s * 0.76, s * 0.28)
+        line(s * 0.24, s * 0.72, s * 0.76, s * 0.72)
+        line(s * 0.50, s * 0.34, s * 0.50, s * 0.50)
+        line(s * 0.50, s * 0.50, s * 0.62, s * 0.58)
+    elif kind in {"notes", "note"}:
+        painter.drawRoundedRect(int(round(s * 0.24)), int(round(s * 0.18)), int(round(s * 0.50)), int(round(s * 0.62)), 3, 3)
+        line(s * 0.34, s * 0.36, s * 0.64, s * 0.36)
+        line(s * 0.34, s * 0.50, s * 0.64, s * 0.50)
+        line(s * 0.34, s * 0.64, s * 0.56, s * 0.64)
     elif kind in {"link", "open-link"}:
         line(s * 0.28, s * 0.72, s * 0.72, s * 0.28)
         line(s * 0.50, s * 0.28, s * 0.72, s * 0.28)
@@ -1798,6 +1883,17 @@ def _refresh_button_icons(root: Optional[QWidget]) -> None:
         return
     widgets = [root, *root.findChildren(QWidget)]
     for widget in widgets:
+        if isinstance(widget, QLabel):
+            kind = widget.property("detail_icon_kind")
+            if kind:
+                size = int(widget.property("detail_icon_size") or 16)
+                fg = _theme_qcolor_from_widget(widget, "section_title", "#eef4fc")
+                accent = _theme_qcolor_from_widget(widget, "accent_primary", "#59f3ff")
+                accent_secondary = _theme_qcolor_from_widget(widget, "accent_secondary", "#ff4da6")
+                widget.setPixmap(_build_button_icon_pixmap(str(kind), fg, accent, accent_secondary, size))
+                widget.setFixedSize(size, size)
+                widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                continue
         if not hasattr(widget, "property") or not hasattr(widget, "setIcon"):
             continue
         kind = widget.property("icon_kind")
@@ -1883,6 +1979,19 @@ def _refresh_button_hover_glow(root: Optional[QWidget]) -> None:
             widget.installEventFilter(_BUTTON_HOVER_GLOW_FILTER)
             widget.setProperty("_hover_glow_installed", True)
         _apply_button_hover_glow(widget, widget.isEnabled() and widget.underMouse())
+
+
+def _set_detail_icon_kind(label: Optional[QLabel], kind: str, size: int = 16) -> None:
+    if label is None:
+        return
+    label.setProperty("detail_icon_kind", str(kind))
+    label.setProperty("detail_icon_size", int(size))
+    fg = _theme_qcolor_from_widget(label, "section_title", "#eef4fc")
+    accent = _theme_qcolor_from_widget(label, "accent_primary", "#59f3ff")
+    accent_secondary = _theme_qcolor_from_widget(label, "accent_secondary", "#ff4da6")
+    label.setPixmap(_build_button_icon_pixmap(kind, fg, accent, accent_secondary, size))
+    label.setFixedSize(size, size)
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
 
 _LEGACY_TABLE_HIGHLIGHT_DEFAULTS = {
@@ -6952,6 +7061,11 @@ class WeatherDialog(QDialog):
             lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
             lbl.setTextFormat(Qt.RichText)
             summary_l.addWidget(lbl, 0)
+        self.live_temp_label.setProperty("weather_chip_series", "temp")
+        self.live_wind_label.setProperty("weather_chip_series", "wind")
+        self.live_cloud_label.setProperty("weather_chip_series", "cloud")
+        self.live_rh_label.setProperty("weather_chip_series", "humidity")
+        self.live_pressure_label.setProperty("weather_chip_series", "pressure")
         summary_l.addWidget(self.moon_phase_info_bar, 0)
         summary_l.addStretch(1)
         root.addWidget(summary_row)
@@ -12909,16 +13023,10 @@ class MainWindow(QMainWindow):
             self.ax_alt.set_yticks([0, 15, 30, 45, 60, 75, 90])
             return
 
-        limit_airmass = self._plot_limit_value()
-        max_airmass = max(3.0, min(8.0, float(math.ceil(limit_airmass + 1.0))))
-        ticks = [1.0, 1.1, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0]
-        visible_ticks = [tick for tick in ticks if tick <= max_airmass]
-        if not visible_ticks or visible_ticks[0] != 1.0:
-            visible_ticks.insert(0, 1.0)
         self.ax_alt.set_ylabel("Airmass")
-        self.ax_alt.set_ylim(max_airmass, 1.0)
-        self.ax_alt.set_yticks(visible_ticks)
-        self.ax_alt.set_yticklabels([f"{tick:.1f}" for tick in visible_ticks])
+        self.ax_alt.set_ylim(VISIBILITY_AIRMASS_Y_MAX, VISIBILITY_AIRMASS_Y_MIN)
+        self.ax_alt.set_yticks(VISIBILITY_AIRMASS_Y_TICKS)
+        self.ax_alt.set_yticklabels([f"{tick:.1f}" for tick in VISIBILITY_AIRMASS_Y_TICKS])
 
     def _update_plot_mode_label_metrics(self) -> None:
         if not hasattr(self, "plot_mode_alt_label") or not hasattr(self, "plot_mode_airmass_label"):
@@ -13476,17 +13584,11 @@ class MainWindow(QMainWindow):
                 color=plot_text,
             )
         else:
-            limit_airmass = self._plot_limit_value()
-            max_airmass = max(3.0, min(8.0, float(math.ceil(limit_airmass + 1.0))))
-            ticks = [1.0, 1.1, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0]
-            visible_ticks = [tick for tick in ticks if tick <= max_airmass]
-            if not visible_ticks or visible_ticks[0] != 1.0:
-                visible_ticks.insert(0, 1.0)
             fig.update_yaxes(
                 title_text="Airmass",
-                range=[max_airmass, 1.0],
-                tickvals=visible_ticks,
-                ticktext=[f"{tick:.1f}" for tick in visible_ticks],
+                range=[VISIBILITY_AIRMASS_Y_MAX, VISIBILITY_AIRMASS_Y_MIN],
+                tickvals=VISIBILITY_AIRMASS_Y_TICKS,
+                ticktext=[f"{tick:.1f}" for tick in VISIBILITY_AIRMASS_Y_TICKS],
                 showgrid=True,
                 gridcolor=grid_css,
                 zerolinecolor=grid_css,
@@ -16663,32 +16765,41 @@ class MainWindow(QMainWindow):
         details_layout.addWidget(self.sel_notes_label)
         details_row.setLayout(details_layout)
 
-        def _add_info_row(form: QFormLayout, row_idx: int, title: str, value_widget: QWidget):
-            title_label = QLabel(title)
+        def _add_info_row(form: QFormLayout, row_idx: int, icon_kind: str, title: str, value_widget: QWidget):
+            title_widget = QWidget()
+            title_layout = QHBoxLayout(title_widget)
+            title_layout.setContentsMargins(0, 0, 0, 0)
+            title_layout.setSpacing(7)
+            icon_label = QLabel(title_widget)
+            _set_detail_icon_kind(icon_label, icon_kind, 16)
+            title_label = QLabel(title, title_widget)
             title_label.setFont(self.info_label_font)
             title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            title_layout.addWidget(icon_label, 0, Qt.AlignVCenter)
+            title_layout.addWidget(title_label, 0, Qt.AlignVCenter)
+            title_layout.addStretch(1)
             if isinstance(value_widget, QLabel):
                 value_widget.setFont(self.info_value_font)
                 value_widget.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            form.insertRow(row_idx, title_label, value_widget)
+            form.insertRow(row_idx, title_widget, value_widget)
             return title_label
 
-        _add_info_row(left_info_form, 0, "🕑 Local time:", self.localtime_label)
-        _add_info_row(left_info_form, 1, "🌐 UTC time:", self.utctime_label)
-        _add_info_row(left_info_form, 2, "⭐ Sidereal time:", self.sidereal_label)
-        _add_info_row(left_info_form, 3, "🌇 Sunset:", self.sunset_label)
-        _add_info_row(left_info_form, 4, "🌅 Sunrise:", self.sunrise_label)
-        _add_info_row(left_info_form, 5, "🌕 Moon phase:", self.moonphase_bar)
-        _add_info_row(left_info_form, 6, "🌙 Moonrise:", self.moonrise_label)
-        _add_info_row(left_info_form, 7, "🌙 Moonset:", self.moonset_label)
+        _add_info_row(left_info_form, 0, "clock", "Local time:", self.localtime_label)
+        _add_info_row(left_info_form, 1, "utc", "UTC time:", self.utctime_label)
+        _add_info_row(left_info_form, 2, "sidereal", "Sidereal time:", self.sidereal_label)
+        _add_info_row(left_info_form, 3, "sunset", "Sunset:", self.sunset_label)
+        _add_info_row(left_info_form, 4, "sunrise", "Sunrise:", self.sunrise_label)
+        _add_info_row(left_info_form, 5, "moonphase", "Moon phase:", self.moonphase_bar)
+        _add_info_row(left_info_form, 6, "moonrise", "Moonrise:", self.moonrise_label)
+        _add_info_row(left_info_form, 7, "moonset", "Moonset:", self.moonset_label)
 
-        _add_info_row(right_info_form, 0, "☀️ Sun altitude:", self.sun_alt_label)
-        _add_info_row(right_info_form, 1, "🌙 Moon altitude:", self.moon_alt_label)
-        _add_info_row(right_info_form, 2, "🎯 Selected target:", self.sel_name_label)
-        self.sel_type_title_label = _add_info_row(right_info_form, 3, "Type / Mag:", self.sel_type_label)
-        _add_info_row(right_info_form, 4, "Score:", self.sel_score_label)
-        _add_info_row(right_info_form, 5, "Best window:", self.sel_window_label)
-        _add_info_row(right_info_form, 6, "Notes:", details_row)
+        _add_info_row(right_info_form, 0, "sun", "Sun altitude:", self.sun_alt_label)
+        _add_info_row(right_info_form, 1, "moon", "Moon altitude:", self.moon_alt_label)
+        _add_info_row(right_info_form, 2, "target", "Selected target:", self.sel_name_label)
+        self.sel_type_title_label = _add_info_row(right_info_form, 3, "describe", "Type / Last Mag:", self.sel_type_label)
+        _add_info_row(right_info_form, 4, "sidereal", "Score:", self.sel_score_label)
+        _add_info_row(right_info_form, 5, "window", "Best window:", self.sel_window_label)
+        _add_info_row(right_info_form, 6, "notes", "Notes:", details_row)
 
         self.info_widget.setContentsMargins(0, 0, 0, 0)
 

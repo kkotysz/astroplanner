@@ -156,6 +156,31 @@ _LIGHT_TEMPLATE = """
         background: %(chip_lunar_bg)s;
         border-color: %(chip_lunar_border)s;
     }
+    QLabel[weather_chip="true"][weather_chip_series="temp"] {
+        background: %(chip_series_temp_bg)s;
+        border-color: %(chip_series_temp_border)s;
+        color: %(chip_series_temp_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="wind"] {
+        background: %(chip_series_wind_bg)s;
+        border-color: %(chip_series_wind_border)s;
+        color: %(chip_series_wind_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="cloud"] {
+        background: %(chip_series_cloud_bg)s;
+        border-color: %(chip_series_cloud_border)s;
+        color: %(chip_series_cloud_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="humidity"] {
+        background: %(chip_series_humidity_bg)s;
+        border-color: %(chip_series_humidity_border)s;
+        color: %(chip_series_humidity_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="pressure"] {
+        background: %(chip_series_pressure_bg)s;
+        border-color: %(chip_series_pressure_border)s;
+        color: %(chip_series_pressure_text)s;
+    }
     *[cutout_page="true"] {
         background: %(tab_pane_bg)s;
     }
@@ -757,6 +782,31 @@ _DARK_TEMPLATE = """
     QLabel[weather_chip="true"][weather_chip_role="lunar"] {
         background: %(chip_lunar_bg)s;
         border-color: %(chip_lunar_border)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="temp"] {
+        background: %(chip_series_temp_bg)s;
+        border-color: %(chip_series_temp_border)s;
+        color: %(chip_series_temp_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="wind"] {
+        background: %(chip_series_wind_bg)s;
+        border-color: %(chip_series_wind_border)s;
+        color: %(chip_series_wind_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="cloud"] {
+        background: %(chip_series_cloud_bg)s;
+        border-color: %(chip_series_cloud_border)s;
+        color: %(chip_series_cloud_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="humidity"] {
+        background: %(chip_series_humidity_bg)s;
+        border-color: %(chip_series_humidity_border)s;
+        color: %(chip_series_humidity_text)s;
+    }
+    QLabel[weather_chip="true"][weather_chip_series="pressure"] {
+        background: %(chip_series_pressure_bg)s;
+        border-color: %(chip_series_pressure_border)s;
+        color: %(chip_series_pressure_text)s;
     }
     *[cutout_page="true"] {
         background: %(tab_pane_bg)s;
@@ -2027,6 +2077,21 @@ def _semantic_tokens(theme_key: str, theme_tokens: Mapping[str, str], dark_enabl
         "chip_solar_border": _rgba(plot_sun, 0.42 if dark_enabled else 0.28),
         "chip_lunar_bg": _rgba(plot_moon, 0.14 if dark_enabled else 0.10),
         "chip_lunar_border": _rgba(plot_moon, 0.34 if dark_enabled else 0.24),
+        "chip_series_temp_bg": _rgba(line_palette[0], 0.15 if dark_enabled else 0.10),
+        "chip_series_temp_border": _rgba(line_palette[0], 0.46 if dark_enabled else 0.28),
+        "chip_series_temp_text": line_palette[0],
+        "chip_series_wind_bg": _rgba(line_palette[1], 0.15 if dark_enabled else 0.10),
+        "chip_series_wind_border": _rgba(line_palette[1], 0.46 if dark_enabled else 0.28),
+        "chip_series_wind_text": line_palette[1],
+        "chip_series_cloud_bg": _rgba(line_palette[2], 0.15 if dark_enabled else 0.10),
+        "chip_series_cloud_border": _rgba(line_palette[2], 0.46 if dark_enabled else 0.28),
+        "chip_series_cloud_text": line_palette[2],
+        "chip_series_humidity_bg": _rgba(line_palette[3], 0.15 if dark_enabled else 0.10),
+        "chip_series_humidity_border": _rgba(line_palette[3], 0.46 if dark_enabled else 0.28),
+        "chip_series_humidity_text": line_palette[3],
+        "chip_series_pressure_bg": _rgba(line_palette[4], 0.15 if dark_enabled else 0.10),
+        "chip_series_pressure_border": _rgba(line_palette[4], 0.46 if dark_enabled else 0.28),
+        "chip_series_pressure_text": line_palette[4],
         "glow_edge": _rgba(accent_primary, 0.72 if dark_enabled else 0.38),
         "loading_bg": str(theme_tokens.get("plot_panel_bg", theme_tokens.get("tab_pane_bg", surface_alt))),
         "loading_border": _rgba(accent_primary, 0.24 if dark_enabled else 0.16),
