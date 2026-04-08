@@ -177,9 +177,14 @@ Set the token in:
 
 ## Observatory Configuration
 
-Observatories are stored in:
+User observatories are stored in the SQLite app database (`app.db`).
 
-- `config/observatories.json`
+AstroPlanner uses SQLite as the only runtime app-storage backend. Legacy `QSettings`
+and `settings.ini` fallbacks are no longer part of the startup path.
+
+The repository ships a read-only seed file for first-run defaults:
+
+- `config/default_observatories.json`
 
 Each observatory entry includes:
 
