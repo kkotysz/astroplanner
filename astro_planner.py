@@ -1558,6 +1558,23 @@ _QT_FALLBACK_FONT_FAMILY: Optional[str] = None
 _MPL_AVAILABLE_FONT_NAMES: Optional[set[str]] = None
 
 
+def _preferred_display_font_family() -> str:
+    """Return enforced display font family used across the app and plots."""
+    return str(_DISPLAY_FONT_QT_FAMILY or "Rajdhani").strip() or "Rajdhani"
+
+
+def _split_font_families(value: object) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    families: list[str] = []
+    for chunk in text.split(","):
+        name = str(chunk or "").strip().strip('"').strip("'").strip()
+        if name:
+            families.append(name)
+    return families
+
+
 def _platform_ui_font_candidates() -> list[str]:
     if sys.platform == "darwin":
         return [".AppleSystemUIFont", "SF Pro Text", "Avenir Next", "Helvetica Neue", "Arial"]
@@ -1631,11 +1648,12 @@ def _embedded_display_font_css() -> str:
 
 
 def _plot_font_css_stack(theme_tokens: Optional[dict[str, str]] = None) -> str:
+    # Enforce Rajdhani-first stack for all web/Plotly charts.
+    fallback_families: list[str] = [_preferred_display_font_family(), "Rajdhani"]
     if theme_tokens:
-        preferred = str(theme_tokens.get("display_font_family", theme_tokens.get("font_family", "")) or "").strip()
-        fallback_families = [preferred] if preferred else []
-    else:
-        fallback_families = []
+        for body_font in _split_font_families(theme_tokens.get("font_family", "")):
+            if body_font and body_font not in fallback_families:
+                fallback_families.append(body_font)
     fallback_families.extend(_platform_ui_font_candidates())
     fallback_families.extend(["Arial", "Helvetica"])
     deduped: list[str] = []
@@ -12982,21 +13000,21 @@ class MainWindow(QMainWindow):
 
     def _apply_styles(self):
         """Apply a custom stylesheet, fonts, and default icon sizes."""
-        display_family = str(
-            getattr(self, "_display_font_family", "") or self._pick_font_family(
-                ["Rajdhani", "SF Pro Display", "Avenir Next", "Inter", "Segoe UI Semibold", "Helvetica Neue", "Arial"]
-            )
-        ).strip()
+        self._ensure_display_font_loaded()
+        display_family = str(getattr(self, "_display_font_family", "") or _preferred_display_font_family()).strip()
         self._display_font_family = display_family
         body_family = display_family
         font_size = _sanitize_ui_font_size(getattr(self, "_ui_font_size", 11))
         app_font = QFont(body_family)
         app_font.setPointSize(font_size)
         QApplication.setFont(app_font)
-        mpl_family = self._pick_matplotlib_font_family(
-            [display_family, body_family, "DejaVu Sans", "Arial", "Helvetica"]
-        )
-        plt.rcParams["font.family"] = [mpl_family, "DejaVu Sans", "Arial", "Helvetica"]
+        plt.rcParams["font.family"] = [
+            _preferred_display_font_family(),
+            "Rajdhani",
+            "DejaVu Sans",
+            "Arial",
+            "Helvetica",
+        ]
         self._theme_name = normalize_theme_key(getattr(self, "_theme_name", DEFAULT_UI_THEME))
         theme_overrides: dict[str, str] = {}
         if getattr(self, "_accent_secondary_override", ""):
@@ -16706,7 +16724,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setObjectName(self.__class__.__name__)
-        fallback_family = _resolved_platform_ui_font_family()
+        self._ensure_display_font_loaded()
+        fallback_family = _preferred_display_font_family()
         if fallback_family not in {"", "Sans Serif"}:
             QFont.insertSubstitution("Sans Serif", fallback_family)
             QFont.insertSubstitution("SF Pro Text", fallback_family)
@@ -16744,9 +16763,7 @@ class MainWindow(QMainWindow):
         self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
         self._ui_font_size = _sanitize_ui_font_size(self.settings.value("general/uiFontSize", 11, type=int))
-        self._display_font_family = self._pick_font_family(
-            ["Rajdhani", "SF Pro Display", "Avenir Next", "Inter", "Segoe UI Semibold", "Helvetica Neue", "Arial"]
-        )
+        self._display_font_family = _preferred_display_font_family()
         startup_font = QFont(self._display_font_family)
         startup_font.setPointSize(self._ui_font_size)
         QApplication.setFont(startup_font)
