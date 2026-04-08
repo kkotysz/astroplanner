@@ -8,34 +8,86 @@ Desktop GUI for planning night observations with `PySide6`, `astroplan`, `astrop
 
 ![Main dashboard](docs/screenshots/dashboard-main.png)
 
+Annotated overlay:
+
+![Main dashboard annotated](docs/screenshots/dashboard-main-overlay.png)
+
+Dashboard overlay legend:
+
+- `1)` Top session/filter row (`Obs`, date, limits, score/moon/show flags).
+- `2)` Main visibility panel (interactive Altitude/Airmass chart).
+- `3)` Sky View block (radar + Aladin/Finder tabs).
+- `4)` Night Details metrics card.
+- `5)` Targets table + action toolbar region.
+
+### Suggest Targets
+
+![Suggest Targets](docs/screenshots/suggest-targets.png)
+
+Annotated overlay:
+
+![Suggest Targets annotated](docs/screenshots/suggest-targets-overlay.png)
+
+Suggest overlay legend:
+
+- `1)` Result summary (loaded vs currently matching targets).
+- `2)` Filter row (`Importance`, `Score`, `Over Lim`, `Moon Sep`, `Airmass`, `Mag`).
+- `3)` Main sortable candidate table.
+- `4)` `Add` action column for direct insertion into the plan.
+- `5)` `Reset` / `Reload` controls.
+
+### AI Assistant Window
+
+![AI Assistant](docs/screenshots/ai-assistant.png)
+
+Annotated overlay:
+
+![AI Assistant annotated](docs/screenshots/ai-assistant-overlay.png)
+
+AI overlay legend:
+
+- `1)` Quick actions column (`Describe Object`, chat tools, AI settings, warm-up).
+- `2)` Chat transcript area (user + LLM responses).
+- `3)` Prompt composer row (`input` + `Send`).
+- `4)` Warm/cold runtime badge for local LLM state.
+
 ### Observatory Manager
 
 ![Observatory manager](docs/screenshots/observatory-manager.png)
+
+Screenshot refresh tooling:
+
+- Capture base screenshots:
+  - `python scripts/capture_readme_screenshots.py --views all`
+- Generate overlays:
+  - `python scripts/generate_readme_overlays.py --views all`
 
 ## Key Features
 
 - Data-dense dashboard: visibility plot, sky radar, cutout/finder chart, night details, and target table.
 - Target planning metrics: `Score`, `Over Lim (h)`, Moon separation, and best observing window.
 - Suggestion workflow:
-  - `Suggest Targets` dialog with sorting/filtering (requires BHTOM account + API token)
-  - `Quick Targets` button to add top suggested rows by score (requires BHTOM account + API token)
-  - dedicated `Settings -> General Settings -> Quick Targets` tab for quick-add behavior
+  - `Suggest Targets` dialog with sorting/filtering.
+  - `Quick Targets` button to add top ranked suggestions fast.
+  - dedicated `Settings -> General Settings -> Quick Targets` controls.
 - Enhanced target add flow:
-  - resolver-backed lookup (SIMBAD, Gaia DR3, Gaia Alerts, TNS, NED, LSST)
-  - auto metadata enrichment (`magnitude`, `type`) when available
-  - editable `name`, `type`, `notes`
+  - resolver-backed lookup (`SIMBAD`, `Gaia DR3`, `Gaia Alerts`, `TNS`, `NED`, `LSST`).
+  - metadata enrichment (`magnitude`, `type`) when available.
+  - editable `name`, `type`, `notes`, and color.
 - Sky field preview:
-  - Aladin cutout with zoom controls
-  - Finder chart tab
-- Weather workspace redesign:
-  - cyberpunk workspace with theme-aware chips, skeleton loaders, and interactive charts
-  - live provider selection (`Open-Meteo`, nearest `METAR`, optional observatory-specific `Custom URL`)
-  - `Meteograms`, `Conditions`, `Cloud Analysis`, and `Satellite`
-  - interactive Plotly/QWebEngine charts when available (fallback to Matplotlib otherwise)
+  - Aladin cutout with zoom/pan/reset controls and telescope FOV overlay.
+  - Finder chart tab with consistent scale/overlay.
+- AI Assistant as a separate window:
+  - dedicated menu action (`AI -> Toggle AI window`) and bottom toolbar button.
+  - object description shortcuts plus local LLM chat (OpenAI-compatible endpoint).
+- Weather workspace:
+  - tabs: `Meteograms`, `Conditions`, `Cloud Analysis`, `Satellite (beta)`.
+  - async provider loading with status chips and partial-failure handling.
+  - live conditions source selector and per-observatory custom endpoint support.
 - Theme and readability controls:
-  - multiple cyberpunk UI themes
-  - per-theme secondary accent override
-  - configurable UI/table font size
+  - multiple cyberpunk UI themes with secondary accent override.
+  - configurable global UI/table font size.
+  - `File -> Toggle Dark/Light Mode`.
 - Export bundle:
   - `plan_targets.json`
   - `plan_plot.png`
@@ -44,71 +96,47 @@ Desktop GUI for planning night observations with `PySide6`, `astroplan`, `astrop
 
 ## Weather Workspace
 
-The Weather window uses four tabs:
+Weather UI tabs:
 
-- `Meteograms`
-- `Conditions`
-- `Cloud Analysis`
-- `Satellite`
+- `Meteograms` for model forecast curves.
+- `Conditions` for current/near-real-time station-style data.
+- `Cloud Analysis` for weighted cloud/clear-rate estimate and monthly map.
+- `Satellite (beta)` for in-app satellite preview.
 
-### Meteograms vs Conditions
+Conditions sources:
 
-- `Meteograms` = model-driven outlook for the next hours/nights.
-- `Conditions` = current / near-real-time station-style data used for go/no-go decisions.
+- `Open-Meteo` (no key).
+- nearest `METAR` station (AviationWeather API).
+- observatory-level `Custom URL` JSON endpoint.
+- reference portal links in the UI: WeatherCloud / Wunderground / Windy.
 
-### Conditions Sources
-
-Built-in public sources:
-
-- `Open-Meteo` (no API key)
-- nearest `METAR` station (AviationWeather API)
-- optional observatory-specific `Custom URL` JSON endpoint
-
-Reference links (no native API integration in v1):
-
-- WeatherCloud
-- Wunderground PWS
-
-### Custom Conditions URL JSON Contract
-
-Required fields (top-level or inside `current`):
+Custom conditions URL contract (required keys):
 
 - `temp_c`
 - `wind_ms`
 - `cloud_pct`
 - `rh_pct`
 
-Optional fields:
+Optional condition keys:
 
 - `pressure_hpa`
 - `updated_utc`
 - `source_label`
-- `series` with arrays (`timestamps`, `temp_c`, `wind_ms`, `cloud_pct`, `rh_pct`, `pressure_hpa`)
+- `series` arrays (`timestamps`, `temp_c`, `wind_ms`, `cloud_pct`, `rh_pct`, `pressure_hpa`)
 
-### Cloud Calculation
-
-`Cloud Analysis` uses:
+Cloud calculation in `Cloud Analysis`:
 
 - `effective_cloud = 0.65*low + 0.25*mid + 0.10*high`
 - `clear_rate = 100 - effective_cloud`
 
-It also shows:
+Weather settings:
 
-- annual cloud estimate from meteoblue climate metadata (when available)
-- monthly EarthEnv cloud map centered on the active observatory
-
-### Weather Settings
-
-In `Settings -> Observatory Manager…` or `+` next to `Obs`:
-
-- custom conditions URL per observatory
-
-In `Settings -> General Settings -> Weather`:
-
-- default conditions source
-- weather auto-refresh interval
-- cloud map source (EarthEnv)
-- cloud map month mode (`session month` or `current month`)
+- per observatory (`Settings -> Observatory Manager…`): `Custom conditions URL`.
+- global (`Settings -> General Settings -> Weather`):
+  - default conditions source
+  - auto refresh interval
+  - cloud map source
+  - cloud map month mode (`session month` / `current month`)
 
 ## Score Calculation
 
@@ -146,21 +174,6 @@ Important detail: all of the above are evaluated only on samples inside the obse
 Set the token in:
 
 - `Settings -> General Settings -> Integrations -> BHTOM API token`
-
-Example `Suggest Targets` view:
-
-![Suggest Targets](docs/screenshots/suggest-targets.png)
-
-Annotated overview:
-
-![Suggest Targets annotated](docs/screenshots/suggest-targets-overlay.png)
-
-Overlay legend:
-
-- `1)` Summary bar: how many targets are loaded and match active filters.
-- `2)` Filters row: tune importance/score/moon separation/magnitude constraints.
-- `3)` Main table: inspect type, mag, score, best window; click headers to sort.
-- `4)` Add column: quick add selected targets into the current observing plan.
 
 ## Observatory Configuration
 
