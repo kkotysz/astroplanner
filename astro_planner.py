@@ -54,7 +54,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 import threading
 from urllib.error import HTTPError, URLError
@@ -143,8 +142,6 @@ from astroplanner.seestar import (
     build_session_queue,
     builtin_seestar_session_templates,
     default_science_checklist_items,
-    dump_user_seestar_session_templates,
-    load_user_seestar_session_templates,
     normalize_seestar_alp_schedule_autofocus_mode,
     render_alp_backend_status_text,
     seestar_alp_schedule_autofocus_mode_label,
@@ -1329,7 +1326,6 @@ from PySide6.QtCore import (
     QTimer,
     QCoreApplication,
     QItemSelectionModel,
-    QSettings,
     QStandardPaths,
     QUrl,
     QUrlQuery,
@@ -1416,10 +1412,24 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 _HAS_MPL_CANVAS = True
 
 APP_SETTINGS_ORG = "krzkot"
-LEGACY_APP_SETTINGS_ORGS = ("YourCompany",)
 APP_SETTINGS_APP = "AstroPlanner"
 APP_SETTINGS_ENV_KEY = "ASTROPLANNER_CONFIG_DIR"
-APP_SETTINGS_FILE_NAME = "settings.ini"
+OBSOLETE_APP_SETTINGS_KEYS = (
+    "general/customObservatories",
+    "general/seestarSessionUserTemplates",
+    "general/seestarCampaignUserPresets",
+    "general/accentSecondaryColor",
+    "__meta/customObservatoriesMigrated",
+    "__meta/seestarSessionTemplatesMigrated",
+    "__meta/legacyMigrated",
+    "__meta/legacyMigratedFromOrg",
+    "__meta/legacyIniMigrated",
+    "__meta/legacyIniMigratedCount",
+    "__meta/legacyIniMigratedFrom",
+    "__meta/storageDirMigrated",
+    "__meta/storageDirMigratedFrom",
+)
+OBSOLETE_APP_STATE_KEYS = ("legacy/settings/imported",)
 
 
 def _config_root_dir() -> Path:
@@ -1460,162 +1470,24 @@ def _resolve_settings_dir() -> Path:
         return env_override
     return _settings_dir_for_org(APP_SETTINGS_ORG)
 
-
-def _legacy_storage_dir_candidates(target_dir: Path) -> list[Path]:
-    candidates: list[Path] = []
-
-    def _add(path: Path) -> None:
-        candidate = path.expanduser()
-        if candidate == target_dir:
-            return
-        if candidate not in candidates:
-            candidates.append(candidate)
-
-    for org_name in LEGACY_APP_SETTINGS_ORGS:
-        _add(_settings_dir_for_org(org_name))
-    return candidates
-
-
-def _migrate_legacy_storage_dir(target_dir: Path) -> Optional[Path]:
-    if _settings_dir_env_override() is not None:
-        return None
-
-    target = target_dir.expanduser()
-    if target.exists():
-        try:
-            if any(target.iterdir()):
-                return None
-            target.rmdir()
-        except Exception:
-            return None
-
-    for candidate in _legacy_storage_dir_candidates(target):
-        if not candidate.exists():
-            continue
-        try:
-            if not any(candidate.iterdir()):
-                continue
-        except Exception:
-            continue
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(candidate), str(target))
-            return candidate
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Legacy storage directory migration failed from %s to %s: %s", candidate, target, exc)
-    return None
-
-
-def _legacy_settings_ini_candidates(target_ini_path: Path) -> list[Path]:
-    """Return historical INI locations to migrate from, excluding current target path."""
-    candidates: list[Path] = []
-
-    def _add(path: Path) -> None:
-        try:
-            normalized = path.expanduser().resolve()
-        except Exception:
-            normalized = path.expanduser()
-        if normalized == target_ini_path:
-            return
-        if normalized not in candidates:
-            candidates.append(normalized)
-
-    root = _config_root_dir()
-    _add(root / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
-    for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
-        _add(root / org_name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
-
-    app_cfg = str(QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation) or "").strip()
-    if app_cfg:
-        app_cfg_path = Path(app_cfg).expanduser()
-        _add(app_cfg_path / APP_SETTINGS_FILE_NAME)
-        for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
-            _add(app_cfg_path / org_name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
-
-    process_name = str(Path(str(sys.argv[0] or "")).stem or "").strip()
-    for name in (process_name, "python3", "python", "pythonw"):
-        if not name:
-            continue
-        for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
-            _add(root / name / org_name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
-        _add(root / name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
-    return candidates
-
-
-def _copy_settings_if_missing(src: object, dst: object) -> int:
-    copied = 0
-    all_keys = getattr(src, "allKeys", None)
-    src_value = getattr(src, "value", None)
-    dst_contains = getattr(dst, "contains", None)
-    dst_set = getattr(dst, "setValue", None)
-    if not callable(all_keys) or not callable(src_value) or not callable(dst_contains) or not callable(dst_set):
-        return 0
-    for key in all_keys():
-        if dst_contains(key):
-            continue
-        dst_set(key, src_value(key))
-        copied += 1
-    return copied
-
-
-def _sync_settings(settings: object) -> None:
-    try:
-        sync = getattr(settings, "sync", None)
-        if callable(sync):
-            sync()
-        status_getter = getattr(settings, "status", None)
-        status = status_getter() if callable(status_getter) else QSettings.Status.NoError
-        if status != QSettings.Status.NoError:
-            file_name_getter = getattr(settings, "fileName", None)
-            file_name = file_name_getter() if callable(file_name_getter) else ""
-            logger.warning("QSettings sync status=%s file=%s", int(status), file_name)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("QSettings sync failed: %s", exc)
+def _cleanup_obsolete_settings(storage: AppStorage, settings: SettingsAdapter) -> None:
+    for key in OBSOLETE_APP_SETTINGS_KEYS:
+        if settings.contains(key):
+            settings.remove(key)
+    for key in OBSOLETE_APP_STATE_KEYS:
+        storage.state.remove(key)
 
 
 def _create_app_settings() -> SettingsAdapter:
-    """Create SQLite-backed settings storage with best-effort legacy import."""
+    """Create SQLite-backed settings storage."""
     settings_dir = _resolve_settings_dir()
-    migrated_storage_dir = _migrate_legacy_storage_dir(settings_dir)
     try:
         settings_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
     storage = AppStorage(settings_dir)
     settings = SettingsAdapter(storage)
-    if migrated_storage_dir is not None:
-        settings.setValue("__meta/storageDirMigrated", True)
-        settings.setValue("__meta/storageDirMigratedFrom", str(migrated_storage_dir))
-    ini_path = settings_dir / APP_SETTINGS_FILE_NAME
-    if not bool(storage.state.get("legacy/settings/imported", False, type_hint=bool)):
-        copied_total = 0
-        for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
-            try:
-                legacy = QSettings(org_name, APP_SETTINGS_APP)
-                copied = settings.import_from_source(legacy)
-                if copied > 0:
-                    copied_total += copied
-                    settings.setValue("__meta/legacyMigrated", True)
-                    settings.setValue("__meta/legacyMigratedFromOrg", str(org_name))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Settings migration skipped for org '%s': %s", org_name, exc)
-        try:
-            for candidate in _legacy_settings_ini_candidates(ini_path.resolve()):
-                if not candidate.exists():
-                    continue
-                source = QSettings(str(candidate), QSettings.IniFormat)
-                copied = settings.import_from_source(source)
-                if copied <= 0:
-                    continue
-                copied_total += copied
-                settings.setValue("__meta/legacyIniMigratedFrom", str(candidate))
-            if copied_total > 0:
-                settings.setValue("__meta/legacyIniMigrated", True)
-                settings.setValue("__meta/legacyIniMigratedCount", int(copied_total))
-                _sync_settings(settings)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Legacy INI migration skipped: %s", exc)
-        storage.state.set("legacy/settings/imported", True)
+    _cleanup_obsolete_settings(storage, settings)
     try:
         settings.setValue("__meta/storageBackend", "sqlite")
     except Exception:
@@ -1681,6 +1553,39 @@ _DISPLAY_FONT_PATH = Path(__file__).resolve().parent / "assets" / "fonts" / "Raj
 _DISPLAY_FONT_LOADED = False
 _DISPLAY_FONT_CSS_CACHE: Optional[str] = None
 _DISPLAY_WEB_FONT_FAMILY = "Rajdhani Web"
+_DISPLAY_FONT_QT_FAMILY: Optional[str] = None
+_QT_FALLBACK_FONT_FAMILY: Optional[str] = None
+_MPL_AVAILABLE_FONT_NAMES: Optional[set[str]] = None
+
+
+def _platform_ui_font_candidates() -> list[str]:
+    if sys.platform == "darwin":
+        return [".AppleSystemUIFont", "SF Pro Text", "Avenir Next", "Helvetica Neue", "Arial"]
+    if sys.platform.startswith("win"):
+        return ["Segoe UI", "Arial"]
+    return ["Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial"]
+
+
+def _resolved_platform_ui_font_family() -> str:
+    global _QT_FALLBACK_FONT_FAMILY
+    if _QT_FALLBACK_FONT_FAMILY:
+        return _QT_FALLBACK_FONT_FAMILY
+    for family in _platform_ui_font_candidates():
+        if family:
+            _QT_FALLBACK_FONT_FAMILY = family
+            return family
+    if _DISPLAY_FONT_QT_FAMILY:
+        _QT_FALLBACK_FONT_FAMILY = _DISPLAY_FONT_QT_FAMILY
+        return _QT_FALLBACK_FONT_FAMILY
+    _QT_FALLBACK_FONT_FAMILY = "Arial"
+    return _QT_FALLBACK_FONT_FAMILY
+
+
+def _available_mpl_font_names() -> set[str]:
+    global _MPL_AVAILABLE_FONT_NAMES
+    if _MPL_AVAILABLE_FONT_NAMES is None:
+        _MPL_AVAILABLE_FONT_NAMES = {str(font.name) for font in mpl_font_manager.fontManager.ttflist}
+    return _MPL_AVAILABLE_FONT_NAMES
 
 
 def _repolish_widget(widget: Optional[QWidget]) -> None:
@@ -1726,9 +1631,19 @@ def _embedded_display_font_css() -> str:
 
 
 def _plot_font_css_stack(theme_tokens: Optional[dict[str, str]] = None) -> str:
-    fallback = "Arial, sans-serif"
     if theme_tokens:
-        fallback = str(theme_tokens.get("display_font_family", theme_tokens.get("font_family", fallback)))
+        preferred = str(theme_tokens.get("display_font_family", theme_tokens.get("font_family", "")) or "").strip()
+        fallback_families = [preferred] if preferred else []
+    else:
+        fallback_families = []
+    fallback_families.extend(_platform_ui_font_candidates())
+    fallback_families.extend(["Arial", "Helvetica"])
+    deduped: list[str] = []
+    for family in fallback_families:
+        normalized = str(family or "").strip()
+        if normalized and normalized not in deduped and normalized != "Sans Serif":
+            deduped.append(normalized)
+    fallback = ", ".join(f'"{family}"' for family in deduped) or '"Arial"'
     if _DISPLAY_FONT_PATH.exists():
         return f'"{_DISPLAY_WEB_FONT_FAMILY}", {fallback}'
     return fallback
@@ -1767,11 +1682,58 @@ def _theme_color_from_widget(widget: object, key: str, fallback: str) -> str:
     return str(value or fallback)
 
 
-def _theme_qcolor_from_widget(widget: object, key: str, fallback: str) -> QColor:
-    color = QColor(_theme_color_from_widget(widget, key, fallback))
+_CSS_RGBA_RE = re.compile(
+    r"^rgba?\(\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})(?:\s*,\s*([0-9]*\.?[0-9]+))?\s*\)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_qcolor_token(value: object) -> QColor:
+    if isinstance(value, QColor):
+        color = QColor(value)
+        return color if color.isValid() else QColor()
+
+    text = str(value or "").strip()
+    if not text:
+        return QColor()
+
+    color = QColor(text)
     if color.isValid():
         return color
-    return QColor(fallback)
+
+    match = _CSS_RGBA_RE.match(text)
+    if not match:
+        return QColor()
+
+    red, green, blue = (max(0, min(255, int(part))) for part in match.groups()[:3])
+    alpha_token = match.group(4)
+    if alpha_token is None or alpha_token == "":
+        alpha = 255
+    else:
+        alpha_value = float(alpha_token)
+        if alpha_value <= 1.0:
+            alpha = int(round(max(0.0, min(1.0, alpha_value)) * 255.0))
+        else:
+            alpha = int(round(max(0.0, min(255.0, alpha_value))))
+    return QColor(red, green, blue, alpha)
+
+
+def _qcolor_from_token(value: object, fallback: object | None = None) -> QColor:
+    color = _parse_qcolor_token(value)
+    if color.isValid():
+        return color
+    if fallback is not None:
+        fallback_color = _parse_qcolor_token(fallback)
+        if fallback_color.isValid():
+            return fallback_color
+    return QColor()
+
+
+def _theme_qcolor_from_widget(widget: object, key: str, fallback: str) -> QColor:
+    color = _qcolor_from_token(_theme_color_from_widget(widget, key, fallback), fallback)
+    if color.isValid():
+        return color
+    return _qcolor_from_token(fallback)
 
 
 def _mix_qcolors_for_theme(first: QColor, second: QColor, first_ratio: float) -> QColor:
@@ -2225,9 +2187,9 @@ def _canonical_color_token(value: object) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    color = QColor(text)
+    color = _qcolor_from_token(text)
     if color.isValid():
-        return color.name().lower()
+        return color.name(QColor.NameFormat.HexArgb).lower()
     return re.sub(r"\s+", "", text.lower())
 
 
@@ -2259,6 +2221,65 @@ def _resolve_table_highlight_color(settings: object, key: str, default_color: st
     if normalized in auto_colors:
         return str(default_color)
     return raw
+
+
+def _format_duration_short(total_seconds: float) -> str:
+    seconds = max(0, int(round(float(total_seconds))))
+    if seconds % 3600 == 0:
+        hours = max(1, seconds // 3600)
+        return f"{hours}h"
+    if seconds % 60 == 0:
+        minutes = max(1, seconds // 60)
+        return f"{minutes} min"
+    return f"{seconds}s"
+
+
+def _bhtom_suggestion_source_message(source: str) -> str:
+    ttl_txt = _format_duration_short(BHTOM_SUGGESTION_CACHE_TTL_S)
+    normalized = str(source or "").strip().lower()
+    if normalized == "cache":
+        return (
+            f"Source: cached BHTOM target list (TTL {ttl_txt}). "
+            "Suggest Targets does not auto-refresh from the network while this cache is still valid."
+        )
+    if normalized == "network":
+        return f"Source: fresh BHTOM target list fetched from the API. Results are cached for {ttl_txt}."
+    return (
+        f"Source: checking cache first (TTL {ttl_txt}). "
+        "If no valid cache is found, AstroPlanner fetches fresh data from BHTOM."
+    )
+
+
+def _site_runtime_signature(site: Optional["Site"]) -> Optional[tuple[str, float, float, float, str]]:
+    if not isinstance(site, Site):
+        return None
+    return (
+        str(site.name or "").strip(),
+        round(float(site.latitude), 6),
+        round(float(site.longitude), 6),
+        round(float(site.elevation), 2),
+        str(site.timezone_name or "").strip(),
+    )
+
+
+def _same_runtime_site(first: Optional["Site"], second: Optional["Site"]) -> bool:
+    first_sig = _site_runtime_signature(first)
+    second_sig = _site_runtime_signature(second)
+    return first_sig is not None and first_sig == second_sig
+
+
+def _should_apply_observatory_change(
+    current_name: str,
+    current_site: Optional["Site"],
+    next_name: str,
+    next_site: Optional["Site"],
+) -> bool:
+    normalized_next = str(next_name or "").strip()
+    if not normalized_next or not isinstance(next_site, Site):
+        return False
+    if str(current_name or "").strip() != normalized_next:
+        return True
+    return not _same_runtime_site(current_site, next_site)
 
 
 def _style_dialog_button_box(
@@ -2296,14 +2317,26 @@ from PySide6.QtWidgets import QStyledItemDelegate, QStyle
 # --- Custom QTableView to manage delete shortcut (macOS only) ----------
 class TargetTableView(QTableView):
     """
-    Emit `deleteRequested` when ⌘+Backspace is pressed, and suppress
-    Ctrl+Backspace so that only the macOS-native shortcut deletes rows.
+    Emit `deleteRequested` when the user presses an erase key while the
+    targets table is focused.
     """
     deleteRequested = Signal()
+    layoutWidthChanged = Signal()
+    hoverRowChanged = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._forced_row_height: Optional[int] = None
+        self._hover_row: Optional[int] = None
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+
+    def _set_hover_row(self, row: Optional[int]) -> None:
+        new_row = row if row is not None and row >= 0 else None
+        if new_row == self._hover_row:
+            return
+        self._hover_row = new_row
+        self.hoverRowChanged.emit(new_row)
 
     def set_forced_row_height(self, height: int) -> None:
         value = max(10, int(height))
@@ -2327,6 +2360,41 @@ class TargetTableView(QTableView):
         if self._forced_row_height is not None:
             return int(self._forced_row_height)
         return super().sizeHintForRow(row)
+
+    def resizeEvent(self, event):  # noqa: D401
+        super().resizeEvent(event)
+        self.layoutWidthChanged.emit()
+
+    def mouseMoveEvent(self, event):  # noqa: D401
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        index = self.indexAt(pos)
+        self._set_hover_row(index.row() if index.isValid() else None)
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):  # noqa: D401
+        self._set_hover_row(None)
+        super().leaveEvent(event)
+
+    def viewportEvent(self, event):  # noqa: D401
+        if event.type() in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+            self._set_hover_row(None)
+        return super().viewportEvent(event)
+
+    def keyPressEvent(self, event):  # noqa: D401
+        key = event.key()
+        if key in (Qt.Key_Backspace, Qt.Key_Delete):
+            mods = event.modifiers() & (
+                Qt.ControlModifier | Qt.MetaModifier | Qt.AltModifier | Qt.ShiftModifier
+            )
+            if mods in (
+                Qt.NoModifier,
+                Qt.ControlModifier,
+                Qt.MetaModifier if sys.platform == "darwin" else Qt.NoModifier,
+            ):
+                self.deleteRequested.emit()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 class NeonToggleSwitch(QAbstractButton):
@@ -2614,28 +2682,6 @@ class SkeletonShimmerWidget(QWidget):
             painter.drawRoundedRect(block, rad, rad)
         painter.end()
 
-    def keyPressEvent(self, event):
-        """
-        Only a *pure* ⌘‑Backspace / ⌘‑Delete on macOS (or Ctrl‑Backspace / Ctrl‑Delete
-        on other platforms) triggers row deletion.  All other Backspace/Delete
-        combinations are swallowed so Qt’s default handler never sees them.
-        """
-        key = event.key()
-        # We care only about the two physical keys that map to “erase” on macOS
-        if key in (Qt.Key_Backspace, Qt.Key_Delete):
-            mods = event.modifiers()
-            # On macOS the Command (⌘) key is reported as Qt.ControlModifier,
-            # while the physical Control key is Qt.MetaModifier.  Everywhere
-            # else Ctrl is Qt.ControlModifier.
-            desired_mod = Qt.ControlModifier if sys.platform == "darwin" else Qt.ControlModifier
-            if mods == desired_mod:
-                self.deleteRequested.emit()
-            # Swallow the event in every case so nothing else processes it
-            return
-        # All other keys → default processing
-        super().keyPressEvent(event)
-
-
 class CoverImageLabel(QLabel):
     """Render pixmap preserving aspect ratio, centered in available space."""
 
@@ -2839,10 +2885,30 @@ def _normalized_css_color(value: object) -> str:
 
 
 def _swatch_text_color(value: object, *, dark: str = "#f6fbff", light: str = "#101720") -> str:
-    color = QColor(str(value or ""))
+    color = _qcolor_from_token(value)
     if not color.isValid():
         return dark
     return dark if color.lightnessF() < 0.60 else light
+
+
+_VALID_TABLE_COLOR_MODES = {"background", "text_glow"}
+UI_FONT_SIZE_MIN = 9
+UI_FONT_SIZE_MAX = 24
+
+
+def _normalize_table_color_mode(value: object, *, default: str = "background") -> str:
+    mode = str(value or "").strip().lower()
+    if mode in _VALID_TABLE_COLOR_MODES:
+        return mode
+    return default
+
+
+def _sanitize_ui_font_size(value: object, *, default: int = 11) -> int:
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        size = int(default)
+    return max(UI_FONT_SIZE_MIN, min(UI_FONT_SIZE_MAX, size))
 
 
 class NoSelectBackgroundDelegate(QStyledItemDelegate):
@@ -2871,9 +2937,8 @@ class TargetTableGlowDelegate(QStyledItemDelegate):
         widget = opt.widget
         style = widget.style() if widget is not None else QApplication.style()
         model = index.model()
-        color_mode = str(getattr(model, "color_mode", "text_glow") or "text_glow").strip().lower()
-        if color_mode not in {"background", "text_glow"}:
-            color_mode = "text_glow"
+        color_mode = _normalize_table_color_mode(getattr(model, "color_mode", "background"), default="background")
+        row_hover = index.row() == getattr(model, "_hover_row", None)
 
         cell_rect = opt.rect.adjusted(0, 0, -1, -1)
         bg_color = self._brush_to_color(index.data(Qt.BackgroundRole))
@@ -2891,12 +2956,27 @@ class TargetTableGlowDelegate(QStyledItemDelegate):
 
         painter.fillRect(cell_rect, bg_color)
 
+        if row_hover:
+            hover_overlay = _theme_qcolor_from_widget(widget, "table_action_hover_bg", "#d8e2ef")
+            if not hover_overlay.isValid():
+                hover_overlay = _theme_qcolor_from_widget(widget, "accent_secondary", "#ff4fd8")
+            if hover_overlay.isValid():
+                overlay = QColor(hover_overlay)
+                if overlay.alpha() <= 0:
+                    overlay.setAlpha(56 if bg_color.alpha() >= 140 else 88)
+                painter.fillRect(cell_rect, overlay)
+
         if opt.state & QStyle.State_Selected:
             overlay = _theme_qcolor_from_widget(widget, "table_sel_bg", "#163455")
             overlay.setAlpha(52 if bg_color.alpha() >= 140 else 96)
             painter.fillRect(cell_rect, overlay)
             border = _theme_qcolor_from_widget(widget, "accent_primary", "#59f3ff")
             border.setAlpha(132)
+            painter.setPen(QPen(border, 1))
+            painter.drawRect(cell_rect)
+        elif row_hover:
+            border = _theme_qcolor_from_widget(widget, "accent_secondary", "#ff4fd8")
+            border.setAlpha(108)
             painter.setPen(QPen(border, 1))
             painter.drawRect(cell_rect)
 
@@ -3094,13 +3174,10 @@ class TableSettingsDialog(QDialog):
         self.color_mode_combo = QComboBox(self)
         self.color_mode_combo.addItem("Colored background", "background")
         self.color_mode_combo.addItem("Colored text + glow", "text_glow")
-        init_color_mode = (
-            str(parent.settings.value("table/colorMode", "text_glow", type=str) or "text_glow")
-            if parent and hasattr(parent, "settings")
-            else "text_glow"
-        ).strip().lower()
-        if init_color_mode not in {"background", "text_glow"}:
-            init_color_mode = "text_glow"
+        init_color_mode = _normalize_table_color_mode(
+            parent.settings.value("table/colorMode", "background", type=str) if parent and hasattr(parent, "settings") else "background",
+            default="background",
+        )
         color_mode_idx = self.color_mode_combo.findData(init_color_mode)
         if color_mode_idx >= 0:
             self.color_mode_combo.setCurrentIndex(color_mode_idx)
@@ -3226,14 +3303,15 @@ class TableSettingsDialog(QDialog):
         s.setValue("table/rowHeight", self.row_height_spin.value())
         s.setValue("table/firstColumnWidth", self.first_col_width_spin.value())
         s.setValue("table/fontSize", self.font_spin.value())
-        s.setValue("table/colorMode", str(self.color_mode_combo.currentData() or "text_glow"))
+        s.setValue("table/colorMode", _normalize_table_color_mode(self.color_mode_combo.currentData(), default="background"))
+        s.setValue("table/colorModeExplicit", True)
         for idx, chk in self.col_checks.items():
             s.setValue(f"table/col{idx}", chk.isChecked())
         for key in ("below","limit","above"):
             s.setValue(f"table/color/{key}", self.selected_colors.get(key))
         # Save default sort column
         s.setValue("table/defaultSortColumn", self.sort_combo.currentIndex())
-        _sync_settings(s)
+        s.sync()
         self.parent()._apply_table_settings()
 
     def accept(self):
@@ -3292,10 +3370,10 @@ class GeneralSettingsDialog(QDialog):
 
         # Global UI font size
         self.ui_font_spin = QSpinBox(self)
-        self.ui_font_spin.setRange(9, 16)
+        self.ui_font_spin.setRange(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX)
         self.ui_font_spin.setSuffix(" pt")
         init_ui_font = parent.settings.value("general/uiFontSize", 11, type=int) if parent and hasattr(parent, "settings") else 11
-        self.ui_font_spin.setValue(max(9, min(16, int(init_ui_font))))
+        self.ui_font_spin.setValue(_sanitize_ui_font_size(init_ui_font))
         general_layout.addRow("UI font size:", self.ui_font_spin)
 
         # UI theme
@@ -3342,7 +3420,7 @@ class GeneralSettingsDialog(QDialog):
         self.accent_secondary_reset_btn.clicked.connect(self._reset_accent_secondary_color)
         accent_layout.addWidget(self.accent_secondary_btn, 1)
         accent_layout.addWidget(self.accent_secondary_reset_btn, 0)
-        general_layout.addRow("Pink accent:", accent_row)
+        general_layout.addRow("Secondary accent:", accent_row)
         self.theme_combo.currentIndexChanged.connect(self._on_theme_selection_changed)
         self._refresh_accent_secondary_controls()
 
@@ -3944,7 +4022,7 @@ class GeneralSettingsDialog(QDialog):
         self.accent_secondary_reset_btn.setEnabled(bool(self._accent_secondary_color))
 
     def _pick_accent_secondary_color(self) -> None:
-        chosen = QColorDialog.getColor(QColor(self._effective_accent_secondary_color()), self, "Pick pink accent")
+        chosen = QColorDialog.getColor(QColor(self._effective_accent_secondary_color()), self, "Pick secondary accent")
         if not chosen.isValid():
             return
         self._accent_secondary_color = chosen.name().lower()
@@ -4052,7 +4130,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("weather/localConditionsLinks", self.weather_local_links_edit.toPlainText().strip())
         s.setValue("weather/cloudMapSource", str(self.weather_cloud_source_combo.currentData() or "earthenv"))
         s.setValue("weather/cloudMapMonthMode", str(self.weather_month_mode_combo.currentData() or "session_month"))
-        _sync_settings(s)
+        s.sync()
         self.parent()._apply_general_settings()
         if rerun_plan:
             self.parent()._run_plan()
@@ -4728,39 +4806,10 @@ class SeestarSessionPlanDialog(QDialog):
                         except Exception:
                             continue
                         templates[str(template.key)] = template
-                    if templates:
-                        return templates
+                    return templates
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load session templates from storage: %s", exc)
-
-        raw_templates = self._settings.value("general/seestarSessionUserTemplates", "", type=str)
-        templates = load_user_seestar_session_templates(raw_templates)
-        if templates or str(raw_templates or "").strip():
-            if templates and storage is not None:
-                try:
-                    storage.session_templates.replace_all(
-                        [template.model_dump(mode="json") for template in templates.values()]
-                    )
-                    self._settings.remove("general/seestarSessionUserTemplates")
-                    self._settings.remove("general/seestarCampaignUserPresets")
-                    self._settings.setValue("__meta/seestarSessionTemplatesMigrated", True)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to migrate session templates into storage: %s", exc)
-            return templates
-        legacy_raw = self._settings.value("general/seestarCampaignUserPresets", "", type=str)
-        migrated = load_user_seestar_session_templates(legacy_raw)
-        if migrated:
-            if storage is not None:
-                try:
-                    storage.session_templates.replace_all(
-                        [template.model_dump(mode="json") for template in migrated.values()]
-                    )
-                    self._settings.remove("general/seestarSessionUserTemplates")
-                    self._settings.remove("general/seestarCampaignUserPresets")
-                    self._settings.setValue("__meta/seestarSessionTemplatesMigrated", True)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to migrate legacy session templates into storage: %s", exc)
-        return migrated
+        return {}
 
     def _load_current_settings_template(self) -> SeestarSessionTemplate:
         checklist_text = self._settings.value(
@@ -5592,9 +5641,6 @@ class SeestarSessionPlanDialog(QDialog):
                 storage.session_templates.replace_all(
                     [template.model_dump(mode="json") for template in self._user_session_templates.values()]
                 )
-                s.remove("general/seestarSessionUserTemplates")
-                s.remove("general/seestarCampaignUserPresets")
-                s.setValue("__meta/seestarSessionTemplatesMigrated", True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to save session templates to storage: %s", exc)
         if not selected_template_key:
@@ -9970,10 +10016,62 @@ def _targets_match(left: Target, right: Target, max_sep_deg: float = 0.05) -> bo
         return False
 
 
+def _distribute_extra_table_width(
+    widths: dict[int, int],
+    *,
+    available_width: int,
+    stretch_weights: dict[int, float],
+) -> dict[int, int]:
+    normalized = {
+        int(col): max(0, int(width))
+        for col, width in widths.items()
+        if int(width) > 0
+    }
+    if not normalized:
+        return {}
+    extra = int(available_width) - sum(normalized.values())
+    if extra <= 0:
+        return dict(normalized)
+
+    candidates = [
+        (int(col), float(stretch_weights.get(col, 0.0)))
+        for col in normalized
+        if float(stretch_weights.get(col, 0.0)) > 0.0
+    ]
+    if not candidates:
+        return dict(normalized)
+
+    total_weight = sum(weight for _col, weight in candidates)
+    if total_weight <= 0.0:
+        return dict(normalized)
+
+    distributed = dict(normalized)
+    allocations: list[tuple[float, int]] = []
+    consumed = 0
+    for col, weight in candidates:
+        raw_share = (float(extra) * float(weight)) / total_weight
+        share = int(math.floor(raw_share))
+        distributed[col] += share
+        consumed += share
+        allocations.append((raw_share - share, col))
+
+    remainder = max(0, int(extra - consumed))
+    allocations.sort(key=lambda item: (-item[0], item[1]))
+    for _fraction, col in allocations[:remainder]:
+        distributed[col] += 1
+    return distributed
+
+
 class ObservatoryManagerDialog(QDialog):
     """Manage observatories with search and inline configuration editing."""
 
-    def __init__(self, observatories: dict[str, Site], parent=None, preset_keys: Optional[dict[str, str]] = None):
+    def __init__(
+        self,
+        observatories: dict[str, Site],
+        parent=None,
+        preset_keys: Optional[dict[str, str]] = None,
+        selected_name: Optional[str] = None,
+    ):
         super().__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self.setWindowTitle("Observatory Manager")
@@ -9983,7 +10081,8 @@ class ObservatoryManagerDialog(QDialog):
             name: Site(**site.model_dump())
             for name, site in observatories.items()
         }
-        self._selected_name: Optional[str] = None
+        preferred_name = str(selected_name or "").strip()
+        self._selected_name: Optional[str] = preferred_name if preferred_name in self._sites else None
         self._loading_fields = False
         self._list_sync = False
         self._preset_sync = False
@@ -11288,6 +11387,12 @@ class SuggestedTargetsDialog(QDialog):
         _set_label_tone(self.summary_label, "muted")
         layout.addWidget(self.summary_label)
 
+        self.source_label = QLabel(self)
+        self.source_label.setWordWrap(True)
+        self.source_label.setText(_bhtom_suggestion_source_message("loading"))
+        _set_label_tone(self.source_label, "muted")
+        layout.addWidget(self.source_label)
+
         filters_row = QHBoxLayout()
         filters_row.setSpacing(8)
         filters_row.addWidget(QLabel("Importance ≥", self))
@@ -11435,6 +11540,11 @@ class SuggestedTargetsDialog(QDialog):
 
         self.table_view.sortByColumn(SuggestionTableModel.COL_SCORE, Qt.DescendingOrder)
         self._apply_filters()
+        self._fit_table_columns_to_width()
+
+    def set_source_message(self, message: str) -> None:
+        self.source_label.setText(str(message or "").strip())
+        self.source_label.setVisible(bool(str(message or "").strip()))
 
     def _build_table_loading_placeholder(self, message: str) -> QWidget:
         widget = QWidget(self)
@@ -11484,7 +11594,40 @@ class SuggestedTargetsDialog(QDialog):
             SuggestionTableModel.COL_NAME,
             self._default_name_column_width(suggestions),
         )
+        self._fit_table_columns_to_width()
         self._refresh_dialog_state()
+
+    @staticmethod
+    def _table_stretch_weights() -> dict[int, float]:
+        return {
+            SuggestionTableModel.COL_NAME: 4.0,
+            SuggestionTableModel.COL_TYPE: 1.6,
+            SuggestionTableModel.COL_IMPORTANCE: 1.0,
+            SuggestionTableModel.COL_SCORE: 1.0,
+            SuggestionTableModel.COL_AIRMASS: 1.1,
+            SuggestionTableModel.COL_HOURS: 1.1,
+            SuggestionTableModel.COL_WINDOW: 2.0,
+            SuggestionTableModel.COL_MOON_SEP: 1.1,
+        }
+
+    def _fit_table_columns_to_width(self) -> None:
+        if not hasattr(self, "table_view"):
+            return
+        widths = {
+            col: int(self.table_view.columnWidth(col))
+            for col in range(self.table_model.columnCount())
+            if not self.table_view.isColumnHidden(col)
+        }
+        if not widths:
+            return
+        viewport_width = max(0, int(self.table_view.viewport().width()) - 2)
+        fitted = _distribute_extra_table_width(
+            widths,
+            available_width=viewport_width,
+            stretch_weights=self._table_stretch_weights(),
+        )
+        for col, width in fitted.items():
+            self.table_view.setColumnWidth(col, int(width))
 
     def _default_name_column_width(self, suggestions: list[dict[str, object]]) -> int:
         name_font = QFont(self.table_view.font())
@@ -11659,6 +11802,10 @@ class SuggestedTargetsDialog(QDialog):
                 self.table_model.set_action_hover_row(None)
                 self.table_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):  # noqa: D401
+        super().resizeEvent(event)
+        self._fit_table_columns_to_width()
 
     def _open_bhtom_target(self, row: int) -> None:
         item = self.table_model.suggestion_at(row)
@@ -12149,7 +12296,8 @@ class TargetTableModel(QAbstractTableModel):
         self._targets = targets
         self.site = site
         self.limit: float | None = None
-        self.color_mode = "text_glow"
+        self.color_mode = "background"
+        self._hover_row: Optional[int] = None
         # Cached current values for table display
         self.order_values: list[int] = []
         self.current_alts: list[float] = []
@@ -12191,8 +12339,7 @@ class TargetTableModel(QAbstractTableModel):
         return _theme_qcolor_from_widget(self, "table_surface_alt", "#101a28")
 
     def _table_color_mode(self) -> str:
-        mode = str(getattr(self, "color_mode", "text_glow") or "text_glow").strip().lower()
-        return mode if mode in {"background", "text_glow"} else "text_glow"
+        return _normalize_table_color_mode(getattr(self, "color_mode", "background"), default="background")
 
     def _boost_table_tint(self, color: QColor, *, strong: bool = False) -> QColor:
         out = QColor(color)
@@ -12212,11 +12359,11 @@ class TargetTableModel(QAbstractTableModel):
             return None
         hc = getattr(self, "highlight_colors", {})
         if alt < 0:
-            color = QColor(hc.get("below", QColor(_theme_color_from_widget(self, "table_status_red", "#ff8080"))))
+            color = _qcolor_from_token(hc.get("below"), _theme_color_from_widget(self, "table_status_red", "#ff8080"))
         elif alt < self.limit:
-            color = QColor(hc.get("limit", QColor(_theme_color_from_widget(self, "table_status_yellow", "#ffff80"))))
+            color = _qcolor_from_token(hc.get("limit"), _theme_color_from_widget(self, "table_status_yellow", "#ffff80"))
         else:
-            color = QColor(hc.get("above", QColor(_theme_color_from_widget(self, "table_status_green", "#b3ffb3"))))
+            color = _qcolor_from_token(hc.get("above"), _theme_color_from_widget(self, "table_status_green", "#b3ffb3"))
         return color if color.isValid() else None
 
     def _cell_background_color(self, row: int, col: int, tgt: Target, row_is_enabled: bool) -> Optional[QColor]:
@@ -12257,6 +12404,7 @@ class TargetTableModel(QAbstractTableModel):
     def reset_targets(self, targets: list[Target]) -> None:
         self.beginResetModel()
         self._targets[:] = targets
+        self._hover_row = None
         self.order_values = []
         self.current_alts = []
         self.current_azs = []
@@ -12273,6 +12421,19 @@ class TargetTableModel(QAbstractTableModel):
         self._targets.append(target)
         self.order_values.append(0)
         self.endInsertRows()
+
+    def set_hover_row(self, row: Optional[int]) -> None:
+        new_row = row if row is not None and 0 <= row < len(self._targets) else None
+        if new_row == self._hover_row:
+            return
+        old_row = self._hover_row
+        self._hover_row = new_row
+        for changed_row in (old_row, new_row):
+            if changed_row is None:
+                continue
+            left = self.index(changed_row, 0)
+            right = self.index(changed_row, self.columnCount() - 1)
+            self.dataChanged.emit(left, right, [Qt.BackgroundRole, Qt.ForegroundRole, Qt.FontRole])
 
     def remove_rows(self, rows: list[int]) -> list[Target]:
         removed: list[Target] = []
@@ -12632,7 +12793,7 @@ class MainWindow(QMainWindow):
             self.right_dashboard.setMinimumWidth(max(460, card_min_w + 22))
 
     def _ensure_display_font_loaded(self) -> None:
-        global _DISPLAY_FONT_LOADED
+        global _DISPLAY_FONT_LOADED, _DISPLAY_FONT_QT_FAMILY
         if _DISPLAY_FONT_LOADED:
             return
         if not _DISPLAY_FONT_PATH.exists():
@@ -12646,18 +12807,31 @@ class MainWindow(QMainWindow):
         except Exception:
             font_id = -1
         if font_id >= 0:
+            try:
+                families = QFontDatabase.applicationFontFamilies(font_id)
+            except Exception:
+                families = []
+            if families:
+                _DISPLAY_FONT_QT_FAMILY = str(families[0] or "").strip() or None
+                if _DISPLAY_FONT_QT_FAMILY:
+                    if _MPL_AVAILABLE_FONT_NAMES is not None:
+                        _MPL_AVAILABLE_FONT_NAMES.add(_DISPLAY_FONT_QT_FAMILY)
             _DISPLAY_FONT_LOADED = True
 
     def _pick_font_family(self, candidates: list[str]) -> str:
         self._ensure_display_font_loaded()
-        available = set(QFontDatabase.families())
-        for family in candidates:
-            if family in available:
+        if _DISPLAY_FONT_QT_FAMILY and _DISPLAY_FONT_QT_FAMILY in candidates:
+            return _DISPLAY_FONT_QT_FAMILY
+        for family in _platform_ui_font_candidates():
+            if family in candidates:
                 return family
-        return QApplication.font().family()
+        for family in candidates:
+            if family and family != "Sans Serif":
+                return family
+        return _resolved_platform_ui_font_family()
 
     def _pick_matplotlib_font_family(self, candidates: list[str]) -> str:
-        available = {f.name for f in mpl_font_manager.fontManager.ttflist}
+        available = _available_mpl_font_names()
         for family in candidates:
             if family in available:
                 return family
@@ -12718,19 +12892,12 @@ class MainWindow(QMainWindow):
         normalized = normalize_theme_key(theme_key or getattr(self, "_theme_name", DEFAULT_UI_THEME))
         return f"general/accentSecondaryColorByTheme/{normalized}"
 
-    def _load_accent_secondary_override(self, theme_key: str | None = None, *, migrate_legacy: bool = True) -> str:
+    def _load_accent_secondary_override(self, theme_key: str | None = None) -> str:
         normalized = normalize_theme_key(theme_key or getattr(self, "_theme_name", DEFAULT_UI_THEME))
         per_theme_key = self._accent_secondary_settings_key(normalized)
         stored = _normalized_css_color(self.settings.value(per_theme_key, "", type=str))
         if stored:
             return stored
-        if not migrate_legacy:
-            return ""
-        legacy = _normalized_css_color(self.settings.value("general/accentSecondaryColor", "", type=str))
-        active_theme = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
-        if legacy and normalized == active_theme:
-            self.settings.setValue(per_theme_key, legacy)
-            return legacy
         return ""
 
     def _save_accent_secondary_override(self, theme_key: str, color: str) -> None:
@@ -12748,16 +12915,18 @@ class MainWindow(QMainWindow):
         plot_panel_bg = self._theme_color("plot_panel_bg", "#162334")
         plot_text = self._theme_color("plot_text", "#d7e4f0")
         plot_grid = self._theme_color("plot_grid", "#2f4666")
-        if hasattr(self, "plot_canvas") and hasattr(self, "ax_alt"):
-            self.plot_canvas.figure.patch.set_facecolor(plot_bg)
-            self.ax_alt.set_facecolor(plot_panel_bg)
-            self.ax_alt.tick_params(axis="x", colors=plot_text)
-            self.ax_alt.tick_params(axis="y", colors=plot_text)
-            for spine in self.ax_alt.spines.values():
+        plot_canvas = getattr(self, "plot_canvas", None)
+        ax_alt = getattr(self, "ax_alt", None)
+        if plot_canvas is not None and ax_alt is not None:
+            plot_canvas.figure.patch.set_facecolor(plot_bg)
+            ax_alt.set_facecolor(plot_panel_bg)
+            ax_alt.tick_params(axis="x", colors=plot_text)
+            ax_alt.tick_params(axis="y", colors=plot_text)
+            for spine in ax_alt.spines.values():
                 spine.set_color(plot_grid)
-            self.ax_alt.xaxis.label.set_color(plot_text)
-            self.ax_alt.yaxis.label.set_color(plot_text)
-            self.ax_alt.title.set_color(plot_text)
+            ax_alt.xaxis.label.set_color(plot_text)
+            ax_alt.yaxis.label.set_color(plot_text)
+            ax_alt.title.set_color(plot_text)
         if hasattr(self, "polar_canvas") and hasattr(self, "polar_ax"):
             self.polar_canvas.figure.patch.set_facecolor(plot_bg)
             self.polar_ax.set_facecolor(plot_panel_bg)
@@ -12787,18 +12956,21 @@ class MainWindow(QMainWindow):
                     pass
             if hasattr(self, "_radar_echo_artists") or hasattr(self, "radar_sweep_mesh") or (hasattr(self, "radar_echo_scatter") and self.radar_echo_scatter is not None):
                 self._refresh_radar_sweep_artists(redraw=False)
-        if hasattr(self, "plot_canvas"):
-            self.plot_canvas.draw_idle()
+        if plot_canvas is not None:
+            plot_canvas.draw_idle()
         if hasattr(self, "polar_canvas"):
             self.polar_canvas.draw_idle()
 
     def _apply_styles(self):
         """Apply a custom stylesheet, fonts, and default icon sizes."""
-        display_family = self._pick_font_family(
-            ["Rajdhani", "SF Pro Display", "Avenir Next", "Inter", "Segoe UI Semibold", "Helvetica Neue", "Arial"]
-        )
+        display_family = str(
+            getattr(self, "_display_font_family", "") or self._pick_font_family(
+                ["Rajdhani", "SF Pro Display", "Avenir Next", "Inter", "Segoe UI Semibold", "Helvetica Neue", "Arial"]
+            )
+        ).strip()
+        self._display_font_family = display_family
         body_family = display_family
-        font_size = max(9, min(16, int(getattr(self, "_ui_font_size", 11))))
+        font_size = _sanitize_ui_font_size(getattr(self, "_ui_font_size", 11))
         app_font = QFont(body_family)
         app_font.setPointSize(font_size)
         QApplication.setFont(app_font)
@@ -12818,6 +12990,8 @@ class MainWindow(QMainWindow):
             display_font_family=display_family,
             overrides=theme_overrides or None,
         )
+        if hasattr(self, "_visibility_web_html_cache"):
+            self._visibility_web_html_cache.clear()
         stylesheet = build_stylesheet(
             self._theme_name,
             dark_enabled=getattr(self, "_dark_enabled", False),
@@ -12849,6 +13023,12 @@ class MainWindow(QMainWindow):
                 self.visibility_loading_widget.setStyleSheet(f"background:{self._theme_color('plot_bg', '#0f192b')};")
             except Exception:
                 pass
+        bootstrap_placeholder = getattr(self, "_visibility_bootstrap_placeholder", None)
+        if isinstance(bootstrap_placeholder, QWidget):
+            try:
+                bootstrap_placeholder.setStyleSheet(f"background:{self._theme_color('plot_bg', '#0f192b')};")
+            except Exception:
+                pass
         for placeholder in getattr(self, "_cutout_image_placeholders", {}).values():
             if isinstance(placeholder, QWidget):
                 try:
@@ -12877,7 +13057,7 @@ class MainWindow(QMainWindow):
             )
             default_colors = {"below": palette.below, "limit": palette.limit, "above": palette.above}
             self.table_model.highlight_colors = {
-                key: QColor(_resolve_table_highlight_color(self.settings, key, default_colors[key]))
+                key: _qcolor_from_token(_resolve_table_highlight_color(self.settings, key, default_colors[key]), default_colors[key])
                 for key in default_colors
             }
             if hasattr(self, "_emit_table_data_changed"):
@@ -13011,6 +13191,68 @@ class MainWindow(QMainWindow):
         layout.addWidget(card, 1)
         widget._loading_hint_label = hint_label  # type: ignore[attr-defined]
         return widget
+
+    def _ensure_visibility_plot_widgets(self) -> None:
+        if bool(getattr(self, "_visibility_plot_widgets_ready", False)):
+            return
+
+        if self.plot_canvas is None or self.ax_alt is None:
+            self.plot_canvas = FigureCanvas(Figure(figsize=(6, 4), tight_layout=True))
+            self.plot_canvas.setContentsMargins(0, 0, 0, 0)
+            self.plot_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.ax_alt = self.plot_canvas.figure.subplots()
+            self.ax_alt.margins(x=0, y=0)
+
+        if self._use_visibility_web and QWebEngineView is not None:
+            self.visibility_web = QWebEngineView(self)
+            self.visibility_web.setMinimumHeight(320)
+            self.visibility_web.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.visibility_web.setStyleSheet(f"background:{self._theme_color('plot_bg', '#121b29')};")
+            self.visibility_web.setToolTip("Interactive visibility chart. Use Plotly controls in the top-right to zoom, pan and reset.")
+            self.visibility_loading_widget = self._build_web_loading_placeholder(
+                "Visibility Plot",
+                "Computing night tracks…",
+            )
+            self.visibility_plot_stack = QStackedLayout()
+            self.visibility_plot_stack.setContentsMargins(0, 0, 0, 0)
+            self.visibility_plot_host = QWidget(self)
+            self.visibility_plot_host.setAttribute(Qt.WA_StyledBackground, True)
+            self.visibility_plot_host.setStyleSheet(f"background:{self._theme_color('plot_bg', '#121b29')};")
+            self.visibility_plot_host.setLayout(self.visibility_plot_stack)
+            self.visibility_plot_stack.addWidget(self.visibility_loading_widget)
+            self.visibility_plot_stack.addWidget(self.visibility_web)
+            self.visibility_plot_stack.setCurrentWidget(self.visibility_loading_widget)
+            self.visibility_web.loadFinished.connect(self._on_visibility_web_load_finished)
+            plot_content_widget = self.visibility_plot_host
+        else:
+            self.plot_toolbar = NavigationToolbar(self.plot_canvas, self)
+            self.plot_toolbar.setIconSize(QSize(16, 16))
+            self.plot_toolbar.layout().setContentsMargins(0, 0, 0, 0)
+            self.plot_toolbar.layout().setSpacing(0)
+            self.plot_toolbar.addSeparator()
+            self.plot_toolbar.addWidget(self.plot_mode_widget)
+            self.plot_toolbar.setMaximumHeight(self.plot_toolbar.sizeHint().height())
+            plot_content_widget = self.plot_canvas
+
+        placeholder = getattr(self, "_visibility_bootstrap_placeholder", None)
+        plot_layout = getattr(self, "plot_card_layout", None)
+        if isinstance(plot_layout, QVBoxLayout):
+            if isinstance(placeholder, QWidget):
+                plot_layout.removeWidget(placeholder)
+                placeholder.hide()
+            if self.plot_toolbar is not None and plot_layout.indexOf(self.plot_toolbar) < 0:
+                plot_layout.insertWidget(0, self.plot_toolbar)
+            if isinstance(plot_content_widget, QWidget) and plot_layout.indexOf(plot_content_widget) < 0:
+                plot_layout.addWidget(plot_content_widget, 1)
+
+        self._visibility_plot_widgets_ready = True
+        self._refresh_mpl_theme()
+
+    def _ensure_visibility_plot_placeholder_message(self, message: str) -> None:
+        placeholder = getattr(self, "_visibility_bootstrap_placeholder", None)
+        hint_label = getattr(placeholder, "_loading_hint_label", None)
+        if isinstance(hint_label, QLabel):
+            hint_label.setText(message)
 
     def _create_cutout_image_stack(
         self,
@@ -13247,7 +13489,7 @@ class MainWindow(QMainWindow):
     def _show_visibility_matplotlib_placeholder(self, title: str, message: str) -> None:
         if getattr(self, "_use_visibility_web", False):
             return
-        if not hasattr(self, "ax_alt") or not hasattr(self, "plot_canvas"):
+        if getattr(self, "ax_alt", None) is None or getattr(self, "plot_canvas", None) is None:
             return
         plot_bg = self._theme_color("plot_bg", "#0f1825")
         plot_panel_bg = self._theme_color("plot_panel_bg", "#162334")
@@ -13285,6 +13527,8 @@ class MainWindow(QMainWindow):
 
     def _begin_visibility_refresh(self, message: str) -> None:
         self._visibility_web_has_content = False
+        if not bool(getattr(self, "_visibility_plot_widgets_ready", False)):
+            self._ensure_visibility_plot_placeholder_message(message)
         if getattr(self, "visibility_web", None) is not None:
             self.visibility_web.setEnabled(False)
             self._set_visibility_loading_state(message, visible=True)
@@ -13574,6 +13818,119 @@ class MainWindow(QMainWindow):
             if 0 <= row < len(self.targets):
                 names.append(self.targets[row].name)
         return names
+
+    def _refresh_visibility_matplotlib_mode_only(self, data: Optional[dict] = None) -> None:
+        payload = data if isinstance(data, dict) else getattr(self, "last_payload", None)
+        if not isinstance(payload, dict):
+            return
+        self._ensure_visibility_plot_widgets()
+        if getattr(self, "ax_alt", None) is None or getattr(self, "plot_canvas", None) is None:
+            return
+        times = payload.get("times")
+        if not isinstance(times, np.ndarray) and not isinstance(times, list):
+            return
+        sample_count = len(times)
+        limit = float(self.limit_spin.value())
+        sun_alt_series = np.array(payload.get("sun_alt", np.full(sample_count, np.nan)), dtype=float)
+        sun_alt_limit = self._sun_alt_limit()
+        obs_sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= sun_alt_limit)
+
+        base_lines: dict[str, Any] = {}
+        high_lines: dict[str, Any] = {}
+        for name, line, is_over in list(getattr(self, "vis_lines", [])):
+            if is_over:
+                high_lines[name] = line
+            else:
+                base_lines[name] = line
+
+        for tgt in self.targets:
+            row = payload.get(tgt.name)
+            if not isinstance(row, dict):
+                continue
+            alt = np.array(row.get("altitude", np.full(sample_count, np.nan)), dtype=float)
+            if alt.shape[0] != sample_count:
+                continue
+            base_line = base_lines.get(tgt.name)
+            if base_line is not None:
+                alt_vis = np.array(alt, copy=True)
+                alt_vis[~(np.isfinite(alt) & (alt > 0.0))] = np.nan
+                base_line.set_ydata(self._plot_y_values(alt_vis))
+            high_line = high_lines.get(tgt.name)
+            if high_line is not None:
+                alt_high = np.array(alt, copy=True)
+                alt_high[~(np.isfinite(alt) & (alt >= limit) & obs_sun_mask)] = np.nan
+                high_line.set_ydata(self._plot_y_values(alt_high))
+
+        if getattr(self, "sun_line", None) is not None and "sun_alt" in payload:
+            self.sun_line.set_ydata(self._plot_y_values(payload["sun_alt"]))
+        if getattr(self, "moon_line", None) is not None and "moon_alt" in payload:
+            self.moon_line.set_ydata(self._plot_y_values(payload["moon_alt"]))
+        if getattr(self, "limit_line", None) is not None:
+            limit_value = self._plot_limit_value()
+            self.limit_line.set_ydata([limit_value, limit_value])
+            self.limit_line.set_label("Limit Airmass" if self._plot_airmass else "Limit Altitude")
+
+        self._configure_main_plot_y_axis()
+        plot_text = self._theme_color("plot_text", "#d7e4f0")
+        self.ax_alt.xaxis.label.set_color(plot_text)
+        self.ax_alt.yaxis.label.set_color(plot_text)
+        self.ax_alt.tick_params(axis="x", colors=plot_text)
+        self.ax_alt.tick_params(axis="y", colors=plot_text)
+        self.plot_canvas.draw_idle()
+
+    def _visibility_web_render_signature(
+        self,
+        data: dict,
+        *,
+        now_override: Optional[datetime] = None,
+    ) -> str:
+        current_now = now_override if isinstance(now_override, datetime) else data.get("now_local")
+        now_key = (
+            current_now.strftime("%Y-%m-%d %H:%M")
+            if isinstance(current_now, datetime)
+            else ""
+        )
+        target_signature = [
+            (
+                str(tgt.name),
+                _normalized_css_color(getattr(tgt, "plot_color", "")),
+                bool(self.table_model.row_enabled[idx]) if idx < len(self.table_model.row_enabled) else True,
+            )
+            for idx, tgt in enumerate(self.targets)
+        ]
+        signature_payload = {
+            "context": str(data.get("site_key", "") or self._current_visibility_context_key()),
+            "mode": "airmass" if self._plot_airmass else "altitude",
+            "theme": str(getattr(self, "_theme_name", DEFAULT_UI_THEME)),
+            "dark": bool(getattr(self, "_dark_enabled", False)),
+            "date": self.date_edit.date().toString("yyyy-MM-dd") if hasattr(self, "date_edit") else "",
+            "sun": bool(self.sun_check.isChecked()) if hasattr(self, "sun_check") else True,
+            "moon": bool(self.moon_check.isChecked()) if hasattr(self, "moon_check") else True,
+            "selected": sorted(self._selected_target_names()),
+            "targets": target_signature,
+            "now": now_key,
+        }
+        serialized = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
+    def _store_visibility_web_html_cache(self, cache_key: str, html: str) -> None:
+        cache = getattr(self, "_visibility_web_html_cache", {})
+        cache[str(cache_key)] = str(html)
+        while len(cache) > 8:
+            cache.pop(next(iter(cache)))
+        self._visibility_web_html_cache = cache
+
+    def _schedule_visibility_plot_refresh(self, *, delay_ms: int = 0) -> None:
+        if not isinstance(getattr(self, "last_payload", None), dict):
+            return
+        if getattr(self, "_use_visibility_web", False):
+            self._ensure_visibility_plot_widgets()
+        self._visibility_plot_refresh_timer.start(max(0, int(delay_ms)))
+
+    @Slot()
+    def _flush_visibility_plot_refresh(self) -> None:
+        if isinstance(getattr(self, "last_payload", None), dict):
+            self._render_visibility_web_plot(self.last_payload)
 
     def _apply_visibility_line_style(self, line: object, *, is_over: bool, is_selected: bool) -> None:
         if line is None:
@@ -13928,11 +14285,20 @@ class MainWindow(QMainWindow):
         *,
         now_override: Optional[datetime] = None,
     ) -> None:
-        web_view = getattr(self, "visibility_web", None)
         payload = data if isinstance(data, dict) else getattr(self, "last_payload", None)
-        if web_view is None or not isinstance(payload, dict):
+        if not isinstance(payload, dict):
             return
-        html = self._build_visibility_plotly_html(payload, now_override=now_override)
+        if getattr(self, "_use_visibility_web", False):
+            self._ensure_visibility_plot_widgets()
+        web_view = getattr(self, "visibility_web", None)
+        if web_view is None:
+            return
+        cache_key = self._visibility_web_render_signature(payload, now_override=now_override)
+        html = self._visibility_web_html_cache.get(cache_key)
+        if not html:
+            html = self._build_visibility_plotly_html(payload, now_override=now_override)
+            if html:
+                self._store_visibility_web_html_cache(cache_key, html)
         if not html:
             self._visibility_web_has_content = False
             self._set_visibility_loading_state("Unable to render interactive chart.", visible=True)
@@ -14792,7 +15158,14 @@ class MainWindow(QMainWindow):
             self._finder_prefetch_done_status()
             self._finder_prefetch_active = False
 
-    def _update_finder_chart_for_target(self, target: Target, key: str, *, background: bool = False):
+    def _update_finder_chart_for_target(
+        self,
+        target: Target,
+        key: str,
+        *,
+        background: bool = False,
+        cache_only: bool = False,
+    ):
         if not hasattr(self, "finder_image_label"):
             return
         if (
@@ -14836,6 +15209,10 @@ class MainWindow(QMainWindow):
                 self._set_cutout_image_loading("finder", "", visible=False)
                 self._set_finder_status(f"Finder: cached ({target.name})", busy=False)
                 self._finder_displayed_key = key
+            return
+        if cache_only:
+            if not background:
+                self._set_finder_status(f"Finder: cache miss ({target.name})", busy=False)
             return
         if self._finder_pending_key == key:
             if not background:
@@ -15139,9 +15516,10 @@ class MainWindow(QMainWindow):
             return
         self._drain_cutout_prefetch_queue()
 
-    def _update_cutout_preview_for_target(self, target: Optional[Target]):
+    def _update_cutout_preview_for_target(self, target: Optional[Target], *, cache_only: bool = False):
         if not hasattr(self, "cutout_image_label"):
             return
+        use_cache_only = bool(cache_only)
 
         if target is None:
             if self._cutout_reply is not None and not self._cutout_reply.isFinished():
@@ -15174,7 +15552,7 @@ class MainWindow(QMainWindow):
         ):
             return
         if show_finder:
-            self._update_finder_chart_for_target(target, key)
+            self._update_finder_chart_for_target(target, key, cache_only=use_cache_only)
 
         if key in self._cutout_cache:
             aladin_pix = self._cutout_cache[key]
@@ -15185,7 +15563,7 @@ class MainWindow(QMainWindow):
             self._set_aladin_status(f"Aladin: cached ({target.name})", busy=False)
             self._prefetch_cutouts_for_all_targets(prioritize=target)
             if show_finder:
-                self._update_finder_chart_for_target(target, key)
+                self._update_finder_chart_for_target(target, key, cache_only=use_cache_only)
             else:
                 self._prefetch_finder_charts_for_all_targets(prioritize=target)
             self._cutout_displayed_key = key
@@ -15201,7 +15579,7 @@ class MainWindow(QMainWindow):
             self._set_aladin_status(f"Aladin: cached ({target.name})", busy=False)
             self._prefetch_cutouts_for_all_targets(prioritize=target)
             if show_finder:
-                self._update_finder_chart_for_target(target, key)
+                self._update_finder_chart_for_target(target, key, cache_only=use_cache_only)
             else:
                 self._prefetch_finder_charts_for_all_targets(prioritize=target)
             self._cutout_displayed_key = key
@@ -15217,10 +15595,17 @@ class MainWindow(QMainWindow):
             self._set_aladin_status(f"Aladin: cached ({target.name})", busy=False)
             self._prefetch_cutouts_for_all_targets(prioritize=target)
             if show_finder:
-                self._update_finder_chart_for_target(target, key)
+                self._update_finder_chart_for_target(target, key, cache_only=use_cache_only)
             else:
                 self._prefetch_finder_charts_for_all_targets(prioritize=target)
             self._cutout_displayed_key = cached_key
+            return
+        if use_cache_only:
+            self._set_aladin_status(f"Aladin: cache miss ({target.name})", busy=False)
+            if show_finder:
+                self._update_finder_chart_for_target(target, key, cache_only=True)
+            if not getattr(self, "_cutout_displayed_key", ""):
+                self._set_cutout_placeholder("Preview not cached yet")
             return
 
         if key == self._cutout_pending_key and self._cutout_reply is not None and not self._cutout_reply.isFinished():
@@ -15402,17 +15787,16 @@ class MainWindow(QMainWindow):
         self.aladin_image_label.set_zoom(float(CUTOUT_ALADIN_INITIAL_PAN_ZOOM))
 
     @Slot(str)
-    def _on_obs_change(self, name: str):
+    def _on_obs_change(self, name: str, *, defer_replot: bool = False):
         logger.info("Observatory switched to %s", name)
         """Populate site fields when an observatory is selected."""
         site = self.observatories.get(name)
         if site is None:
             return
-        self.lat_edit.setText(f"{site.latitude}")
-        self.lon_edit.setText(f"{site.longitude}")
-        self.elev_edit.setText(f"{site.elevation}")
+        if hasattr(self, "settings"):
+            self.settings.setValue("general/defaultSite", name)
+        self._prime_selected_observatory(name)
         # Update the table model and replot with debounce
-        self.table_model.site = site
         self._clear_table_dynamic_cache()
         self.target_metrics.clear()
         self.target_windows.clear()
@@ -15421,21 +15805,33 @@ class MainWindow(QMainWindow):
         self.table_model.color_map.clear()
         self.table_model.layoutChanged.emit()
         self._validate_site_inputs()
-        self._begin_visibility_refresh(f"Updating view for {name}…")
-        self._replot_timer.start()
-        if hasattr(self, "aladin_image_label"):
-            self._set_cutout_image_loading("aladin", f"Loading Aladin preview for {name}…", visible=True)
-        if hasattr(self, "finder_image_label"):
-            self._set_cutout_image_loading("finder", f"Loading finder chart for {name}…", visible=True)
-        weather_window = getattr(self, "weather_window", None)
-        if isinstance(weather_window, WeatherDialog):
-            weather_window._set_weather_plot_loading("conditions", "Updating conditions…", visible=True)
-            weather_window._set_weather_plot_loading("meteogram", "Updating meteogram…", visible=True)
-            weather_window._set_weather_image_loading("cloud_map", "Updating cloud climatology…", visible=True)
-            weather_window._set_weather_image_loading("satellite", "Updating satellite preview…", visible=True)
+        if not defer_replot:
+            self._begin_visibility_refresh(f"Updating view for {name}…")
+            self._replot_timer.start()
+            if hasattr(self, "aladin_image_label"):
+                self._set_cutout_image_loading("aladin", f"Loading Aladin preview for {name}…", visible=True)
+            if hasattr(self, "finder_image_label"):
+                self._set_cutout_image_loading("finder", f"Loading finder chart for {name}…", visible=True)
+            weather_window = getattr(self, "weather_window", None)
+            if isinstance(weather_window, WeatherDialog):
+                weather_window._set_weather_plot_loading("conditions", "Updating conditions…", visible=True)
+                weather_window._set_weather_plot_loading("meteogram", "Updating meteogram…", visible=True)
+                weather_window._set_weather_image_loading("cloud_map", "Updating cloud climatology…", visible=True)
+                weather_window._set_weather_image_loading("satellite", "Updating satellite preview…", visible=True)
         self._obs_change_finalize_pending = True
         self._schedule_plan_autosave()
         QTimer.singleShot(0, lambda n=str(name): self._finalize_observatory_change(n))
+
+    def _prime_selected_observatory(self, name: str) -> bool:
+        site = self.observatories.get(name)
+        if site is None:
+            return False
+        self.lat_edit.setText(f"{site.latitude}")
+        self.lon_edit.setText(f"{site.longitude}")
+        self.elev_edit.setText(f"{site.elevation}")
+        self.table_model.site = site
+        self._validate_site_inputs()
+        return True
 
     def _finalize_observatory_change(self, name: str) -> None:
         if not hasattr(self, "obs_combo") or self.obs_combo.currentText() != name:
@@ -15456,7 +15852,8 @@ class MainWindow(QMainWindow):
         if site is None:
             return
         self._sync_cutout_fov_to_site(site)
-        self._update_cutout_preview_for_target(self._selected_target_or_none())
+        if not getattr(self, "_defer_startup_preview_updates", False):
+            self._update_cutout_preview_for_target(self._selected_target_or_none())
         self._refresh_weather_window_context()
 
     def _current_limiting_magnitude(self) -> float:
@@ -16002,39 +16399,13 @@ class MainWindow(QMainWindow):
                 logger.warning("Failed to load observatories from storage: %s", exc)
 
         cfg_path = self._observatories_config_path()
-        loaded: dict[str, Site] = {}
-        preset_keys: dict[str, str] = {}
         if cfg_path.exists():
             try:
                 payload = json.loads(cfg_path.read_text(encoding="utf-8"))
-                loaded, preset_keys = self._parse_custom_observatories_payload(payload)
+                return self._parse_custom_observatories_payload(payload)
             except Exception as exc:
                 logger.warning("Failed to parse %s: %s", cfg_path, exc)
-        if loaded:
-            if storage is not None:
-                try:
-                    self._save_custom_observatories(loaded, preset_keys=preset_keys)
-                except Exception as exc:
-                    logger.warning("Failed to migrate observatories into storage: %s", exc)
-            return loaded, preset_keys
-
-        raw = self.settings.value("general/customObservatories", "", type=str)
-        if not raw:
-            return {}, {}
-        try:
-            migrated, migrated_preset_keys = self._parse_custom_observatories_payload(json.loads(raw))
-        except Exception:
-            logger.warning("Failed to parse legacy custom observatories from settings.")
-            return {}, {}
-        if migrated:
-            loaded = migrated
-            preset_keys = migrated_preset_keys
-            if storage is not None:
-                self._save_custom_observatories(migrated, preset_keys=preset_keys)
-                self.settings.remove("general/customObservatories")
-                self.settings.setValue("__meta/customObservatoriesMigrated", True)
-                logger.info("Migrated %d observatories to SQLite storage", len(migrated))
-        return loaded, preset_keys
+        return {}, {}
 
     def _save_custom_observatories(
         self,
@@ -16075,24 +16446,31 @@ class MainWindow(QMainWindow):
         if storage is not None:
             try:
                 storage.observatories.replace_all(observatory_items)
-                self.settings.remove("general/customObservatories")
-                self.settings.setValue("__meta/customObservatoriesMigrated", True)
                 return
             except Exception as exc:
                 logger.warning("Failed to save observatories to storage: %s", exc)
                 return
 
-    def _refresh_observatory_combo(self, selected_name: Optional[str] = None):
+    def _refresh_observatory_combo(
+        self,
+        selected_name: Optional[str] = None,
+        *,
+        emit_selection_change: bool = False,
+    ):
         current = selected_name or self.obs_combo.currentText()
         self.obs_combo.blockSignals(True)
         self.obs_combo.clear()
         self.obs_combo.addItems(self.observatories.keys())
-        self.obs_combo.blockSignals(False)
-        self._update_obs_combo_widths()
         if current in self.observatories:
             self.obs_combo.setCurrentText(current)
         elif self.obs_combo.count() > 0:
             self.obs_combo.setCurrentIndex(0)
+        self.obs_combo.blockSignals(False)
+        self._update_obs_combo_widths()
+        if emit_selection_change:
+            selected = self.obs_combo.currentText().strip()
+            if selected:
+                self._on_obs_change(selected)
 
     def _lookup_observatory_coordinates(self, query: str) -> tuple[float, float, Optional[float], str]:
         q = query.strip()
@@ -16153,10 +16531,12 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _open_observatory_manager(self):
+        current_name = self.obs_combo.currentText() if hasattr(self, "obs_combo") else ""
         dlg = ObservatoryManagerDialog(
             self.observatories,
             self,
             preset_keys=getattr(self, "_observatory_preset_keys", {}),
+            selected_name=current_name,
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -16301,14 +16681,20 @@ class MainWindow(QMainWindow):
             self._observatory_preset_keys[name] = "custom"
             self._save_custom_observatories()
             self._refresh_observatory_combo(selected_name=name)
+            self.settings.setValue("general/defaultSite", name)
+            self._on_obs_change(name)
             return
     def __init__(self):
         super().__init__()
         self.setObjectName(self.__class__.__name__)
-        fallback_family = QApplication.font().family() or "Arial"
-        QFont.insertSubstitution("Sans Serif", fallback_family)
-        QFont.insertSubstitution("SF Pro Text", fallback_family)
-        QFont.insertSubstitution("SF Pro Display", fallback_family)
+        fallback_family = _resolved_platform_ui_font_family()
+        if fallback_family not in {"", "Sans Serif"}:
+            QFont.insertSubstitution("Sans Serif", fallback_family)
+            QFont.insertSubstitution("SF Pro Text", fallback_family)
+            QFont.insertSubstitution("SF Pro Display", fallback_family)
+            bootstrap_font = QFont(fallback_family)
+            bootstrap_font.setPointSize(11)
+            QApplication.setFont(bootstrap_font)
         # Initialize clock_worker early so callbacks can safely reference it
         self.clock_worker = None
         # Keep references to every ClockWorker we create so they can all be stopped
@@ -16331,11 +16717,20 @@ class MainWindow(QMainWindow):
         self._plan_autosave_timer.setSingleShot(True)
         self._plan_autosave_timer.timeout.connect(self._flush_plan_autosave)
         self._suspend_plan_autosave = False
+        self._defer_startup_preview_updates = False
+        self._startup_restore_pending = True
+        self._obs_change_finalize_pending = False
         logger.info("Using settings file: %s", self.settings.fileName())
         self._migrate_table_settings_schema()
         self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
-        self._ui_font_size = max(9, min(16, self.settings.value("general/uiFontSize", 11, type=int)))
+        self._ui_font_size = _sanitize_ui_font_size(self.settings.value("general/uiFontSize", 11, type=int))
+        self._display_font_family = self._pick_font_family(
+            ["Rajdhani", "SF Pro Display", "Avenir Next", "Inter", "Segoe UI Semibold", "Helvetica Neue", "Arial"]
+        )
+        startup_font = QFont(self._display_font_family)
+        startup_font.setPointSize(self._ui_font_size)
+        QApplication.setFont(startup_font)
 
         # ── Polar-path visibility flags (persisted) ───────────────────────────
         self.show_sun_path  = self.settings.value("general/showSunPath",  True, type=bool)
@@ -16457,6 +16852,7 @@ class MainWindow(QMainWindow):
         self._bhtom_worker_request_id = 0
         self._bhtom_worker_mode = ""
         self._bhtom_worker_cache_key: Optional[tuple[str, str]] = None
+        self._bhtom_worker_source = ""
         self._bhtom_dialog: Optional[SuggestedTargetsDialog] = None
         self._finder_workers: list[FinderChartWorker] = []
         self._finder_worker: Optional[FinderChartWorker] = None
@@ -16479,11 +16875,17 @@ class MainWindow(QMainWindow):
         self._finder_timeout_timer.setSingleShot(True)
         self._finder_timeout_timer.setInterval(FINDER_WORKER_TIMEOUT_MS)
         self._finder_timeout_timer.timeout.connect(self._on_finder_chart_timeout)
+        self._startup_weather_worker: Optional[WeatherLiveWorker] = None
         self._cutout_resize_timer = QTimer(self)
         self._cutout_resize_timer.setSingleShot(True)
         self._cutout_resize_timer.setInterval(260)
         self._cutout_resize_timer.timeout.connect(self._on_cutout_resize_timeout)
         self._cutout_last_resize_signature: Optional[tuple] = None
+        self._visibility_plot_refresh_timer = QTimer(self)
+        self._visibility_plot_refresh_timer.setSingleShot(True)
+        self._visibility_plot_refresh_timer.setInterval(0)
+        self._visibility_plot_refresh_timer.timeout.connect(self._flush_visibility_plot_refresh)
+        self._visibility_web_html_cache: dict[str, str] = {}
         self._table_column_width_reset_requested = False
         self._table_column_width_timer = QTimer(self)
         self._table_column_width_timer.setSingleShot(True)
@@ -16496,6 +16898,7 @@ class MainWindow(QMainWindow):
         self.table_view.setObjectName("MainTargetsTable")
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.deleteRequested.connect(self._delete_selected_targets)
+        self.table_view.hoverRowChanged.connect(self.table_model.set_hover_row)
         self.table_view.setItemDelegate(TargetTableGlowDelegate(self.table_view))
         # Make columns only as wide as their contents
         header = self.table_view.horizontalHeader()
@@ -16516,6 +16919,7 @@ class MainWindow(QMainWindow):
         self.table_model.modelReset.connect(self._schedule_plan_autosave)
         self.table_model.rowsInserted.connect(lambda *_: self._schedule_plan_autosave())
         self.table_model.rowsRemoved.connect(lambda *_: self._schedule_plan_autosave())
+        self.table_view.layoutWidthChanged.connect(lambda: self._schedule_table_column_width_refresh(reset_widths=True))
         # NOTE: Reapply table settings and default sort are now handled explicitly after layoutChanged.emit()
         # # Apply saved settings now that table_view exists
         # self._load_settings()
@@ -16625,6 +17029,7 @@ class MainWindow(QMainWindow):
         self.table_view.selectionModel().selectionChanged.connect(self._update_selected_details)
         # Holder for visibility line artists per target, with over-limit flag
         self.vis_lines: list[tuple[str, Any, bool]] = []
+        self.limit_line = None
         # Connect pick event for polar scatter
         self.polar_canvas.mpl_connect('pick_event', self._on_polar_pick)
         self.polar_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -16725,9 +17130,10 @@ class MainWindow(QMainWindow):
         self.obs_combo.setCurrentText(init_site)
         self.obs_combo.blockSignals(False)
         self.obs_combo.currentTextChanged.connect(self._on_obs_change)
-        # Ensure site fields & clock worker start immediately for final startup site.
+        # Prime the initial site fields without kicking background work before
+        # workspace restore decides what the real startup context should be.
         if init_site:
-            self._on_obs_change(init_site)
+            self._prime_selected_observatory(init_site)
         self.obs_combo.setMinimumContentsLength(26)
         self.obs_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.obs_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -16749,38 +17155,22 @@ class MainWindow(QMainWindow):
         self.lon_edit.editingFinished.connect(self._on_site_inputs_changed)
         self.elev_edit.editingFinished.connect(self._on_site_inputs_changed)
 
-        self.plot_canvas = FigureCanvas(Figure(figsize=(6, 4), tight_layout=True))
-        self.plot_canvas.setContentsMargins(0, 0, 0, 0)
-        self.ax_alt = self.plot_canvas.figure.subplots()
-        self.ax_alt.margins(x=0, y=0)
         self._use_visibility_web = bool(_HAS_QTWEBENGINE and _HAS_PLOTLY and QWebEngineView is not None)
         self._visibility_web_minute_key = ""
         self._visibility_web_has_content = False
-        if self._use_visibility_web and QWebEngineView is not None:
-            self.visibility_web = QWebEngineView(self)
-            self.visibility_web.setMinimumHeight(320)
-            self.visibility_web.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.visibility_web.setStyleSheet(f"background:{self._theme_color('plot_bg', '#121b29')};")
-            self.visibility_web.setToolTip("Interactive visibility chart. Use Plotly controls in the top-right to zoom, pan and reset.")
-            self.visibility_loading_widget = self._build_web_loading_placeholder(
-                "Visibility Plot",
-                "Computing night tracks…",
-            )
-            self.visibility_plot_stack = QStackedLayout()
-            self.visibility_plot_stack.setContentsMargins(0, 0, 0, 0)
-            self.visibility_plot_host = QWidget(self)
-            self.visibility_plot_host.setAttribute(Qt.WA_StyledBackground, True)
-            self.visibility_plot_host.setStyleSheet(f"background:{self._theme_color('plot_bg', '#121b29')};")
-            self.visibility_plot_host.setLayout(self.visibility_plot_stack)
-            self.visibility_plot_stack.addWidget(self.visibility_loading_widget)
-            self.visibility_plot_stack.addWidget(self.visibility_web)
-            self.visibility_plot_stack.setCurrentWidget(self.visibility_loading_widget)
-            self.visibility_web.loadFinished.connect(self._on_visibility_web_load_finished)
-        else:
-            self.visibility_web = None
-            self.visibility_loading_widget = None
-            self.visibility_plot_stack = None
-            self.visibility_plot_host = None
+        self.plot_canvas = None
+        self.ax_alt = None
+        self.plot_toolbar = None
+        self.visibility_web = None
+        self.visibility_loading_widget = None
+        self.visibility_plot_stack = None
+        self.visibility_plot_host = None
+        self._visibility_plot_widgets_ready = False
+        self._visibility_bootstrap_placeholder = self._build_web_loading_placeholder(
+            "Visibility Plot",
+            "Preparing chart…",
+        )
+        self._visibility_bootstrap_placeholder.setMinimumHeight(320)
 
         self.plot_mode_widget = QWidget(self)
         self.plot_mode_widget.setObjectName("PlotModeWidget")
@@ -16806,7 +17196,6 @@ class MainWindow(QMainWindow):
         self._refresh_plot_mode_switch()
         self._update_plot_mode_label_metrics()
         if self._use_visibility_web:
-            self.plot_toolbar = None
             self.plot_controls_bar = QWidget(self)
             self.plot_controls_bar.setObjectName("PlotControlsBar")
             plot_controls_layout = QHBoxLayout(self.plot_controls_bar)
@@ -16822,14 +17211,6 @@ class MainWindow(QMainWindow):
         else:
             self.plot_controls_bar = None
             self.plot_hint_label = None
-            # Matplotlib toolbar
-            self.plot_toolbar = NavigationToolbar(self.plot_canvas, self)
-            self.plot_toolbar.setIconSize(QSize(16, 16))
-            self.plot_toolbar.layout().setContentsMargins(0, 0, 0, 0)
-            self.plot_toolbar.layout().setSpacing(0)
-            self.plot_toolbar.addSeparator()
-            self.plot_toolbar.addWidget(self.plot_mode_widget)
-            self.plot_toolbar.setMaximumHeight(self.plot_toolbar.sizeHint().height())
 
         # top controls
         # Date selector with previous/next day buttons
@@ -16982,6 +17363,10 @@ class MainWindow(QMainWindow):
         suggest_targets_btn = QPushButton("Suggest Targets")
         suggest_targets_btn.setMinimumHeight(24)
         suggest_targets_btn.clicked.connect(self._ai_suggest_targets)
+        suggest_targets_btn.setToolTip(
+            "Check cached BHTOM targets first (TTL 1h). "
+            "A fresh fetch starts only when the cache is missing or expired."
+        )
         _set_button_variant(suggest_targets_btn, "primary")
         _set_button_icon_kind(suggest_targets_btn, "suggest")
         self.quick_targets_btn = QPushButton("Quick Targets")
@@ -17062,16 +17447,13 @@ class MainWindow(QMainWindow):
         plot_l = QVBoxLayout()
         plot_l.setContentsMargins(2, 2, 2, 2)
         plot_l.setSpacing(2)
-        if self._use_visibility_web and self.visibility_web is not None:
+        if self._use_visibility_web and self.plot_controls_bar is not None:
             if self.plot_controls_bar is not None:
                 plot_l.addWidget(self.plot_controls_bar)
-            plot_l.addWidget(self.visibility_plot_host, 1)
-        else:
-            if self.plot_toolbar is not None:
-                plot_l.addWidget(self.plot_toolbar)
-            plot_l.addWidget(self.plot_canvas)
+        plot_l.addWidget(self._visibility_bootstrap_placeholder, 1)
         plot_card.setLayout(plot_l)
-        self.plot_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.plot_card = plot_card
+        self.plot_card_layout = plot_l
 
         self.table_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.table_view.setAlternatingRowColors(True)
@@ -17369,8 +17751,7 @@ class MainWindow(QMainWindow):
         main_l.setSpacing(0)
         main_l.addWidget(main_vertical)
         main_area.setLayout(main_l)
-        self.ai_window = self._build_ai_window()
-        self.ai_window.hide()
+        self.ai_window: Optional[QDialog] = None
         self.weather_window: Optional[WeatherDialog] = None
 
         container = QWidget()
@@ -17430,35 +17811,43 @@ class MainWindow(QMainWindow):
 
         # Start real‑time clock updates for time labels (but avoid double‑launch)
         self.clock_worker = getattr(self, "clock_worker", None)
-        if self.table_model.site and self.clock_worker is None and not getattr(self, "_obs_change_finalize_pending", False):
+        if (
+            self.table_model.site
+            and self.clock_worker is None
+            and not getattr(self, "_obs_change_finalize_pending", False)
+            and not getattr(self, "_startup_restore_pending", False)
+        ):
             self._start_clock_worker()
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_clock)
         self._clock_timer.start(1000)
         self._update_status_bar()
         self._update_selected_details()
-        self._restore_workspace_on_startup()
-        self._validate_site_inputs()
-        self._replot_timer.start()
-        QTimer.singleShot(120, self._prefetch_bhtom_observatory_presets_on_startup)
-        QTimer.singleShot(900, self._warmup_llm_on_startup)
+        QTimer.singleShot(0, self._run_startup_sequence)
     def _start_clock_worker(self):
         # Don’t create new workers while exiting
         if getattr(self, "_shutting_down", False):
             return
-        # Stop any existing clock worker
-        if self.clock_worker:
-            previous_worker = self.clock_worker
-            self.clock_worker = None
-            try:
-                previous_worker.request_stop()
-            except Exception:
-                try:
-                    previous_worker.stop()
-                except Exception:
-                    pass
         # Determine site, fallback to default if none
         site = self.table_model.site or Site(name="Default", latitude=0.0, longitude=0.0, elevation=0.0)
+        existing_worker = self.clock_worker
+        if (
+            existing_worker is not None
+            and existing_worker.isRunning()
+            and _same_runtime_site(getattr(existing_worker, "site", None), site)
+        ):
+            logger.debug("Reusing existing ClockWorker for site %s", site.name)
+            return
+        # Stop any existing clock worker
+        if existing_worker:
+            self.clock_worker = None
+            try:
+                existing_worker.request_stop()
+            except Exception:
+                try:
+                    existing_worker.stop()
+                except Exception:
+                    pass
         logger.info("Launching new ClockWorker for site %s", site.name)
         # Create and track new worker instance
         worker = ClockWorker(site, self.targets, self)
@@ -17488,7 +17877,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.exception("Error during thread cleanup: %s", exc)
         try:
-            _sync_settings(self.settings)
+            self.settings.sync()
         except Exception:
             pass
         super().closeEvent(event)
@@ -17533,6 +17922,11 @@ class MainWindow(QMainWindow):
         self.ai_describe_act.triggered.connect(self._ai_describe_target)
         self.ai_suggest_act = QAction("Suggest targets for tonight", self, shortcut=QKeySequence("Ctrl+Shift+I"))
         self.ai_suggest_act.triggered.connect(self._ai_suggest_targets)
+        self.ai_suggest_act.setToolTip(
+            "Check cached BHTOM targets first (TTL 1h). "
+            "A fresh fetch starts only when the cache is missing or expired."
+        )
+        self.ai_suggest_act.setStatusTip(self.ai_suggest_act.toolTip())
         self.weather_act = QAction("Weather Window…", self)
         self.weather_act.triggered.connect(self._open_weather_window)
         self.ai_toggle_panel_act = QAction("Toggle AI window", self)
@@ -17705,10 +18099,22 @@ class MainWindow(QMainWindow):
             version = 3
 
         if version < 4:
-            color_mode = str(self.settings.value("table/colorMode", "", type=str) or "").strip().lower()
-            if color_mode not in {"background", "text_glow"}:
-                self.settings.setValue("table/colorMode", "text_glow")
+            color_mode = _normalize_table_color_mode(
+                self.settings.value("table/colorMode", "", type=str),
+                default="",
+            )
+            if color_mode not in _VALID_TABLE_COLOR_MODES:
+                self.settings.setValue("table/colorMode", "background")
             version = 4
+
+        if version < 5:
+            color_mode = _normalize_table_color_mode(
+                self.settings.value("table/colorMode", "", type=str),
+                default="background",
+            )
+            if color_mode not in _VALID_TABLE_COLOR_MODES:
+                self.settings.setValue("table/colorMode", "background")
+            version = 5
 
         self.settings.setValue("table/columnSchemaVersion", version)
 
@@ -17769,12 +18175,13 @@ class MainWindow(QMainWindow):
         )
         default_colors = {"below": palette.below, "limit": palette.limit, "above": palette.above}
         self.table_model.highlight_colors = {
-            k: QColor(_resolve_table_highlight_color(self.settings, k, default_colors[k]))
+            k: _qcolor_from_token(_resolve_table_highlight_color(self.settings, k, default_colors[k]), default_colors[k])
             for k in default_colors
         }
-        table_color_mode = str(self.settings.value("table/colorMode", "text_glow", type=str) or "text_glow").strip().lower()
-        if table_color_mode not in {"background", "text_glow"}:
-            table_color_mode = "text_glow"
+        table_color_mode = _normalize_table_color_mode(
+            self.settings.value("table/colorMode", "background", type=str),
+            default="background",
+        )
         self.table_model.color_mode = table_color_mode
         self.table_view.setProperty("table_color_mode", table_color_mode)
         self._apply_column_preset(self.settings.value("table/viewPreset", "observation", type=str), save=False)
@@ -17824,6 +18231,21 @@ class MainWindow(QMainWindow):
         self._table_column_width_reset_requested = self._table_column_width_reset_requested or reset_widths
         self._table_column_width_timer.start()
 
+    @staticmethod
+    def _main_table_stretch_weights() -> dict[int, float]:
+        return {
+            TargetTableModel.COL_NAME: 4.0,
+            TargetTableModel.COL_RA: 1.0,
+            TargetTableModel.COL_HA: 1.0,
+            TargetTableModel.COL_DEC: 1.0,
+            TargetTableModel.COL_ALT: 1.0,
+            TargetTableModel.COL_AZ: 1.0,
+            TargetTableModel.COL_MOON_SEP: 1.2,
+            TargetTableModel.COL_SCORE: 1.0,
+            TargetTableModel.COL_HOURS: 1.2,
+            TargetTableModel.COL_MAG: 1.1,
+        }
+
     def _refresh_table_column_widths(self) -> None:
         if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
             return
@@ -17843,6 +18265,7 @@ class MainWindow(QMainWindow):
             TargetTableModel.COL_NAME: baseline_name_width,
         }
         row_count = self.table_model.rowCount()
+        required_widths: dict[int, int] = {}
 
         for col in range(self.table_model.columnCount()):
             if self.table_view.isColumnHidden(col):
@@ -17870,12 +18293,24 @@ class MainWindow(QMainWindow):
                 header_width,
                 content_width + col_padding,
             )
+            required_widths[col] = required_width
 
             if reset_widths:
                 new_width = required_width
             else:
                 new_width = max(self.table_view.columnWidth(col), required_width)
-            self.table_view.setColumnWidth(col, new_width)
+            required_widths[col] = int(new_width)
+
+        if not required_widths:
+            return
+        viewport_width = max(0, int(self.table_view.viewport().width()) - 2)
+        fitted_widths = _distribute_extra_table_width(
+            required_widths,
+            available_width=viewport_width,
+            stretch_weights=self._main_table_stretch_weights(),
+        )
+        for col, width in fitted_widths.items():
+            self.table_view.setColumnWidth(col, int(width))
 
     def open_table_settings(self):
         """Open the Table Settings dialog."""
@@ -17901,7 +18336,7 @@ class MainWindow(QMainWindow):
         self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
         self._accent_secondary_override = self._load_accent_secondary_override(self._theme_name)
-        self._ui_font_size = max(9, min(16, self.settings.value("general/uiFontSize", 11, type=int)))
+        self._ui_font_size = _sanitize_ui_font_size(self.settings.value("general/uiFontSize", 11, type=int))
         self.color_blind_mode = self.settings.value("general/colorBlindMode", False, type=bool)
         self._radar_sweep_enabled = self.settings.value("general/radarSweepAnimation", False, type=bool)
         self._radar_sweep_speed = max(40, min(260, self.settings.value("general/radarSweepSpeed", 140, type=int)))
@@ -18036,9 +18471,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _focus_ai_input(self) -> None:
+        ai_window = self._ensure_ai_window()
         if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
             self.ai_toggle_btn.setChecked(True)
-        ai_window = getattr(self, "ai_window", None)
         if isinstance(ai_window, QDialog):
             ai_window.show()
             ai_window.raise_()
@@ -18180,7 +18615,8 @@ class MainWindow(QMainWindow):
             self.edit_object_btn.setEnabled(False)
             if hasattr(self, "ai_describe_act"):
                 self.ai_describe_act.setEnabled(False)
-            self._update_cutout_preview_for_target(None)
+            if not getattr(self, "_defer_startup_preview_updates", False):
+                self._update_cutout_preview_for_target(None)
             self._update_night_details_constraints()
             self._update_status_bar()
             return
@@ -18223,7 +18659,8 @@ class MainWindow(QMainWindow):
         self.edit_object_btn.setEnabled(True)
         if hasattr(self, "ai_describe_act"):
             self.ai_describe_act.setEnabled(True)
-        self._update_cutout_preview_for_target(tgt)
+        if not getattr(self, "_defer_startup_preview_updates", False):
+            self._update_cutout_preview_for_target(tgt)
         self._update_night_details_constraints()
         self._update_status_bar()
 
@@ -18647,6 +19084,18 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to stop MetadataLookupWorker: %s", exc)
             self._meta_worker = None
+        startup_weather_worker = getattr(self, "_startup_weather_worker", None)
+        if startup_weather_worker is not None:
+            try:
+                if startup_weather_worker.isRunning():
+                    startup_weather_worker.requestInterruption()
+                    startup_weather_worker.quit()
+                    if not startup_weather_worker.wait(1500):
+                        startup_weather_worker.terminate()
+                        startup_weather_worker.wait(400)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to stop startup WeatherLiveWorker: %s", exc)
+            self._startup_weather_worker = None
         bhtom_worker = getattr(self, "_bhtom_worker", None)
         if bhtom_worker is not None:
             try:
@@ -18661,6 +19110,7 @@ class MainWindow(QMainWindow):
             self._bhtom_worker = None
             self._bhtom_worker_mode = ""
             self._bhtom_worker_cache_key = None
+            self._bhtom_worker_source = ""
             self._bhtom_dialog = None
         obs_worker = getattr(self, "_bhtom_observatory_worker", None)
         if obs_worker is not None:
@@ -18835,7 +19285,159 @@ class MainWindow(QMainWindow):
             self._render_ai_messages()
         self._refresh_ai_panel_action_buttons()
 
-    def _persist_ai_messages_to_storage(self) -> None:
+    def _preload_cached_runtime_state_on_startup(self) -> None:
+        self._prefetch_bhtom_observatory_presets_on_startup()
+        self._prefetch_bhtom_candidates_on_startup()
+        self._preload_cached_preview_images_on_startup()
+        selected_target = self._selected_target_or_none()
+        if selected_target is not None:
+            self._update_cutout_preview_for_target(selected_target)
+            self._prefetch_finder_charts_for_all_targets(prioritize=selected_target)
+        else:
+            self._prefetch_cutouts_for_all_targets()
+            self._prefetch_finder_charts_for_all_targets()
+        self._prefetch_weather_on_startup()
+
+    def _preload_cached_preview_images_on_startup(self) -> None:
+        selected_target = self._selected_target_or_none()
+        if selected_target is None or not hasattr(self, "aladin_image_label"):
+            return
+        render_w, render_h = self._cutout_render_dimensions_px(getattr(self, "aladin_image_label", None))
+        loaded_cutouts = 0
+        loaded_finders = 0
+        key = self._cutout_key_for_target(selected_target, render_w, render_h)
+        cutout = self._load_pixmap_from_storage_cache("cutout_preview", key)
+        if cutout is not None and not cutout.isNull():
+            self._cache_cutout_pixmap(key, cutout, persist=False)
+            loaded_cutouts += 1
+        finder = self._load_pixmap_from_storage_cache("finder_preview", key)
+        if finder is not None and not finder.isNull():
+            self._cache_finder_pixmap(key, finder, persist=False)
+            loaded_finders += 1
+        if loaded_cutouts:
+            logger.info("Preloaded %d cached Aladin preview into RAM.", loaded_cutouts)
+        if loaded_finders:
+            logger.info("Preloaded %d cached finder preview into RAM.", loaded_finders)
+
+    def _run_startup_sequence(self) -> None:
+        if getattr(self, "_shutting_down", False):
+            return
+        if hasattr(self, "_replot_timer") and self._replot_timer.isActive():
+            self._replot_timer.stop()
+        self._defer_startup_preview_updates = True
+        restored_workspace = False
+        try:
+            restored_workspace = self._restore_workspace_on_startup(defer_visual_refresh=True)
+        finally:
+            self._defer_startup_preview_updates = False
+            self._startup_restore_pending = False
+        self._validate_site_inputs()
+        current_site_name = self.obs_combo.currentText().strip() if hasattr(self, "obs_combo") else ""
+        if current_site_name and not getattr(self, "_obs_change_finalize_pending", False):
+            self._finalize_observatory_change(current_site_name)
+        if restored_workspace:
+            QTimer.singleShot(0, self._update_selected_details)
+        if not restored_workspace:
+            self._replot_timer.start()
+        QTimer.singleShot(120, self._preload_cached_runtime_state_on_startup)
+        QTimer.singleShot(900, self._warmup_llm_on_startup)
+
+    def _prefetch_bhtom_candidates_on_startup(self) -> None:
+        token = self._bhtom_api_token_optional()
+        if not token:
+            return
+        base_url = self._bhtom_api_base_url()
+        cached_candidates = self._cached_bhtom_candidates(token=token, base_url=base_url)
+        if not cached_candidates:
+            return
+        self._bhtom_candidate_cache_key = (base_url, token)
+        self._bhtom_candidate_cache = list(cached_candidates)
+        self._bhtom_candidate_cache_loaded_at = perf_counter()
+        self._refresh_cached_bhtom_suggestions()
+        self._set_bhtom_status(f"BHTOM: cache ({len(cached_candidates)})", busy=False)
+
+    def _refresh_cached_bhtom_suggestions(self) -> None:
+        self._bhtom_ranked_suggestions_cache = []
+        candidates = list(self._bhtom_candidate_cache or [])
+        if not candidates:
+            return
+        context, error = self._build_bhtom_suggestion_context()
+        if context is None:
+            if error:
+                logger.info("Skipping cached BHTOM suggestion ranking: %s", error)
+            return
+        try:
+            suggestions, _notes = _rank_local_target_suggestions_from_candidates(
+                payload=context["payload"],  # type: ignore[index]
+                site=context["site"],  # type: ignore[index]
+                targets=context["targets"],  # type: ignore[index]
+                limit_altitude=float(context["limit_altitude"]),
+                sun_alt_limit=float(context["sun_alt_limit"]),
+                min_moon_sep=float(context["min_moon_sep"]),
+                candidates=candidates,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to rebuild cached BHTOM suggestions: %s", exc)
+            return
+        self._bhtom_ranked_suggestions_cache = list(suggestions)
+
+    def _prefetch_weather_on_startup(self) -> None:
+        if getattr(self, "_shutting_down", False):
+            return
+        site = self._current_site_for_weather()
+        if not isinstance(site, Site):
+            return
+        existing = getattr(self, "_startup_weather_worker", None)
+        if isinstance(existing, WeatherLiveWorker) and existing.isRunning():
+            return
+
+        cloud_month_mode = str(
+            self.settings.value("weather/cloudMapMonthMode", "session_month", type=str) or "session_month"
+        ).strip().lower()
+        cloud_month = int(QDate.currentDate().month()) if cloud_month_mode == "current_month" else int(self.date_edit.date().month())
+        worker = WeatherLiveWorker(
+            lat=float(site.latitude),
+            lon=float(site.longitude),
+            elev=float(site.elevation),
+            custom_conditions_url=str(getattr(site, "custom_conditions_url", "") or "").strip(),
+            cloud_map_source=str(self.settings.value("weather/cloudMapSource", "earthenv", type=str) or "earthenv").strip(),
+            cloud_map_month=cloud_month,
+            force_refresh=False,
+            include_cloud_map=True,
+            include_satellite=True,
+            storage=getattr(self, "app_storage", None),
+            parent=self,
+        )
+        worker.progress.connect(self._on_startup_weather_progress)
+        worker.completed.connect(self._on_startup_weather_completed)
+        worker.finished.connect(lambda w=worker: self._on_startup_weather_finished(w))
+        worker.finished.connect(worker.deleteLater)
+        self._startup_weather_worker = worker
+        worker.start()
+
+    @Slot(str, int, int)
+    def _on_startup_weather_progress(self, status: str, _step: int, _total: int) -> None:
+        logger.info("Startup weather refresh: %s", str(status or "").strip() or "running")
+
+    @Slot(dict)
+    def _on_startup_weather_completed(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        sections = payload.get("sections")
+        if isinstance(sections, dict):
+            forecast = sections.get("forecast") if isinstance(sections.get("forecast"), dict) else {}
+            conditions = sections.get("conditions") if isinstance(sections.get("conditions"), dict) else {}
+            logger.info(
+                "Startup weather refresh ready (forecast=%s, conditions=%s).",
+                str(forecast.get("status", "unknown") or "unknown"),
+                str(conditions.get("status", "unknown") or "unknown"),
+            )
+
+    def _on_startup_weather_finished(self, worker: WeatherLiveWorker) -> None:
+        if getattr(self, "_startup_weather_worker", None) is worker:
+            self._startup_weather_worker = None
+
+    def _persist_ai_messages_to_storage(self, *, allow_empty_clear: bool = False) -> None:
         storage = getattr(self, "app_storage", None)
         plan_id = self._active_plan_storage_id()
         if storage is None or not plan_id:
@@ -18844,7 +19446,7 @@ class MainWindow(QMainWindow):
             serialized = self._serialize_ai_messages_for_storage()
             if serialized:
                 storage.chat_history.replace_messages(plan_id, serialized)
-            else:
+            elif allow_empty_clear:
                 storage.chat_history.clear(plan_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to persist AI history for %s: %s", plan_id, exc)
@@ -18912,8 +19514,6 @@ class MainWindow(QMainWindow):
             self._observatory_preset_keys[site_name] = "custom"
             self._save_custom_observatories()
             self._refresh_observatory_combo(selected_name=site_name)
-        else:
-            self.observatories[site_name] = site
 
     def _apply_plan_payload(
         self,
@@ -18923,6 +19523,7 @@ class MainWindow(QMainWindow):
         plan_id: str,
         plan_kind: str,
         plan_name: str,
+        defer_visual_refresh: bool = False,
     ) -> None:
         loaded_targets: list[Target] = []
         for payload in target_payloads:
@@ -18936,14 +19537,17 @@ class MainWindow(QMainWindow):
             self._ensure_named_site_available(site_snapshot, preferred_name=site_name)
 
         selected_target_name = str(snapshot.get("selected_target_name", "") or "")
+        current_site_name = self.obs_combo.currentText().strip() if hasattr(self, "obs_combo") else ""
+        current_site = self.table_model.site if isinstance(getattr(self.table_model, "site", None), Site) else None
+        target_site = self.observatories.get(site_name) if site_name else None
         self.obs_combo.blockSignals(True)
         try:
             if site_name and site_name in self.observatories:
                 self.obs_combo.setCurrentText(site_name)
         finally:
             self.obs_combo.blockSignals(False)
-        if site_name and site_name in self.observatories:
-            self._on_obs_change(site_name)
+        if _should_apply_observatory_change(current_site_name, current_site, site_name, target_site):
+            self._on_obs_change(site_name, defer_replot=defer_visual_refresh)
         elif isinstance(site_snapshot, dict):
             try:
                 restored_site = Site(**site_snapshot)
@@ -18994,12 +19598,13 @@ class MainWindow(QMainWindow):
                 if _normalize_catalog_token(target.name) == _normalize_catalog_token(selected_target_name):
                     self.table_view.selectRow(row_idx)
                     break
-        self._update_selected_details()
+        if not defer_visual_refresh:
+            self._update_selected_details()
         self._refresh_target_color_map()
         self._emit_table_data_changed()
         self._run_plan()
 
-    def _restore_plan_record(self, record: dict[str, object]) -> None:
+    def _restore_plan_record(self, record: dict[str, object], *, defer_visual_refresh: bool = False) -> None:
         snapshot = dict(record.get("snapshot") or {})
         target_payloads = [
             dict(payload)
@@ -19014,27 +19619,29 @@ class MainWindow(QMainWindow):
                 plan_id=str(record.get("id", "") or ""),
                 plan_kind=str(record.get("plan_kind", "workspace") or "workspace"),
                 plan_name=str(record.get("name", "Workspace") or "Workspace"),
+                defer_visual_refresh=defer_visual_refresh,
             )
         finally:
             self._suspend_plan_autosave = False
         self._persist_workspace_now()
 
-    def _restore_workspace_on_startup(self) -> None:
+    def _restore_workspace_on_startup(self, *, defer_visual_refresh: bool = False) -> bool:
         storage = getattr(self, "app_storage", None)
         if storage is None:
-            return
+            return False
         try:
             workspace = storage.plans.load_workspace()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to restore workspace from storage: %s", exc)
             workspace = None
         if workspace:
-            self._restore_plan_record(workspace)
+            self._restore_plan_record(workspace, defer_visual_refresh=defer_visual_refresh)
             if str(workspace.get("id", "")).strip():
                 self._workspace_plan_id = str(workspace.get("id"))
-            return
+            return True
         self._persist_workspace_now()
         self._load_ai_messages_for_active_plan()
+        return False
 
     def _load_plan_from_json_path(self, file_path: str, *, persist_workspace: bool = True) -> None:
         try:
@@ -19487,6 +20094,7 @@ class MainWindow(QMainWindow):
     def _run_plan(self):
         """Kick off the worker thread unless one is already running."""
         logger.info("Starting new visibility calculation …")
+        self._ensure_visibility_plot_widgets()
         if self.worker and self.worker.isRunning():
             self._queued_plan_run = True
             try:
@@ -19664,6 +20272,9 @@ class MainWindow(QMainWindow):
     def _update_plot(self, data: dict):
         """Redraw the altitude plot with new data from the worker."""
         logger.info("Altitude plot refresh (%d targets)", len(self.targets))
+        self._ensure_visibility_plot_widgets()
+        if self.plot_canvas is None or self.ax_alt is None:
+            return
         sender = self.sender()
         if sender is getattr(self, "worker", None):
             self.worker = None
@@ -19876,7 +20487,7 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------------------
         limit_line_value = self._plot_limit_value()
         limit_line_label = "Limit Airmass" if self._plot_airmass else "Limit Altitude"
-        self.ax_alt.axhline(
+        self.limit_line = self.ax_alt.axhline(
             limit_line_value,
             color=self._theme_color("plot_limit", "#ff5d8f"),
             linestyle="-",
@@ -19982,6 +20593,7 @@ class MainWindow(QMainWindow):
                 total_targets=len(self.targets),
             )
             self._calc_started_at = 0.0
+        self._refresh_cached_bhtom_suggestions()
         self._update_selected_details()
         self._update_status_bar()
         self._reset_plot_navigation_home()
@@ -19999,7 +20611,9 @@ class MainWindow(QMainWindow):
             self.sun_line.set_visible(self.sun_check.isChecked())
         if hasattr(self, 'moon_line') and self.moon_line:
             self.moon_line.set_visible(self.moon_check.isChecked())
-        self.plot_canvas.draw_idle()
+        plot_canvas = getattr(self, "plot_canvas", None)
+        if plot_canvas is not None:
+            plot_canvas.draw_idle()
         if isinstance(getattr(self, "last_payload", None), dict):
             self._render_visibility_web_plot(self.last_payload)
 
@@ -20013,7 +20627,10 @@ class MainWindow(QMainWindow):
         self._animate_plot_mode_switch()
         self.settings.setValue("general/plotAirmass", self._plot_airmass)
         if isinstance(self.last_payload, dict):
-            self._update_plot(self.last_payload)
+            if getattr(self, "_use_visibility_web", False):
+                self._schedule_visibility_plot_refresh()
+            else:
+                self._refresh_visibility_matplotlib_mode_only(self.last_payload)
 
 
     @Slot()
@@ -20387,7 +21004,9 @@ class MainWindow(QMainWindow):
         with open(out_path / "plan_targets.json", "w", encoding="utf-8") as fh:
             json.dump([t.model_dump() for t in self.targets], fh, indent=2)
         # PNG
-        self.plot_canvas.figure.savefig(out_path / "plan_plot.png", dpi=150)
+        self._ensure_visibility_plot_widgets()
+        if self.plot_canvas is not None:
+            self.plot_canvas.figure.savefig(out_path / "plan_plot.png", dpi=150)
         # CSV summary and ICS window schedule
         tz_name = "UTC"
         if isinstance(getattr(self, "last_payload", None), dict):
@@ -21394,9 +22013,22 @@ class MainWindow(QMainWindow):
         window.finished.connect(self._on_ai_window_finished)
         return window
 
+    def _ensure_ai_window(self) -> QDialog:
+        ai_window = getattr(self, "ai_window", None)
+        if isinstance(ai_window, QDialog):
+            return ai_window
+        ai_window = self._build_ai_window()
+        ai_window.setStyleSheet(self.styleSheet())
+        self.ai_window = ai_window
+        if getattr(self, "_ai_messages", None):
+            self._render_ai_messages()
+        self._refresh_ai_panel_action_buttons()
+        self._refresh_ai_warm_indicator()
+        return ai_window
+
     @Slot(bool)
     def _toggle_ai_panel(self, checked: bool) -> None:
-        ai_window = getattr(self, "ai_window", None)
+        ai_window = self._ensure_ai_window() if checked else getattr(self, "ai_window", None)
         if isinstance(ai_window, QDialog):
             if checked:
                 ai_window.show()
@@ -22948,7 +23580,7 @@ class MainWindow(QMainWindow):
         cached = self._cached_bhtom_observatory_presets(token=token, base_url=base_url)
         if cached:
             self.bhtom_observatory_presets_changed.emit(cached, f"Loaded {len(cached)} cached BHTOM presets.")
-        self._ensure_bhtom_observatory_prefetch(force_refresh=True)
+            self._set_bhtom_status(f"BHTOM: cache ({len(cached)})", busy=False)
 
     def _ensure_bhtom_observatory_prefetch(self, *, force_refresh: bool = False) -> bool:
         token = self._bhtom_api_token_optional()
@@ -23324,6 +23956,7 @@ class MainWindow(QMainWindow):
         cached_candidates = self._cached_bhtom_candidates(token=token, base_url=base_url)
         if cached_candidates is not None:
             logger.info("Using cached BHTOM candidates (%d entries).", len(cached_candidates))
+        self._bhtom_worker_source = "cache" if cached_candidates is not None else "network"
 
         worker = BhtomSuggestionWorker(
             request_id=req_id,
@@ -23380,8 +24013,10 @@ class MainWindow(QMainWindow):
             return
         dlg.update_suggestions(suggestions, notes)
         if page < 0:
+            dlg.set_source_message(_bhtom_suggestion_source_message("cache"))
             dlg.set_loading_state(True, "Loading BHTOM targets from cache...")
         else:
+            dlg.set_source_message(_bhtom_suggestion_source_message("network"))
             dlg.set_loading_state(True, f"Loading BHTOM targets... page {page}")
 
     def _on_bhtom_worker_finished(self, worker: BhtomSuggestionWorker) -> None:
@@ -23405,6 +24040,8 @@ class MainWindow(QMainWindow):
         self._bhtom_worker_mode = ""
         cache_key = self._bhtom_worker_cache_key
         self._bhtom_worker_cache_key = None
+        source = str(self._bhtom_worker_source or "").strip().lower()
+        self._bhtom_worker_source = ""
 
         if error:
             self._set_bhtom_status("BHTOM: cancelled" if error == "cancelled" else "BHTOM: error", busy=False)
@@ -23414,6 +24051,7 @@ class MainWindow(QMainWindow):
                     dlg = self._bhtom_dialog
                     if dlg is not None and shb.isValid(dlg):
                         dlg.set_loading_state(False, "Loading failed")
+                        dlg.set_source_message(_bhtom_suggestion_source_message(source or "loading"))
                         if not dlg.table_model.total_count():
                             dlg.notes_label.setText(f"Notes: {error}")
                             dlg.notes_label.setVisible(True)
@@ -23445,6 +24083,7 @@ class MainWindow(QMainWindow):
             dlg = self._bhtom_dialog
             if dlg is not None and shb.isValid(dlg):
                 dlg.update_suggestions(suggestions, notes)
+                dlg.set_source_message(_bhtom_suggestion_source_message(source or "network"))
                 dlg.set_loading_state(False, "Loaded")
             self._set_bhtom_status(f"BHTOM: ready ({len(suggestions)})", busy=False)
         elif mode == "quick":
@@ -23765,6 +24404,7 @@ class MainWindow(QMainWindow):
             reload_callback=None,
             parent=self,
         )
+        dlg.set_source_message(_bhtom_suggestion_source_message("loading"))
         dlg.set_loading_state(True, "Loading BHTOM targets...")
         self._bhtom_dialog = dlg
         dlg.finished.connect(self._on_suggest_dialog_closed)
@@ -23870,7 +24510,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "ai_output_layout"):
             self._render_ai_messages()
         self._refresh_ai_panel_action_buttons()
-        self._persist_ai_messages_to_storage()
+        self._persist_ai_messages_to_storage(allow_empty_clear=True)
 
     def _apply_ai_chat_font(self) -> None:
         if not hasattr(self, "ai_output"):

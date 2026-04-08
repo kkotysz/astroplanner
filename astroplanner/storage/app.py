@@ -12,6 +12,9 @@ from typing import Any, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 
+_SETTINGS_MISSING = object()
+
+
 class _CacheAssetMissingError(FileNotFoundError):
     """Raised when a cached payload references an asset that is no longer available."""
 
@@ -187,16 +190,27 @@ def _sqlite_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
 class SettingsRepository:
     def __init__(self, storage: "AppStorage") -> None:
         self.storage = storage
+        self._cache: dict[str, object] = {}
+        self._loaded = False
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        with self.storage.connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value_json, value_type FROM app_settings ORDER BY key"
+            ).fetchall()
+        self._cache = {
+            str(row["key"]): _deserialize_value(str(row["value_json"]), str(row["value_type"]))
+            for row in rows
+        }
+        self._loaded = True
 
     def get(self, key: str, default: object = None, *, type_hint: type | None = None) -> object:
-        with self.storage.connect() as conn:
-            row = conn.execute(
-                "SELECT value_json, value_type FROM app_settings WHERE key = ?",
-                (str(key),),
-            ).fetchone()
-        if row is None:
+        self._ensure_loaded()
+        value = self._cache.get(str(key), _SETTINGS_MISSING)
+        if value is _SETTINGS_MISSING:
             return _coerce_typed_value(default, type_hint)
-        value = _deserialize_value(str(row["value_json"]), str(row["value_type"]))
         return _coerce_typed_value(value, type_hint)
 
     def set(self, key: str, value: object, *, is_secret: bool | None = None) -> None:
@@ -216,45 +230,22 @@ class SettingsRepository:
                 """,
                 (str(key), value_json, value_type, int(secret), now),
             )
+        self._cache[str(key)] = value
+        self._loaded = True
 
     def remove(self, key: str) -> None:
         with self.storage.connect() as conn, conn:
             conn.execute("DELETE FROM app_settings WHERE key = ?", (str(key),))
+        if self._loaded:
+            self._cache.pop(str(key), None)
 
     def contains(self, key: str) -> bool:
-        with self.storage.connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM app_settings WHERE key = ? LIMIT 1",
-                (str(key),),
-            ).fetchone()
-        return row is not None
+        self._ensure_loaded()
+        return str(key) in self._cache
 
     def keys(self) -> list[str]:
-        with self.storage.connect() as conn:
-            rows = conn.execute("SELECT key FROM app_settings ORDER BY key").fetchall()
-        return [str(row["key"]) for row in rows]
-
-    def import_from_source(self, source: object, *, overwrite: bool = False) -> int:
-        if hasattr(source, "allKeys") and callable(getattr(source, "allKeys")):
-            keys = [str(key) for key in getattr(source, "allKeys")()]
-            value_getter = getattr(source, "value")
-        elif isinstance(source, Mapping):
-            keys = [str(key) for key in source.keys()]
-            value_getter = source.get
-        else:
-            return 0
-        copied = 0
-        for key in keys:
-            if not overwrite and self.contains(key):
-                continue
-            try:
-                value = value_getter(key)
-            except Exception:
-                continue
-            self.set(key, value)
-            copied += 1
-        return copied
-
+        self._ensure_loaded()
+        return sorted(self._cache.keys())
 
 class StateRepository:
     def __init__(self, storage: "AppStorage") -> None:
@@ -286,6 +277,10 @@ class StateRepository:
                 """,
                 (str(key), value_json, value_type, now),
             )
+
+    def remove(self, key: str) -> None:
+        with self.storage.connect() as conn, conn:
+            conn.execute("DELETE FROM app_state WHERE key = ?", (str(key),))
 
 
 class CacheRepository:
@@ -1372,6 +1367,3 @@ class SettingsAdapter:
 
     def status(self) -> int:
         return 0
-
-    def import_from_source(self, source: object, *, overwrite: bool = False) -> int:
-        return self.storage.settings.import_from_source(source, overwrite=overwrite)

@@ -27,21 +27,34 @@ def test_settings_adapter_roundtrips_values(tmp_path: Path) -> None:
     assert settings.contains("general/defaultSite") is False
 
 
-def test_settings_import_from_mapping_preserves_existing_values(tmp_path: Path) -> None:
+def test_state_repository_roundtrips_and_removes_values(tmp_path: Path) -> None:
+    storage = AppStorage(tmp_path)
+    storage.state.set("startup/ready", True)
+    storage.state.set("session/lastPlan", "workspace")
+
+    assert storage.state.get("startup/ready", False, type_hint=bool) is True
+    assert storage.state.get("session/lastPlan", "", type_hint=str) == "workspace"
+
+    storage.state.remove("startup/ready")
+    assert storage.state.get("startup/ready", False, type_hint=bool) is False
+
+
+def test_settings_adapter_uses_cached_values_after_initial_load(tmp_path: Path) -> None:
     storage = AppStorage(tmp_path)
     settings = SettingsAdapter(storage)
-    settings.setValue("general/defaultSite", "Current")
+    settings.setValue("general/defaultSite", "WRO")
+    settings.setValue("general/uiTheme", "retro")
 
-    copied = settings.import_from_source(
-        {
-            "general/defaultSite": "Legacy",
-            "general/uiTheme": "neon",
-        }
-    )
+    assert settings.value("general/defaultSite", type=str) == "WRO"
 
-    assert copied == 1
-    assert settings.value("general/defaultSite", type=str) == "Current"
-    assert settings.value("general/uiTheme", type=str) == "neon"
+    def _unexpected_connect():
+        raise AssertionError("settings cache should avoid reopening SQLite for cached reads")
+
+    storage.connect = _unexpected_connect  # type: ignore[assignment]
+
+    assert settings.value("general/defaultSite", type=str) == "WRO"
+    assert settings.contains("general/uiTheme") is True
+    assert sorted(settings.allKeys()) == ["general/defaultSite", "general/uiTheme"]
 
 
 def test_cache_repository_persists_assets_and_respects_ttl(tmp_path: Path) -> None:
