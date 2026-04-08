@@ -54,6 +54,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 from urllib.error import HTTPError, URLError
@@ -1307,6 +1308,8 @@ def _sanitize_cutout_size_px(value: object) -> int:
 from PySide6.QtCore import (
     Property,
     QAbstractTableModel,
+    QBuffer,
+    QByteArray,
     QDate,
     QElapsedTimer,
     QEasingCurve,
@@ -1330,6 +1333,7 @@ from PySide6.QtCore import (
     QStandardPaths,
     QUrl,
     QUrlQuery,
+    QIODevice,
 )
 from PySide6.QtGui import (
     QAction,
@@ -1411,7 +1415,8 @@ from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToo
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 _HAS_MPL_CANVAS = True
 
-APP_SETTINGS_ORG = "YourCompany"
+APP_SETTINGS_ORG = "krzkot"
+LEGACY_APP_SETTINGS_ORGS = ("YourCompany",)
 APP_SETTINGS_APP = "AstroPlanner"
 APP_SETTINGS_ENV_KEY = "ASTROPLANNER_CONFIG_DIR"
 APP_SETTINGS_FILE_NAME = "settings.ini"
@@ -1430,6 +1435,18 @@ def _config_root_dir() -> Path:
     return Path.home() / ".config"
 
 
+def _settings_dir_env_override() -> Optional[Path]:
+    env_override = str(os.getenv(APP_SETTINGS_ENV_KEY, "") or "").strip()
+    if not env_override:
+        return None
+    return Path(env_override).expanduser()
+
+
+def _settings_dir_for_org(org_name: str, *, root_dir: Optional[Path] = None) -> Path:
+    root = root_dir if root_dir is not None else _config_root_dir()
+    return Path(root).expanduser() / str(org_name).strip() / APP_SETTINGS_APP
+
+
 def _resolve_settings_dir() -> Path:
     """Return a stable writable directory for app settings."""
     try:
@@ -1438,10 +1455,55 @@ def _resolve_settings_dir() -> Path:
     except Exception:
         pass
 
-    env_override = str(os.getenv(APP_SETTINGS_ENV_KEY, "") or "").strip()
-    if env_override:
-        return Path(env_override).expanduser()
-    return _config_root_dir() / APP_SETTINGS_ORG / APP_SETTINGS_APP
+    env_override = _settings_dir_env_override()
+    if env_override is not None:
+        return env_override
+    return _settings_dir_for_org(APP_SETTINGS_ORG)
+
+
+def _legacy_storage_dir_candidates(target_dir: Path) -> list[Path]:
+    candidates: list[Path] = []
+
+    def _add(path: Path) -> None:
+        candidate = path.expanduser()
+        if candidate == target_dir:
+            return
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for org_name in LEGACY_APP_SETTINGS_ORGS:
+        _add(_settings_dir_for_org(org_name))
+    return candidates
+
+
+def _migrate_legacy_storage_dir(target_dir: Path) -> Optional[Path]:
+    if _settings_dir_env_override() is not None:
+        return None
+
+    target = target_dir.expanduser()
+    if target.exists():
+        try:
+            if any(target.iterdir()):
+                return None
+            target.rmdir()
+        except Exception:
+            return None
+
+    for candidate in _legacy_storage_dir_candidates(target):
+        if not candidate.exists():
+            continue
+        try:
+            if not any(candidate.iterdir()):
+                continue
+        except Exception:
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(candidate), str(target))
+            return candidate
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Legacy storage directory migration failed from %s to %s: %s", candidate, target, exc)
+    return None
 
 
 def _legacy_settings_ini_candidates(target_ini_path: Path) -> list[Path]:
@@ -1460,19 +1522,22 @@ def _legacy_settings_ini_candidates(target_ini_path: Path) -> list[Path]:
 
     root = _config_root_dir()
     _add(root / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
-    _add(root / APP_SETTINGS_ORG / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
+    for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
+        _add(root / org_name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
 
     app_cfg = str(QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation) or "").strip()
     if app_cfg:
         app_cfg_path = Path(app_cfg).expanduser()
         _add(app_cfg_path / APP_SETTINGS_FILE_NAME)
-        _add(app_cfg_path / APP_SETTINGS_ORG / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
+        for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
+            _add(app_cfg_path / org_name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
 
     process_name = str(Path(str(sys.argv[0] or "")).stem or "").strip()
     for name in (process_name, "python3", "python", "pythonw"):
         if not name:
             continue
-        _add(root / name / APP_SETTINGS_ORG / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
+        for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
+            _add(root / name / org_name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
         _add(root / name / APP_SETTINGS_APP / APP_SETTINGS_FILE_NAME)
     return candidates
 
@@ -1511,23 +1576,29 @@ def _sync_settings(settings: object) -> None:
 def _create_app_settings() -> SettingsAdapter:
     """Create SQLite-backed settings storage with best-effort legacy import."""
     settings_dir = _resolve_settings_dir()
+    migrated_storage_dir = _migrate_legacy_storage_dir(settings_dir)
     try:
         settings_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
     storage = AppStorage(settings_dir)
     settings = SettingsAdapter(storage)
+    if migrated_storage_dir is not None:
+        settings.setValue("__meta/storageDirMigrated", True)
+        settings.setValue("__meta/storageDirMigratedFrom", str(migrated_storage_dir))
     ini_path = settings_dir / APP_SETTINGS_FILE_NAME
     if not bool(storage.state.get("legacy/settings/imported", False, type_hint=bool)):
         copied_total = 0
-        try:
-            legacy = QSettings(APP_SETTINGS_ORG, APP_SETTINGS_APP)
-            copied = settings.import_from_source(legacy)
-            if copied > 0:
-                copied_total += copied
-                settings.setValue("__meta/legacyMigrated", True)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Settings migration skipped: %s", exc)
+        for org_name in (APP_SETTINGS_ORG, *LEGACY_APP_SETTINGS_ORGS):
+            try:
+                legacy = QSettings(org_name, APP_SETTINGS_APP)
+                copied = settings.import_from_source(legacy)
+                if copied > 0:
+                    copied_total += copied
+                    settings.setValue("__meta/legacyMigrated", True)
+                    settings.setValue("__meta/legacyMigratedFromOrg", str(org_name))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Settings migration skipped for org '%s': %s", org_name, exc)
         try:
             for candidate in _legacy_settings_ini_candidates(ini_path.resolve()):
                 if not candidate.exists():
@@ -4670,6 +4741,9 @@ class SeestarSessionPlanDialog(QDialog):
                     storage.session_templates.replace_all(
                         [template.model_dump(mode="json") for template in templates.values()]
                     )
+                    self._settings.remove("general/seestarSessionUserTemplates")
+                    self._settings.remove("general/seestarCampaignUserPresets")
+                    self._settings.setValue("__meta/seestarSessionTemplatesMigrated", True)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to migrate session templates into storage: %s", exc)
             return templates
@@ -4681,13 +4755,11 @@ class SeestarSessionPlanDialog(QDialog):
                     storage.session_templates.replace_all(
                         [template.model_dump(mode="json") for template in migrated.values()]
                     )
+                    self._settings.remove("general/seestarSessionUserTemplates")
+                    self._settings.remove("general/seestarCampaignUserPresets")
+                    self._settings.setValue("__meta/seestarSessionTemplatesMigrated", True)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to migrate legacy session templates into storage: %s", exc)
-            else:
-                self._settings.setValue(
-                    "general/seestarSessionUserTemplates",
-                    dump_user_seestar_session_templates(migrated),
-                )
         return migrated
 
     def _load_current_settings_template(self) -> SeestarSessionTemplate:
@@ -5520,11 +5592,11 @@ class SeestarSessionPlanDialog(QDialog):
                 storage.session_templates.replace_all(
                     [template.model_dump(mode="json") for template in self._user_session_templates.values()]
                 )
+                s.remove("general/seestarSessionUserTemplates")
+                s.remove("general/seestarCampaignUserPresets")
+                s.setValue("__meta/seestarSessionTemplatesMigrated", True)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to save session templates to storage, falling back to settings: %s", exc)
-                s.setValue("general/seestarSessionUserTemplates", dump_user_seestar_session_templates(self._user_session_templates))
-        else:
-            s.setValue("general/seestarSessionUserTemplates", dump_user_seestar_session_templates(self._user_session_templates))
+                logger.warning("Failed to save session templates to storage: %s", exc)
         if not selected_template_key:
             s.setValue("general/seestarSessionRepeatCount", max(1, int(self.seestar_session_repeat_spin.value())))
             s.setValue("general/seestarSessionMinutesPerRun", max(1, int(self.seestar_session_minutes_spin.value())))
@@ -14347,7 +14419,52 @@ class MainWindow(QMainWindow):
         painter.end()
         return view
 
-    def _cache_cutout_pixmap(self, key: str, pixmap: QPixmap):
+    def _pixmap_to_png_bytes(self, pixmap: QPixmap) -> bytes:
+        if pixmap.isNull():
+            return b""
+        payload = QByteArray()
+        buffer = QBuffer(payload)
+        if not buffer.open(QIODevice.WriteOnly):
+            return b""
+        try:
+            ok = pixmap.save(buffer, "PNG")
+        finally:
+            buffer.close()
+        return bytes(payload) if ok else b""
+
+    def _load_pixmap_from_storage_cache(self, namespace: str, key: str) -> Optional[QPixmap]:
+        storage = getattr(self, "app_storage", None)
+        if storage is None or not key:
+            return None
+        try:
+            payload = storage.cache.get_json(namespace, key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to read %s image cache '%s': %s", namespace, key, exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        image_bytes = payload.get("image_bytes")
+        if not isinstance(image_bytes, (bytes, bytearray)):
+            return None
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(bytes(image_bytes), "PNG") or pixmap.isNull():
+            return None
+        return pixmap
+
+    def _persist_pixmap_to_storage_cache(self, namespace: str, key: str, pixmap: QPixmap) -> None:
+        storage = getattr(self, "app_storage", None)
+        if storage is None or not key or pixmap.isNull():
+            return
+        payload = self._pixmap_to_png_bytes(pixmap)
+        if not payload:
+            return
+        try:
+            storage.cache.set_json(namespace, key, {"image_bytes": payload}, ttl_s=14 * 24 * 60 * 60)
+            storage.cache.prune_namespace(namespace, max_entries=160)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist %s image cache '%s': %s", namespace, key, exc)
+
+    def _cache_cutout_pixmap(self, key: str, pixmap: QPixmap, *, persist: bool = True):
         self._cutout_cache[key] = pixmap
         if key in self._cutout_cache_order:
             self._cutout_cache_order.remove(key)
@@ -14357,8 +14474,10 @@ class MainWindow(QMainWindow):
         while len(self._cutout_cache_order) > cache_limit:
             stale = self._cutout_cache_order.pop(0)
             self._cutout_cache.pop(stale, None)
+        if persist:
+            self._persist_pixmap_to_storage_cache("cutout_preview", key, pixmap)
 
-    def _cache_finder_pixmap(self, key: str, pixmap: QPixmap):
+    def _cache_finder_pixmap(self, key: str, pixmap: QPixmap, *, persist: bool = True):
         self._finder_cache[key] = pixmap
         if key in self._finder_cache_order:
             self._finder_cache_order.remove(key)
@@ -14368,6 +14487,8 @@ class MainWindow(QMainWindow):
         while len(self._finder_cache_order) > cache_limit:
             stale = self._finder_cache_order.pop(0)
             self._finder_cache.pop(stale, None)
+        if persist:
+            self._persist_pixmap_to_storage_cache("finder_preview", key, pixmap)
 
     def _find_cutout_cache_variant(self, target: Target) -> Optional[tuple[str, QPixmap]]:
         coord_suffix = f"{target.ra:.6f},{target.dec:.6f}"
@@ -14687,6 +14808,18 @@ class MainWindow(QMainWindow):
             if not background:
                 self.finder_image_label.setText("")
                 self.finder_image_label.setPixmap(cached)
+                self._set_cutout_image_loading("finder", "", visible=False)
+                self._set_finder_status(f"Finder: cached ({target.name})", busy=False)
+                self._finder_displayed_key = key
+            return
+        persisted = self._load_pixmap_from_storage_cache("finder_preview", key)
+        if persisted is not None and not persisted.isNull():
+            self._cache_finder_pixmap(key, persisted, persist=False)
+            if (not background) and hasattr(self, "_finder_timeout_timer"):
+                self._finder_timeout_timer.stop()
+            if not background:
+                self.finder_image_label.setText("")
+                self.finder_image_label.setPixmap(persisted)
                 self._set_cutout_image_loading("finder", "", visible=False)
                 self._set_finder_status(f"Finder: cached ({target.name})", busy=False)
                 self._finder_displayed_key = key
@@ -15058,6 +15191,22 @@ class MainWindow(QMainWindow):
             self._cutout_displayed_key = key
             return
 
+        persisted_cutout = self._load_pixmap_from_storage_cache("cutout_preview", key)
+        if persisted_cutout is not None and not persisted_cutout.isNull():
+            self._cache_cutout_pixmap(key, persisted_cutout, persist=False)
+            self.aladin_image_label.setText("")
+            self.aladin_image_label.setPixmap(persisted_cutout)
+            self._set_cutout_image_loading("aladin", "", visible=False)
+            self._ensure_aladin_pan_ready()
+            self._set_aladin_status(f"Aladin: cached ({target.name})", busy=False)
+            self._prefetch_cutouts_for_all_targets(prioritize=target)
+            if show_finder:
+                self._update_finder_chart_for_target(target, key)
+            else:
+                self._prefetch_finder_charts_for_all_targets(prioritize=target)
+            self._cutout_displayed_key = key
+            return
+
         cached_variant = self._find_cutout_cache_variant(target)
         if cached_variant is not None:
             cached_key, cached_pix = cached_variant
@@ -15285,6 +15434,7 @@ class MainWindow(QMainWindow):
             weather_window._set_weather_image_loading("cloud_map", "Updating cloud climatology…", visible=True)
             weather_window._set_weather_image_loading("satellite", "Updating satellite preview…", visible=True)
         self._obs_change_finalize_pending = True
+        self._schedule_plan_autosave()
         QTimer.singleShot(0, lambda n=str(name): self._finalize_observatory_change(n))
 
     def _finalize_observatory_change(self, name: str) -> None:
@@ -15765,7 +15915,7 @@ class MainWindow(QMainWindow):
         adapter.open_handoff_dialog(bundle, parent=self)
 
     def _observatories_config_path(self) -> Path:
-        return Path(__file__).resolve().parent / "config" / "observatories.json"
+        return Path(__file__).resolve().parent / "config" / "default_observatories.json"
 
     def _update_obs_combo_widths(self):
         if not hasattr(self, "obs_combo"):
@@ -15879,9 +16029,11 @@ class MainWindow(QMainWindow):
         if migrated:
             loaded = migrated
             preset_keys = migrated_preset_keys
-            self._save_custom_observatories(migrated, preset_keys=preset_keys)
-            self.settings.remove("general/customObservatories")
-            logger.info("Migrated %d observatories to SQLite storage", len(migrated))
+            if storage is not None:
+                self._save_custom_observatories(migrated, preset_keys=preset_keys)
+                self.settings.remove("general/customObservatories")
+                self.settings.setValue("__meta/customObservatoriesMigrated", True)
+                logger.info("Migrated %d observatories to SQLite storage", len(migrated))
         return loaded, preset_keys
 
     def _save_custom_observatories(
@@ -15919,20 +16071,16 @@ class MainWindow(QMainWindow):
                     "preset_key": preset_key,
                 }
             )
-        payload = {
-            "version": 3,
-            "observatories": observatory_items,
-        }
         storage = getattr(self, "app_storage", None)
         if storage is not None:
             try:
                 storage.observatories.replace_all(observatory_items)
+                self.settings.remove("general/customObservatories")
+                self.settings.setValue("__meta/customObservatoriesMigrated", True)
                 return
             except Exception as exc:
-                logger.warning("Failed to save observatories to storage, falling back to JSON: %s", exc)
-        cfg_path = self._observatories_config_path()
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                logger.warning("Failed to save observatories to storage: %s", exc)
+                return
 
     def _refresh_observatory_combo(self, selected_name: Optional[str] = None):
         current = selected_name or self.obs_combo.currentText()
@@ -16175,6 +16323,14 @@ class MainWindow(QMainWindow):
         # Persistent user settings
         self.settings = _create_app_settings()
         self.app_storage = getattr(self.settings, "storage", None)
+        self._workspace_plan_id = ""
+        self._active_plan_id = ""
+        self._active_plan_kind = "workspace"
+        self._active_plan_name = "Workspace"
+        self._plan_autosave_timer = QTimer(self)
+        self._plan_autosave_timer.setSingleShot(True)
+        self._plan_autosave_timer.timeout.connect(self._flush_plan_autosave)
+        self._suspend_plan_autosave = False
         logger.info("Using settings file: %s", self.settings.fileName())
         self._migrate_table_settings_schema()
         self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
@@ -16356,12 +16512,17 @@ class MainWindow(QMainWindow):
         self.table_model.rowsRemoved.connect(lambda *_: self._schedule_table_column_width_refresh(reset_widths=True))
         self.table_model.modelReset.connect(self._schedule_primary_target_selection)
         self.table_model.rowsInserted.connect(lambda *_: self._schedule_primary_target_selection())
+        self.table_model.layoutChanged.connect(self._schedule_plan_autosave)
+        self.table_model.modelReset.connect(self._schedule_plan_autosave)
+        self.table_model.rowsInserted.connect(lambda *_: self._schedule_plan_autosave())
+        self.table_model.rowsRemoved.connect(lambda *_: self._schedule_plan_autosave())
         # NOTE: Reapply table settings and default sort are now handled explicitly after layoutChanged.emit()
         # # Apply saved settings now that table_view exists
         # self._load_settings()
         # Enable click‐to‐sort
         self.table_view.setSortingEnabled(True)
         self.table_view.horizontalHeader().setSectionsClickable(True)
+        self.table_view.horizontalHeader().sortIndicatorChanged.connect(lambda *_: self._schedule_plan_autosave())
         # Do not override user default sort here; let _load_settings() apply the saved sort
         self.table_view.setDragDropMode(QTableView.InternalMove)
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -16545,7 +16706,7 @@ class MainWindow(QMainWindow):
         }
         loaded_observatories, loaded_preset_keys = self._load_custom_observatories()
         if loaded_observatories:
-            # Config file is now the source of truth (so deletions persist between runs).
+            # SQLite is the source of truth for user observatories.
             self.observatories = dict(loaded_observatories)
             self._observatory_preset_keys = {
                 name: str(loaded_preset_keys.get(name, "custom") or "custom")
@@ -16580,6 +16741,7 @@ class MainWindow(QMainWindow):
         # Debounced connections for date and limit spin
         self.date_edit.dateChanged.connect(lambda _: self._replot_timer.start())
         self.date_edit.dateChanged.connect(lambda _: self._refresh_weather_window_context())
+        self.date_edit.dateChanged.connect(lambda *_: self._schedule_plan_autosave())
         self.limit_spin.valueChanged.connect(self._update_limit)
         self.sun_alt_limit_spin.valueChanged.connect(self._on_sun_alt_limit_changed)
         # Re-plot when latitude, longitude, or elevation is changed
@@ -16807,16 +16969,16 @@ class MainWindow(QMainWindow):
         _set_button_variant(self.edit_object_btn, "neutral")
         _set_button_icon_kind(self.edit_object_btn, "edit")
 
-        load_plan_btn = QPushButton("Load Plan…")
-        load_plan_btn.setMinimumHeight(24)
-        load_plan_btn.clicked.connect(self._load_plan)
-        _set_button_variant(load_plan_btn, "secondary")
-        _set_button_icon_kind(load_plan_btn, "load")
-        save_btn = QPushButton("Save Plan…")
-        save_btn.setMinimumHeight(24)
-        save_btn.clicked.connect(self._export_plan)
-        _set_button_variant(save_btn, "secondary")
-        _set_button_icon_kind(save_btn, "save")
+        self.open_saved_plan_btn = QPushButton("Open Saved Plan…")
+        self.open_saved_plan_btn.setMinimumHeight(24)
+        self.open_saved_plan_btn.clicked.connect(self._open_saved_plan)
+        _set_button_variant(self.open_saved_plan_btn, "secondary")
+        _set_button_icon_kind(self.open_saved_plan_btn, "load")
+        self.save_plan_as_btn = QPushButton("Save Plan As…")
+        self.save_plan_as_btn.setMinimumHeight(24)
+        self.save_plan_as_btn.clicked.connect(self._save_plan_as)
+        _set_button_variant(self.save_plan_as_btn, "secondary")
+        _set_button_icon_kind(self.save_plan_as_btn, "save")
         suggest_targets_btn = QPushButton("Suggest Targets")
         suggest_targets_btn.setMinimumHeight(24)
         suggest_targets_btn.clicked.connect(self._ai_suggest_targets)
@@ -16883,8 +17045,8 @@ class MainWindow(QMainWindow):
         actions_l.addWidget(self.weather_btn)
         actions_l.addWidget(toggle_obs_btn)
         actions_l.addWidget(self.edit_object_btn)
-        actions_l.addWidget(load_plan_btn)
-        actions_l.addWidget(save_btn)
+        actions_l.addWidget(self.open_saved_plan_btn)
+        actions_l.addWidget(self.save_plan_as_btn)
         actions_l.addWidget(self.ai_toggle_btn)
         actions_l.addStretch(1)
         actions_bar.setLayout(actions_l)
@@ -17275,6 +17437,7 @@ class MainWindow(QMainWindow):
         self._clock_timer.start(1000)
         self._update_status_bar()
         self._update_selected_details()
+        self._restore_workspace_on_startup()
         self._validate_site_inputs()
         self._replot_timer.start()
         QTimer.singleShot(120, self._prefetch_bhtom_observatory_presets_on_startup)
@@ -17315,6 +17478,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Stop background threads before the window closes."""
         try:
+            if hasattr(self, "_plan_autosave_timer") and self._plan_autosave_timer.isActive():
+                self._plan_autosave_timer.stop()
+            self._flush_plan_autosave()
+        except Exception:
+            pass
+        try:
             self._cleanup_threads()
         except Exception as exc:
             logger.exception("Error during thread cleanup: %s", exc)
@@ -17337,8 +17506,12 @@ class MainWindow(QMainWindow):
         self.load_act = QAction("Load targets…", self, shortcut=QKeySequence("Ctrl+L"))
         self.load_act.triggered.connect(self._load_targets)
 
-        self.load_plan_act = QAction("Load plan…", self, shortcut=QKeySequence("Ctrl+Shift+L"))
-        self.load_plan_act.triggered.connect(self._load_plan)
+        self.open_saved_plan_act = QAction("Open saved plan…", self, shortcut=QKeySequence("Ctrl+Shift+L"))
+        self.open_saved_plan_act.triggered.connect(self._open_saved_plan)
+        self.import_plan_json_act = QAction("Import plan JSON…", self)
+        self.import_plan_json_act.triggered.connect(self._import_plan_json)
+        self.save_plan_as_act = QAction("Save plan as…", self, shortcut=QKeySequence("Ctrl+Shift+S"))
+        self.save_plan_as_act.triggered.connect(self._save_plan_as)
 
         self.add_act = QAction("Add target…", self, shortcut=QKeySequence("Ctrl+N"))
         self.add_act.triggered.connect(self._add_target_dialog)
@@ -17370,6 +17543,8 @@ class MainWindow(QMainWindow):
         self.ai_warmup_act.triggered.connect(self._warmup_llm_manual)
         self.ai_clear_chat_act = QAction("Clear AI chat", self)
         self.ai_clear_chat_act.triggered.connect(self._clear_ai_messages)
+        self.obs_history_act = QAction("Observation History…", self)
+        self.obs_history_act.triggered.connect(self._show_observation_history)
         self.ai_focus_input_act = QAction("Focus AI input", self)
         self.ai_focus_input_act.triggered.connect(self._focus_ai_input)
         self.ai_settings_act = QAction("AI Settings…", self)
@@ -17392,7 +17567,9 @@ class MainWindow(QMainWindow):
         # Make shortcuts work even if the action isn't in a visible menu
         for act in (
             self.load_act,
-            self.load_plan_act,
+            self.open_saved_plan_act,
+            self.import_plan_json_act,
+            self.save_plan_as_act,
             self.add_act,
             self.toggle_obs_act,
             self.exp_act,
@@ -17405,6 +17582,7 @@ class MainWindow(QMainWindow):
             self.ai_focus_input_act,
             self.ai_settings_act,
             self.weather_act,
+            self.obs_history_act,
         ):
             self.addAction(act)
 
@@ -17415,7 +17593,9 @@ class MainWindow(QMainWindow):
         menubar.setVisible(True)
         file_menu = menubar.addMenu("&File")
         file_menu.addAction(self.load_act)
-        file_menu.addAction(self.load_plan_act)
+        file_menu.addAction(self.open_saved_plan_act)
+        file_menu.addAction(self.import_plan_json_act)
+        file_menu.addAction(self.save_plan_as_act)
         file_menu.addAction(self.exp_act)
         file_menu.addAction(self.seestar_session_act)
         file_menu.addSeparator()
@@ -17433,6 +17613,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.view_full_preset_act)
         view_menu.addSeparator()
         view_menu.addAction(self.weather_act)
+        view_menu.addAction(self.obs_history_act)
 
         ai_menu = menubar.addMenu("&AI")
         ai_menu.addAction(self.ai_describe_act)
@@ -17635,6 +17816,7 @@ class MainWindow(QMainWindow):
             self.view_obs_preset_act.setChecked(preset == "observation")
         if hasattr(self, "view_full_preset_act"):
             self.view_full_preset_act.setChecked(preset == "full")
+        self._schedule_plan_autosave()
 
     def _schedule_table_column_width_refresh(self, reset_widths: bool = False) -> None:
         if not hasattr(self, "table_view") or not hasattr(self, "table_model"):
@@ -17875,6 +18057,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("general/sunAltLimit", int(value))
         self._update_status_bar()
         self._refresh_weather_window_context()
+        self._schedule_plan_autosave()
         if hasattr(self, "progress"):
             self._replot_timer.start()
 
@@ -17887,6 +18070,7 @@ class MainWindow(QMainWindow):
         self._apply_table_row_visibility()
         self._emit_table_data_changed()
         self._update_status_bar()
+        self._schedule_plan_autosave()
         if hasattr(self, "progress"):
             self._replot_timer.start()
 
@@ -18072,6 +18256,7 @@ class MainWindow(QMainWindow):
         idx = self.table_model.index(row, TargetTableModel.COL_NAME)
         self.table_model.dataChanged.emit(idx, idx, [Qt.ToolTipRole, Qt.DisplayRole])
         self._update_selected_details()
+        self._schedule_plan_autosave()
 
     def _edit_object_for_row(self, row: int):
         if not (0 <= row < len(self.targets)):
@@ -18229,6 +18414,7 @@ class MainWindow(QMainWindow):
             tgt.magnitude = magnitude
             tgt.plot_color = plot_color
             tgt.priority = priority_spin.value()
+            was_observed = bool(tgt.observed)
             tgt.observed = observed_chk.isChecked()
             tgt.notes = notes_edit.toPlainText().strip()
 
@@ -18245,6 +18431,8 @@ class MainWindow(QMainWindow):
             self._emit_table_data_changed()
             self._update_selected_details()
             self._update_status_bar()
+            self._record_observation_if_needed(tgt, was_observed=was_observed, source="edit_object")
+            self._schedule_plan_autosave()
             self._replot_timer.start()
             return
 
@@ -18362,6 +18550,7 @@ class MainWindow(QMainWindow):
             return
         self.table_model.site = site
         self._start_clock_worker()
+        self._schedule_plan_autosave()
         self._replot_timer.start()
 
     def _cleanup_threads(self):
@@ -18520,31 +18709,666 @@ class MainWindow(QMainWindow):
             return
         self._apply_default_sort()
 
+    def _plan_target_key(self, target: Target) -> str:
+        source_catalog = str(target.source_catalog or "").strip().lower()
+        source_object_id = str(target.source_object_id or "").strip().lower()
+        if source_catalog and source_object_id:
+            return f"{source_catalog}:{source_object_id}"
+        return _normalize_catalog_token(target.name) or f"{target.ra:.6f}:{target.dec:.6f}"
+
+    def _active_plan_storage_id(self) -> str:
+        return str(self._active_plan_id or self._workspace_plan_id or "")
+
+    def _serialize_current_targets(self) -> list[dict[str, object]]:
+        return [target.model_dump(mode="json") for target in self.targets]
+
+    def _current_site_snapshot(self) -> dict[str, object]:
+        site = getattr(self.table_model, "site", None)
+        if isinstance(site, Site):
+            return site.model_dump(mode="json")
+        if hasattr(self, "obs_combo"):
+            name = self.obs_combo.currentText().strip()
+            obs = self.observatories.get(name) if hasattr(self, "observatories") else None
+            if isinstance(obs, Site):
+                return obs.model_dump(mode="json")
+            try:
+                fallback = Site(
+                    name=name or "Custom",
+                    latitude=self._read_site_float(self.lat_edit),
+                    longitude=self._read_site_float(self.lon_edit),
+                    elevation=self._read_site_float(self.elev_edit),
+                    limiting_magnitude=self._current_limiting_magnitude(),
+                )
+            except Exception:
+                return {}
+            return fallback.model_dump(mode="json")
+        return {}
+
+    def _current_plan_snapshot(self) -> dict[str, object]:
+        header = self.table_view.horizontalHeader() if hasattr(self, "table_view") else None
+        selected = self._selected_target_or_none()
+        default_sort_column = TargetTableModel.COL_SCORE
+        if header is not None:
+            default_sort_column = int(header.sortIndicatorSection())
+        return {
+            "date": self.date_edit.date().toString(Qt.ISODate) if hasattr(self, "date_edit") else "",
+            "site_name": self.obs_combo.currentText().strip() if hasattr(self, "obs_combo") else "",
+            "site_snapshot": self._current_site_snapshot(),
+            "limit_altitude": float(self.limit_spin.value()) if hasattr(self, "limit_spin") else 30.0,
+            "sun_alt_limit": float(self._sun_alt_limit()),
+            "min_moon_sep": float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0,
+            "min_score": float(self.min_score_spin.value()) if hasattr(self, "min_score_spin") else 0.0,
+            "hide_observed": bool(self.hide_observed_chk.isChecked()) if hasattr(self, "hide_observed_chk") else False,
+            "selected_target_name": str(selected.name if isinstance(selected, Target) else ""),
+            "view_preset": "full" if hasattr(self, "view_full_preset_act") and self.view_full_preset_act.isChecked() else "observation",
+            "default_sort_column": int(default_sort_column),
+        }
+
+    def _set_plan_context(self, *, plan_id: str, plan_kind: str, plan_name: str) -> None:
+        self._active_plan_id = str(plan_id or "")
+        self._active_plan_kind = str(plan_kind or "workspace")
+        self._active_plan_name = str(plan_name or "Workspace")
+        if self._active_plan_kind == "workspace":
+            self._workspace_plan_id = self._active_plan_id
+        self._load_ai_messages_for_active_plan()
+
+    def _serialize_ai_messages_for_storage(self) -> list[dict[str, object]]:
+        serialized: list[dict[str, object]] = []
+        for idx, message in enumerate(self._ai_messages):
+            payload: dict[str, object] = {
+                "kind": str(message.get("kind", "info") or "info"),
+                "text": str(message.get("text", "") or ""),
+                "created_at": float(message.get("created_at", datetime.now(timezone.utc).timestamp()) or datetime.now(timezone.utc).timestamp()),
+                "sort_order": idx,
+            }
+            action_targets = message.get("action_targets")
+            if isinstance(action_targets, list):
+                payload["action_targets"] = [
+                    target.model_dump(mode="json")
+                    for target in action_targets
+                    if isinstance(target, Target)
+                ]
+            serialized.append(payload)
+        return serialized
+
+    def _deserialize_ai_messages_from_storage(self, rows: list[dict[str, object]]) -> list[dict[str, Any]]:
+        restored: list[dict[str, Any]] = []
+        for row in rows:
+            message: dict[str, Any] = {
+                "kind": str(row.get("kind", "info") or "info"),
+                "text": str(row.get("text", "") or ""),
+                "created_at": float(row.get("created_at", 0.0) or 0.0),
+            }
+            action_targets_payload = row.get("action_targets")
+            if isinstance(action_targets_payload, list):
+                action_targets: list[Target] = []
+                for target_payload in action_targets_payload:
+                    if not isinstance(target_payload, dict):
+                        continue
+                    try:
+                        action_targets.append(Target(**target_payload))
+                    except Exception:
+                        continue
+                if action_targets:
+                    message["action_targets"] = action_targets
+            restored.append(message)
+        return restored
+
+    def _load_ai_messages_for_active_plan(self) -> None:
+        storage = getattr(self, "app_storage", None)
+        plan_id = self._active_plan_storage_id()
+        if storage is None or not plan_id:
+            self._ai_messages = []
+            self._ai_message_widget_refs = []
+            if hasattr(self, "ai_output_layout"):
+                self._render_ai_messages()
+            self._refresh_ai_panel_action_buttons()
+            return
+        try:
+            rows = storage.chat_history.list_messages(plan_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to load AI history for %s: %s", plan_id, exc)
+            rows = []
+        self._ai_messages = self._deserialize_ai_messages_from_storage(rows)
+        self._ai_message_widget_refs = []
+        if hasattr(self, "ai_output_layout"):
+            self._render_ai_messages()
+        self._refresh_ai_panel_action_buttons()
+
+    def _persist_ai_messages_to_storage(self) -> None:
+        storage = getattr(self, "app_storage", None)
+        plan_id = self._active_plan_storage_id()
+        if storage is None or not plan_id:
+            return
+        try:
+            serialized = self._serialize_ai_messages_for_storage()
+            if serialized:
+                storage.chat_history.replace_messages(plan_id, serialized)
+            else:
+                storage.chat_history.clear(plan_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist AI history for %s: %s", plan_id, exc)
+
+    def _persist_workspace_now(self) -> None:
+        storage = getattr(self, "app_storage", None)
+        if storage is None or self._suspend_plan_autosave:
+            return
+        try:
+            record = storage.plans.save_workspace(self._current_plan_snapshot(), self._serialize_current_targets())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist workspace: %s", exc)
+            return
+        workspace_id = str(record.get("id", "") or "")
+        if workspace_id:
+            self._workspace_plan_id = workspace_id
+            if self._active_plan_kind == "workspace" or not self._active_plan_id:
+                self._active_plan_id = workspace_id
+                self._active_plan_kind = "workspace"
+                self._active_plan_name = str(record.get("name", "Workspace") or "Workspace")
+
+    def _persist_active_plan_now(self) -> None:
+        if self._suspend_plan_autosave:
+            return
+        self._persist_workspace_now()
+        storage = getattr(self, "app_storage", None)
+        if storage is None or self._active_plan_kind != "saved" or not self._active_plan_id:
+            self._persist_ai_messages_to_storage()
+            return
+        try:
+            record = storage.plans.save_named(
+                self._active_plan_name,
+                self._current_plan_snapshot(),
+                self._serialize_current_targets(),
+                plan_id=self._active_plan_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to autosave active plan '%s': %s", self._active_plan_name, exc)
+        else:
+            self._active_plan_id = str(record.get("id", self._active_plan_id) or self._active_plan_id)
+            self._active_plan_name = str(record.get("name", self._active_plan_name) or self._active_plan_name)
+        self._persist_ai_messages_to_storage()
+
+    def _schedule_plan_autosave(self) -> None:
+        if self._suspend_plan_autosave or getattr(self, "app_storage", None) is None:
+            return
+        self._plan_autosave_timer.start(500)
+
+    def _flush_plan_autosave(self) -> None:
+        self._persist_active_plan_now()
+
+    def _ensure_named_site_available(self, site_snapshot: dict[str, object], *, preferred_name: str) -> None:
+        if not site_snapshot:
+            return
+        site_name = str(preferred_name or site_snapshot.get("name") or "Custom").strip() or "Custom"
+        site_snapshot = dict(site_snapshot)
+        site_snapshot["name"] = site_name
+        try:
+            site = Site(**site_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Skipping invalid stored site snapshot for '%s': %s", site_name, exc)
+            return
+        if site_name not in self.observatories:
+            self.observatories[site_name] = site
+            self._observatory_preset_keys[site_name] = "custom"
+            self._save_custom_observatories()
+            self._refresh_observatory_combo(selected_name=site_name)
+        else:
+            self.observatories[site_name] = site
+
+    def _apply_plan_payload(
+        self,
+        snapshot: dict[str, object],
+        target_payloads: list[dict[str, object]],
+        *,
+        plan_id: str,
+        plan_kind: str,
+        plan_name: str,
+    ) -> None:
+        loaded_targets: list[Target] = []
+        for payload in target_payloads:
+            try:
+                loaded_targets.append(Target(**payload))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Skipping invalid stored target payload: %s", exc)
+        site_snapshot = snapshot.get("site_snapshot")
+        site_name = str(snapshot.get("site_name", "") or "")
+        if isinstance(site_snapshot, dict):
+            self._ensure_named_site_available(site_snapshot, preferred_name=site_name)
+
+        selected_target_name = str(snapshot.get("selected_target_name", "") or "")
+        self.obs_combo.blockSignals(True)
+        try:
+            if site_name and site_name in self.observatories:
+                self.obs_combo.setCurrentText(site_name)
+        finally:
+            self.obs_combo.blockSignals(False)
+        if site_name and site_name in self.observatories:
+            self._on_obs_change(site_name)
+        elif isinstance(site_snapshot, dict):
+            try:
+                restored_site = Site(**site_snapshot)
+            except Exception:
+                restored_site = None
+            if isinstance(restored_site, Site):
+                self.lat_edit.setText(f"{restored_site.latitude}")
+                self.lon_edit.setText(f"{restored_site.longitude}")
+                self.elev_edit.setText(f"{restored_site.elevation}")
+                self.table_model.site = restored_site
+
+        iso_date = str(snapshot.get("date", "") or "").strip()
+        if iso_date:
+            qdate = QDate.fromString(iso_date, Qt.ISODate)
+            if qdate.isValid():
+                self.date_edit.setDate(qdate)
+        if "limit_altitude" in snapshot:
+            self.limit_spin.setValue(int(round(float(snapshot.get("limit_altitude", self.limit_spin.value()) or self.limit_spin.value()))))
+        if "sun_alt_limit" in snapshot:
+            self.sun_alt_limit_spin.setValue(int(round(float(snapshot.get("sun_alt_limit", self.sun_alt_limit_spin.value()) or self.sun_alt_limit_spin.value()))))
+        if "min_moon_sep" in snapshot:
+            self.min_moon_sep_spin.setValue(int(round(float(snapshot.get("min_moon_sep", self.min_moon_sep_spin.value()) or self.min_moon_sep_spin.value()))))
+        if "min_score" in snapshot:
+            self.min_score_spin.setValue(int(round(float(snapshot.get("min_score", self.min_score_spin.value()) or self.min_score_spin.value()))))
+        if "hide_observed" in snapshot:
+            self.hide_observed_chk.setChecked(bool(snapshot.get("hide_observed")))
+
+        self.target_metrics.clear()
+        self.target_windows.clear()
+        self.table_model.reset_targets(loaded_targets)
+        self._recompute_recommended_order_cache()
+        self._apply_table_settings()
+        preset = str(snapshot.get("view_preset", "observation") or "observation")
+        self._apply_column_preset(preset, save=False)
+        sort_col_raw = snapshot.get("default_sort_column", TargetTableModel.COL_SCORE)
+        try:
+            sort_col = int(sort_col_raw)
+        except Exception:
+            sort_col = TargetTableModel.COL_SCORE
+        if 0 <= sort_col < self.table_model.columnCount():
+            self.table_view.sortByColumn(sort_col, Qt.AscendingOrder)
+        else:
+            self._apply_default_sort()
+        self._fetch_missing_magnitudes_async()
+        self._set_plan_context(plan_id=plan_id, plan_kind=plan_kind, plan_name=plan_name)
+        if selected_target_name:
+            for row_idx, target in enumerate(self.targets):
+                if _normalize_catalog_token(target.name) == _normalize_catalog_token(selected_target_name):
+                    self.table_view.selectRow(row_idx)
+                    break
+        self._update_selected_details()
+        self._refresh_target_color_map()
+        self._emit_table_data_changed()
+        self._run_plan()
+
+    def _restore_plan_record(self, record: dict[str, object]) -> None:
+        snapshot = dict(record.get("snapshot") or {})
+        target_payloads = [
+            dict(payload)
+            for payload in record.get("targets", [])
+            if isinstance(payload, dict)
+        ]
+        self._suspend_plan_autosave = True
+        try:
+            self._apply_plan_payload(
+                snapshot,
+                target_payloads,
+                plan_id=str(record.get("id", "") or ""),
+                plan_kind=str(record.get("plan_kind", "workspace") or "workspace"),
+                plan_name=str(record.get("name", "Workspace") or "Workspace"),
+            )
+        finally:
+            self._suspend_plan_autosave = False
+        self._persist_workspace_now()
+
+    def _restore_workspace_on_startup(self) -> None:
+        storage = getattr(self, "app_storage", None)
+        if storage is None:
+            return
+        try:
+            workspace = storage.plans.load_workspace()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to restore workspace from storage: %s", exc)
+            workspace = None
+        if workspace:
+            self._restore_plan_record(workspace)
+            if str(workspace.get("id", "")).strip():
+                self._workspace_plan_id = str(workspace.get("id"))
+            return
+        self._persist_workspace_now()
+        self._load_ai_messages_for_active_plan()
+
+    def _load_plan_from_json_path(self, file_path: str, *, persist_workspace: bool = True) -> None:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            target_payloads = [dict(entry) for entry in data if isinstance(entry, dict)]
+        except Exception as e:
+            QMessageBox.critical(self, "Load plan error", str(e))
+            return
+        self._suspend_plan_autosave = True
+        try:
+            self._apply_plan_payload(
+                {},
+                target_payloads,
+                plan_id=str(self._workspace_plan_id or ""),
+                plan_kind="workspace",
+                plan_name="Workspace",
+            )
+        finally:
+            self._suspend_plan_autosave = False
+        if persist_workspace:
+            self._persist_workspace_now()
+            self._set_plan_context(
+                plan_id=str(self._workspace_plan_id or self._active_plan_id),
+                plan_kind="workspace",
+                plan_name="Workspace",
+            )
+            self._persist_ai_messages_to_storage()
+
     @Slot()
-    def _load_plan(self):
-        """Load a saved plan (JSON targets)."""
+    def _import_plan_json(self):
         fn, _ = QFileDialog.getOpenFileName(
-            self, "Load plan JSON", str(Path.cwd()), "JSON files (*.json)"
+            self, "Import plan JSON", str(Path.cwd()), "JSON files (*.json)"
         )
         if not fn:
             return
+        self._load_plan_from_json_path(fn, persist_workspace=True)
+
+    @Slot()
+    def _load_plan(self):
+        self._open_saved_plan()
+
+    @Slot()
+    def _save_plan_as(self) -> None:
+        storage = getattr(self, "app_storage", None)
+        if storage is None:
+            QMessageBox.information(self, "Save Plan", "SQLite storage is not available.")
+            return
+        default_name = self._active_plan_name if self._active_plan_kind == "saved" else ""
+        name, ok = QInputDialog.getText(self, "Save Plan As", "Plan name:", text=default_name)
+        if not ok:
+            return
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            QMessageBox.information(self, "Save Plan", "Plan name cannot be empty.")
+            return
         try:
-            with open(fn, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
-            loaded_targets: list[Target] = []
-            self.target_metrics.clear()
-            self.target_windows.clear()
-            for entry in data:
-                loaded_targets.append(Target(**entry))
-            self.table_model.reset_targets(loaded_targets)
-            # Reapply settings & default sort after layout change
-            self._apply_table_settings()
-            self._apply_default_sort()
-            self._fetch_missing_magnitudes_async()
-            # Automatically redraw the visibility plot after loading a plan
-            self._run_plan()
-        except Exception as e:
-            QMessageBox.critical(self, "Load plan error", str(e))
+            record = storage.plans.save_named(
+                normalized_name,
+                self._current_plan_snapshot(),
+                self._serialize_current_targets(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Save Plan", f"Could not save the plan:\n{exc}")
+            return
+        self._persist_workspace_now()
+        self._set_plan_context(
+            plan_id=str(record.get("id", "") or ""),
+            plan_kind="saved",
+            plan_name=str(record.get("name", normalized_name) or normalized_name),
+        )
+        self._persist_ai_messages_to_storage()
+        self.statusBar().showMessage(f"Saved plan '{self._active_plan_name}'.", 4000)
+
+    @Slot()
+    def _open_saved_plan(self) -> None:
+        storage = getattr(self, "app_storage", None)
+        if storage is None:
+            QMessageBox.information(self, "Open Saved Plan", "SQLite storage is not available.")
+            return
+        try:
+            plans = storage.plans.list_saved()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Open Saved Plan", f"Could not read saved plans:\n{exc}")
+            return
+        if not plans:
+            QMessageBox.information(self, "Open Saved Plan", "No saved plans were found.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Open Saved Plan")
+        dlg.resize(520, 420)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        search_edit = QLineEdit(dlg)
+        search_edit.setPlaceholderText("Filter saved plans...")
+        plan_list = QListWidget(dlg)
+        info_label = QLabel(dlg)
+        info_label.setObjectName("SectionHint")
+        delete_btn = QPushButton("Delete", dlg)
+        _set_button_variant(delete_btn, "neutral")
+        buttons = QDialogButtonBox(QDialogButtonBox.Open | QDialogButtonBox.Cancel, parent=dlg)
+        open_btn = buttons.button(QDialogButtonBox.Open)
+
+        current_plan_map: dict[str, dict[str, object]] = {}
+
+        def refresh_items() -> None:
+            current_plan_map.clear()
+            plan_list.clear()
+            query = str(search_edit.text() or "").strip().lower()
+            for item in plans:
+                plan_name = str(item.get("name", "") or "")
+                if query and query not in plan_name.lower():
+                    continue
+                label = f"{plan_name} ({int(item.get('target_count', 0) or 0)} targets)"
+                widget_item = QListWidgetItem(label, plan_list)
+                plan_id = str(item.get("id", "") or "")
+                widget_item.setData(Qt.UserRole, plan_id)
+                current_plan_map[plan_id] = item
+            has_selection = plan_list.count() > 0
+            if has_selection:
+                plan_list.setCurrentRow(0)
+            open_btn.setEnabled(has_selection)
+            delete_btn.setEnabled(has_selection)
+
+        def update_info() -> None:
+            current_item = plan_list.currentItem()
+            if current_item is None:
+                info_label.setText("No saved plan selected.")
+                return
+            plan_id = str(current_item.data(Qt.UserRole) or "")
+            plan = current_plan_map.get(plan_id, {})
+            updated_at = float(plan.get("updated_at", 0.0) or 0.0)
+            if updated_at > 0:
+                stamp = datetime.fromtimestamp(updated_at, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+            else:
+                stamp = "unknown"
+            info_label.setText(
+                f"Targets: {int(plan.get('target_count', 0) or 0)} | Last update: {stamp}"
+            )
+
+        def delete_selected() -> None:
+            current_item = plan_list.currentItem()
+            if current_item is None:
+                return
+            plan_id = str(current_item.data(Qt.UserRole) or "")
+            plan = current_plan_map.get(plan_id, {})
+            plan_name = str(plan.get("name", "this plan") or "this plan")
+            answer = QMessageBox.question(
+                dlg,
+                "Delete Saved Plan",
+                f"Delete '{plan_name}' from SQLite storage?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            try:
+                deleted = storage.plans.delete_plan(plan_id)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(dlg, "Delete Saved Plan", f"Could not delete the plan:\n{exc}")
+                return
+            if not deleted:
+                QMessageBox.information(dlg, "Delete Saved Plan", "The selected plan no longer exists.")
+                return
+            nonlocal plans
+            plans = [item for item in plans if str(item.get("id", "")) != plan_id]
+            refresh_items()
+            update_info()
+
+        search_edit.textChanged.connect(lambda _text: (refresh_items(), update_info()))
+        plan_list.currentItemChanged.connect(lambda *_args: update_info())
+        plan_list.itemDoubleClicked.connect(lambda *_args: dlg.accept())
+        delete_btn.clicked.connect(delete_selected)
+
+        layout.addWidget(search_edit)
+        layout.addWidget(plan_list, 1)
+        layout.addWidget(info_label)
+        controls_row = QHBoxLayout()
+        controls_row.addWidget(delete_btn)
+        controls_row.addStretch(1)
+        layout.addLayout(controls_row)
+        layout.addWidget(buttons)
+
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        refresh_items()
+        update_info()
+        if dlg.exec() != QDialog.Accepted:
+            return
+        current_item = plan_list.currentItem()
+        if current_item is None:
+            return
+        plan_id = str(current_item.data(Qt.UserRole) or "")
+        try:
+            record = storage.plans.load_plan(plan_id)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Open Saved Plan", f"Could not load the plan:\n{exc}")
+            return
+        if not record:
+            QMessageBox.information(self, "Open Saved Plan", "The selected plan is no longer available.")
+            return
+        self._restore_plan_record(record)
+        self.statusBar().showMessage(f"Opened '{record.get('name', 'saved plan')}'.", 4000)
+
+    @Slot()
+    def _show_observation_history(self) -> None:
+        storage = getattr(self, "app_storage", None)
+        if storage is None:
+            QMessageBox.information(self, "Observation History", "SQLite storage is not available.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Observation History")
+        dlg.resize(880, 460)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        search_edit = QLineEdit(dlg)
+        search_edit.setPlaceholderText("Search by target or site...")
+        table = QTableWidget(dlg)
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Observed At", "Target", "Site", "Source", "Notes"])
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        export_btn = QPushButton("Export CSV", dlg)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dlg)
+        current_rows: list[dict[str, object]] = []
+
+        def load_rows() -> list[dict[str, object]]:
+            try:
+                return storage.observation_log.list_entries(search=search_edit.text())
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(dlg, "Observation History", f"Could not load history:\n{exc}")
+                return []
+
+        def refresh_table() -> None:
+            rows = load_rows()
+            current_rows[:] = rows
+            table.setRowCount(len(rows))
+            for row_idx, row in enumerate(rows):
+                observed_at = float(row.get("observed_at", 0.0) or 0.0)
+                if observed_at > 0:
+                    stamp = datetime.fromtimestamp(observed_at, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+                else:
+                    stamp = "-"
+                values = [
+                    stamp,
+                    str(row.get("target_name", "") or ""),
+                    str(row.get("site_name", "") or ""),
+                    str(row.get("source", "") or ""),
+                    str(row.get("notes", "") or ""),
+                ]
+                for col_idx, value in enumerate(values):
+                    table.setItem(row_idx, col_idx, QTableWidgetItem(value))
+            table.resizeRowsToContents()
+
+        def export_csv() -> None:
+            if not current_rows:
+                QMessageBox.information(dlg, "Observation History", "No observation entries to export.")
+                return
+            default_name = f"astroplanner-observation-history-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+            file_path, _ = QFileDialog.getSaveFileName(
+                dlg,
+                "Export Observation History",
+                str(Path.home() / default_name),
+                "CSV files (*.csv)",
+            )
+            if not file_path:
+                return
+            try:
+                with open(file_path, "w", encoding="utf-8", newline="") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(["observed_at", "target_name", "target_key", "site_name", "source", "notes"])
+                    for row in current_rows:
+                        writer.writerow(
+                            [
+                                float(row.get("observed_at", 0.0) or 0.0),
+                                str(row.get("target_name", "") or ""),
+                                str(row.get("target_key", "") or ""),
+                                str(row.get("site_name", "") or ""),
+                                str(row.get("source", "") or ""),
+                                str(row.get("notes", "") or ""),
+                            ]
+                        )
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(dlg, "Observation History", f"Could not export CSV:\n{exc}")
+                return
+            self.statusBar().showMessage(f"Exported observation history to {Path(file_path).name}.", 4000)
+
+        search_edit.textChanged.connect(lambda _text: refresh_table())
+        export_btn.clicked.connect(export_csv)
+        buttons.rejected.connect(dlg.reject)
+
+        layout.addWidget(search_edit)
+        layout.addWidget(table, 1)
+        controls = QHBoxLayout()
+        controls.addWidget(export_btn)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+        layout.addWidget(buttons)
+        refresh_table()
+        dlg.exec()
+
+    def _record_observation_if_needed(self, target: Target, *, was_observed: bool, source: str) -> None:
+        if was_observed or not target.observed:
+            return
+        storage = getattr(self, "app_storage", None)
+        if storage is None:
+            return
+        site_payload = self._current_site_snapshot()
+        site_name = str(site_payload.get("name", self.obs_combo.currentText() if hasattr(self, "obs_combo") else "") or "")
+        try:
+            storage.observation_log.append(
+                target_name=target.name,
+                target_key=self._plan_target_key(target),
+                target_payload=target.model_dump(mode="json"),
+                site_name=site_name,
+                site_payload=site_payload,
+                notes=str(target.notes or ""),
+                source=source,
+                plan_id=self._active_plan_storage_id() or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist observation log entry for %s: %s", target.name, exc)
 
     # .....................................................
     # file / target helpers
@@ -18656,6 +19480,7 @@ class MainWindow(QMainWindow):
             self._update_selected_details()
             self._prefetch_cutouts_for_all_targets(prioritize=self._selected_target_or_none())
             self._prefetch_finder_charts_for_all_targets(prioritize=self._selected_target_or_none())
+        self._schedule_plan_autosave()
         return True
 
     @Slot()
@@ -18733,6 +19558,7 @@ class MainWindow(QMainWindow):
         self._apply_default_sort()
         self._update_selected_details()
         # Debounce and update plot after removing a target
+        self._schedule_plan_autosave()
         self._replot_timer.start()
 
     @Slot()
@@ -18750,13 +19576,17 @@ class MainWindow(QMainWindow):
         self._apply_table_settings()
         self._apply_default_sort()
         self._update_selected_details()
+        self._schedule_plan_autosave()
         self._replot_timer.start()
 
     def _toggle_observed_row(self, row: int):
         if 0 <= row < len(self.targets):
+            was_observed = bool(self.targets[row].observed)
             self.targets[row].observed = not self.targets[row].observed
             self._emit_table_data_changed()
             self._update_selected_details()
+            self._record_observation_if_needed(self.targets[row], was_observed=was_observed, source="toggle_row")
+            self._schedule_plan_autosave()
             if self.last_payload is not None:
                 self._update_plot(self.last_payload)
             else:
@@ -18769,9 +19599,13 @@ class MainWindow(QMainWindow):
             return
         for row in rows:
             if 0 <= row < len(self.targets):
-                self.targets[row].observed = not self.targets[row].observed
+                target = self.targets[row]
+                was_observed = bool(target.observed)
+                target.observed = not target.observed
+                self._record_observation_if_needed(target, was_observed=was_observed, source="toggle_selected")
         self._emit_table_data_changed()
         self._update_selected_details()
+        self._schedule_plan_autosave()
         if self.last_payload is not None:
             self._update_plot(self.last_payload)
         else:
@@ -19940,6 +20774,22 @@ class MainWindow(QMainWindow):
         age = perf_counter() - self._gaia_alerts_cache_loaded_at
         if self._gaia_alerts_cache and not force_refresh and age < ttl_seconds:
             return
+        storage = getattr(self, "app_storage", None)
+        if storage is not None and not force_refresh:
+            try:
+                cached_payload = storage.cache.get_json("gaia_alerts_catalog", "alerts.csv")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to read Gaia Alerts cache from storage: %s", exc)
+            else:
+                if isinstance(cached_payload, dict) and cached_payload:
+                    self._gaia_alerts_cache = {
+                        str(key): value
+                        for key, value in cached_payload.items()
+                        if isinstance(value, dict)
+                    }
+                    if self._gaia_alerts_cache:
+                        self._gaia_alerts_cache_loaded_at = perf_counter()
+                        return
 
         req = Request(
             "https://gsaweb.ast.cam.ac.uk/alerts/alerts.csv",
@@ -19976,6 +20826,11 @@ class MainWindow(QMainWindow):
             raise RuntimeError("Gaia Alerts cache is empty after download.")
         self._gaia_alerts_cache = parsed
         self._gaia_alerts_cache_loaded_at = perf_counter()
+        if storage is not None:
+            try:
+                storage.cache.set_json("gaia_alerts_catalog", "alerts.csv", parsed, ttl_s=ttl_seconds)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to persist Gaia Alerts cache: %s", exc)
 
     def _resolve_target_gaia_alerts(self, query: str) -> Target:
         self._load_gaia_alerts_cache()
@@ -20496,7 +21351,7 @@ class MainWindow(QMainWindow):
         self.ai_input = QLineEdit(center_widget)
         self.ai_input.setPlaceholderText("Ask about tonight or the selected object...")
         self.ai_input.setToolTip(
-            "The AI chat does not keep chat memory. "
+            "The AI chat is saved per active plan/workspace. "
             "Use complete questions with the object or class name, e.g. 'Która SN z BHTOM jest dziś najlepsza?'"
         )
         self.ai_input.returnPressed.connect(self._send_ai_query)
@@ -21918,9 +22773,6 @@ class MainWindow(QMainWindow):
             raise RuntimeError("BHTOM features require an API token in Settings -> General Settings.")
         return token
 
-    def _bhtom_observatory_cache_path(self) -> Path:
-        return Path(__file__).resolve().parent / "config" / "bhtom_observatory_presets_cache.json"
-
     def _bhtom_token_hash(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -22031,51 +22883,16 @@ class MainWindow(QMainWindow):
         base_url: str,
     ) -> Optional[list[dict[str, object]]]:
         storage = getattr(self, "app_storage", None)
+        if storage is None:
+            return None
         cache_key = self._bhtom_storage_cache_key(token=token, base_url=base_url)
-        if storage is not None:
-            try:
-                cached = storage.cache.get_json("bhtom_observatory_presets", cache_key)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to read BHTOM observatory cache from storage: %s", exc)
-            else:
-                presets = self._deserialize_bhtom_observatory_presets(cached)
-                if presets:
-                    return presets
-        cache_path = self._bhtom_observatory_cache_path()
-        if not cache_path.exists():
-            return None
         try:
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception:
+            cached = storage.cache.get_json("bhtom_observatory_presets", cache_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to read BHTOM observatory cache from storage: %s", exc)
             return None
-        if not isinstance(payload, dict):
-            return None
-        if int(payload.get("version", 0)) != 1:
-            return None
-        if str(payload.get("base_url", "")).strip().rstrip("/") != str(base_url).strip().rstrip("/"):
-            return None
-        if str(payload.get("token_hash", "")).strip() != self._bhtom_token_hash(token):
-            return None
-        fetched_at = _safe_float(payload.get("fetched_at_unix"))
-        if fetched_at is None:
-            return None
-        age_s = datetime.now(timezone.utc).timestamp() - float(fetched_at)
-        if age_s < 0 or age_s > BHTOM_OBSERVATORY_CACHE_TTL_S:
-            return None
-        presets = self._deserialize_bhtom_observatory_presets(payload.get("presets"))
-        if not presets:
-            return None
-        if storage is not None:
-            try:
-                storage.cache.set_json(
-                    "bhtom_observatory_presets",
-                    cache_key,
-                    self._serialize_bhtom_observatory_presets(presets),
-                    ttl_s=BHTOM_OBSERVATORY_CACHE_TTL_S,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to migrate BHTOM observatory cache into storage: %s", exc)
-        return presets
+        presets = self._deserialize_bhtom_observatory_presets(cached)
+        return presets or None
 
     def _save_bhtom_observatory_disk_cache(
         self,
@@ -22088,25 +22905,15 @@ class MainWindow(QMainWindow):
         if not serializable:
             return
         storage = getattr(self, "app_storage", None)
-        cache_key = self._bhtom_storage_cache_key(token=token, base_url=base_url)
-        if storage is not None:
-            storage.cache.set_json(
-                "bhtom_observatory_presets",
-                cache_key,
-                serializable,
-                ttl_s=BHTOM_OBSERVATORY_CACHE_TTL_S,
-            )
+        if storage is None:
             return
-        payload = {
-            "version": 1,
-            "base_url": str(base_url).strip().rstrip("/"),
-            "token_hash": self._bhtom_token_hash(token),
-            "fetched_at_unix": datetime.now(timezone.utc).timestamp(),
-            "presets": serializable,
-        }
-        cache_path = self._bhtom_observatory_cache_path()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        cache_key = self._bhtom_storage_cache_key(token=token, base_url=base_url)
+        storage.cache.set_json(
+            "bhtom_observatory_presets",
+            cache_key,
+            serializable,
+            ttl_s=BHTOM_OBSERVATORY_CACHE_TTL_S,
+        )
 
     def _fetch_bhtom_target_page(self, page: int, token: Optional[str] = None) -> object:
         return _fetch_bhtom_target_page_payload(
@@ -23045,6 +23852,7 @@ class MainWindow(QMainWindow):
             if not self._ai_messages[idx].get("text", "").strip():
                 self._ai_messages.pop(idx)
                 self._render_ai_messages()
+                self._persist_ai_messages_to_storage()
         self._ai_stream_message_index = None
         sender = self.sender()
         if sender is self._llm_worker:
@@ -23062,6 +23870,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "ai_output_layout"):
             self._render_ai_messages()
         self._refresh_ai_panel_action_buttons()
+        self._persist_ai_messages_to_storage()
 
     def _apply_ai_chat_font(self) -> None:
         if not hasattr(self, "ai_output"):
@@ -23733,6 +24542,7 @@ class MainWindow(QMainWindow):
                 action_targets=self._extract_addable_bhtom_targets_from_ai_text(text),
             )
         self._ai_stream_message_index = None
+        self._persist_ai_messages_to_storage()
 
     def _fail_ai_response(self, message: str) -> None:
         self._ai_stream_render_timer.stop()
@@ -23748,6 +24558,7 @@ class MainWindow(QMainWindow):
         else:
             self._append_ai_message(message, is_error=True)
         self._ai_stream_message_index = None
+        self._persist_ai_messages_to_storage()
 
     def _append_ai_message(
         self,
@@ -23759,11 +24570,17 @@ class MainWindow(QMainWindow):
         action_targets: Optional[list[Target]] = None,
     ) -> int:
         kind = "user" if is_user else "error" if is_error else "ai" if is_ai else "info"
-        payload: dict[str, Any] = {"kind": kind, "text": str(text)}
+        payload: dict[str, Any] = {
+            "kind": kind,
+            "text": str(text),
+            "created_at": datetime.now(timezone.utc).timestamp(),
+        }
         if action_targets:
             payload["action_targets"] = list(action_targets)
         self._ai_messages.append(payload)
         self._render_ai_messages()
+        if not is_ai or self._llm_active_tag in {"", "warmup"}:
+            self._persist_ai_messages_to_storage()
         return len(self._ai_messages) - 1
 
     @Slot(int)
@@ -23771,6 +24588,7 @@ class MainWindow(QMainWindow):
         """Shift the selected date by the given number of days and re-plot."""
         new_date = self.date_edit.date().addDays(offset_days)
         self.date_edit.setDate(new_date)
+        self._schedule_plan_autosave()
         self._replot_timer.start()
 
     @Slot()
@@ -23792,6 +24610,7 @@ class MainWindow(QMainWindow):
         else:
             new_date = local_qdate
         self.date_edit.setDate(new_date)
+        self._schedule_plan_autosave()
         self._replot_timer.start()
 
     @Slot()
@@ -23801,6 +24620,7 @@ class MainWindow(QMainWindow):
         new_limit = float(self.limit_spin.value())
         self.table_model.limit = new_limit
         self._emit_table_data_changed()
+        self._schedule_plan_autosave()
         # Replot visibility with updated limit
         if self.last_payload is not None:
             self._update_plot(self.last_payload)
@@ -23818,24 +24638,10 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = MainWindow()
 
-    # If a plan file is specified, load targets and immediately plot
+    # If a plan file is specified, import it into the workspace and immediately plot.
     if args.plan:
         try:
-            with open(args.plan, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
-            # Populate the existing targets list so the model sees it
-            win.targets.clear()
-            win.target_metrics.clear()
-            win.target_windows.clear()
-            for entry in data:
-                win.targets.append(Target(**entry))
-            win._clear_table_dynamic_cache()
-            win.table_model.layoutChanged.emit()
-            win._apply_table_settings()
-            win._apply_default_sort()
-            win._fetch_missing_magnitudes_async()
-            # Now run the plot (also sets the site and refreshes buttons)
-            win._run_plan()
+            win._load_plan_from_json_path(args.plan, persist_workspace=True)
         except Exception as e:
             QMessageBox.critical(None, "Startup Load Error", f"Failed to load plan '{args.plan}': {e}")
 

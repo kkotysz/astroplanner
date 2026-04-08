@@ -12,6 +12,10 @@ from typing import Any, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 
+class _CacheAssetMissingError(FileNotFoundError):
+    """Raised when a cached payload references an asset that is no longer available."""
+
+
 def _utc_timestamp() -> float:
     return datetime.now(timezone.utc).timestamp()
 
@@ -43,6 +47,15 @@ def _deserialize_value(value_json: str, value_type: str) -> object:
         if value_type == "str":
             return value_json
         return None
+
+
+def _decode_json_object(value: object, default: object) -> object:
+    if isinstance(value, str) and value:
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
 
 
 def _coerce_bool(value: object) -> bool:
@@ -150,8 +163,8 @@ def _restore_cache_payload(value: object, *, assets_dir: Path) -> object:
         if isinstance(relative_path, str) and relative_path.strip():
             try:
                 return (assets_dir / relative_path).read_bytes()
-            except Exception:
-                return b""
+            except Exception as exc:
+                raise _CacheAssetMissingError(relative_path) from exc
         return {str(key): _restore_cache_payload(val, assets_dir=assets_dir) for key, val in value.items()}
     if isinstance(value, list):
         return [_restore_cache_payload(val, assets_dir=assets_dir) for val in value]
@@ -301,7 +314,11 @@ class CacheRepository:
             payload = json.loads(payload_json)
         except Exception:
             return None
-        return _restore_cache_payload(payload, assets_dir=self.storage.assets_dir)
+        try:
+            return _restore_cache_payload(payload, assets_dir=self.storage.assets_dir)
+        except _CacheAssetMissingError:
+            self.delete(namespace, cache_key)
+            return None
 
     def set_json(
         self,
@@ -328,7 +345,14 @@ class CacheRepository:
         )
         payload_json = json.dumps(prepared_payload, ensure_ascii=False)
         metadata_json = json.dumps(dict(metadata or {}), ensure_ascii=False)
+        new_asset_paths = set(self._iter_asset_paths(prepared_payload))
+        old_asset_paths: set[str] = set()
         with self.storage.connect() as conn, conn:
+            row = conn.execute(
+                "SELECT payload_json FROM cache_entries WHERE namespace = ? AND cache_key = ?",
+                (str(namespace), str(cache_key)),
+            ).fetchone()
+            old_asset_paths = self._asset_paths_from_payload_json(row["payload_json"] if row is not None else None)
             conn.execute(
                 """
                 INSERT INTO cache_entries (
@@ -359,6 +383,11 @@ class CacheRepository:
                     metadata_json,
                 ),
             )
+        for relative_path in old_asset_paths - new_asset_paths:
+            try:
+                (self.storage.assets_dir / relative_path).unlink(missing_ok=True)
+            except Exception:
+                continue
 
     def delete(self, namespace: str, cache_key: str) -> None:
         with self.storage.connect() as conn:
@@ -389,18 +418,57 @@ class CacheRepository:
             )
             return int(cur.rowcount or 0)
 
+    def delete_namespace(self, namespace: str) -> int:
+        with self.storage.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM cache_entries WHERE namespace = ?",
+                (str(namespace),),
+            ).fetchall()
+        for row in rows:
+            self._delete_assets_from_row(row["payload_json"])
+        with self.storage.connect() as conn, conn:
+            cur = conn.execute("DELETE FROM cache_entries WHERE namespace = ?", (str(namespace),))
+            return int(cur.rowcount or 0)
+
+    def prune_namespace(self, namespace: str, max_entries: int) -> int:
+        limit = max(0, int(max_entries))
+        with self.storage.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT cache_key, payload_json
+                FROM cache_entries
+                WHERE namespace = ?
+                ORDER BY fetched_at DESC, cache_key DESC
+                """,
+                (str(namespace),),
+            ).fetchall()
+        if len(rows) <= limit:
+            return 0
+        stale_rows = rows[limit:]
+        for row in stale_rows:
+            self._delete_assets_from_row(row["payload_json"])
+        with self.storage.connect() as conn, conn:
+            cur = conn.executemany(
+                "DELETE FROM cache_entries WHERE namespace = ? AND cache_key = ?",
+                [(str(namespace), str(row["cache_key"])) for row in stale_rows],
+            )
+            return int(cur.rowcount or 0)
+
     def _delete_assets_from_row(self, payload_json: object) -> None:
-        if not isinstance(payload_json, str) or not payload_json:
-            return
-        try:
-            payload = json.loads(payload_json)
-        except Exception:
-            return
-        for relative_path in self._iter_asset_paths(payload):
+        for relative_path in self._asset_paths_from_payload_json(payload_json):
             try:
                 (self.storage.assets_dir / relative_path).unlink(missing_ok=True)
             except Exception:
                 continue
+
+    def _asset_paths_from_payload_json(self, payload_json: object) -> set[str]:
+        if not isinstance(payload_json, str) or not payload_json:
+            return set()
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            return set()
+        return set(self._iter_asset_paths(payload))
 
     def _iter_asset_paths(self, payload: object) -> Iterator[str]:
         if isinstance(payload, dict):
@@ -627,6 +695,428 @@ class PlansRepository:
     def __init__(self, storage: "AppStorage") -> None:
         self.storage = storage
 
+    def load_workspace(self) -> dict[str, object] | None:
+        return self._load_one("plan_kind = 'workspace'")
+
+    def save_workspace(
+        self,
+        snapshot: Mapping[str, object] | None,
+        targets: Iterable[Mapping[str, object]],
+    ) -> dict[str, object]:
+        now = _utc_timestamp()
+        payload_json = json.dumps(dict(snapshot or {}), ensure_ascii=False)
+        existing_id = self._find_workspace_id()
+        with self.storage.connect() as conn, conn:
+            if existing_id is None:
+                plan_id = str(uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO plans (
+                        id, name, plan_kind, payload_json, created_at, updated_at, last_opened_at, deleted_at
+                    )
+                    VALUES (?, ?, 'workspace', ?, ?, ?, ?, NULL)
+                    """,
+                    (plan_id, "Workspace", payload_json, now, now, now),
+                )
+            else:
+                plan_id = existing_id
+                conn.execute(
+                    """
+                    UPDATE plans
+                    SET name = ?, payload_json = ?, updated_at = ?, last_opened_at = ?, deleted_at = NULL
+                    WHERE id = ?
+                    """,
+                    ("Workspace", payload_json, now, now, plan_id),
+                )
+            self._replace_targets(conn, plan_id, targets, now=now)
+        return self.load_plan(plan_id) or {}
+
+    def list_saved(self) -> list[dict[str, object]]:
+        with self.storage.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT plans.id, plans.name, plans.payload_json, plans.created_at,
+                       plans.updated_at, plans.last_opened_at, COUNT(plan_targets.id) AS target_count
+                FROM plans
+                LEFT JOIN plan_targets
+                    ON plan_targets.plan_id = plans.id AND plan_targets.deleted_at IS NULL
+                WHERE plans.deleted_at IS NULL AND plans.plan_kind = 'saved'
+                GROUP BY plans.id, plans.name, plans.payload_json, plans.created_at, plans.updated_at, plans.last_opened_at
+                ORDER BY plans.last_opened_at DESC, lower(plans.name), plans.created_at DESC
+                """
+            ).fetchall()
+        items: list[dict[str, object]] = []
+        for row in rows:
+            items.append(
+                {
+                    "id": str(row["id"]),
+                    "name": str(row["name"]),
+                    "snapshot": _decode_json_object(row["payload_json"], {}),
+                    "created_at": float(row["created_at"] or 0.0),
+                    "updated_at": float(row["updated_at"] or 0.0),
+                    "last_opened_at": float(row["last_opened_at"] or 0.0),
+                    "target_count": int(row["target_count"] or 0),
+                }
+            )
+        return items
+
+    def save_named(
+        self,
+        name: str,
+        snapshot: Mapping[str, object] | None,
+        targets: Iterable[Mapping[str, object]],
+        plan_id: str | None = None,
+    ) -> dict[str, object]:
+        normalized_name = str(name or "").strip() or "Saved Plan"
+        now = _utc_timestamp()
+        payload_json = json.dumps(dict(snapshot or {}), ensure_ascii=False)
+        existing_id: str | None = None
+        if plan_id:
+            with self.storage.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM plans
+                    WHERE id = ? AND deleted_at IS NULL AND plan_kind = 'saved'
+                    """,
+                    (str(plan_id),),
+                ).fetchone()
+            if row is not None:
+                existing_id = str(row["id"])
+        with self.storage.connect() as conn, conn:
+            if existing_id is None:
+                existing_id = str(uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO plans (
+                        id, name, plan_kind, payload_json, created_at, updated_at, last_opened_at, deleted_at
+                    )
+                    VALUES (?, ?, 'saved', ?, ?, ?, ?, NULL)
+                    """,
+                    (existing_id, normalized_name, payload_json, now, now, now),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE plans
+                    SET name = ?, payload_json = ?, updated_at = ?, last_opened_at = ?, deleted_at = NULL
+                    WHERE id = ?
+                    """,
+                    (normalized_name, payload_json, now, now, existing_id),
+                )
+            self._replace_targets(conn, existing_id, targets, now=now)
+        return self.load_plan(existing_id) or {}
+
+    def load_plan(self, plan_id: str) -> dict[str, object] | None:
+        return self._load_one("id = ?", (str(plan_id),), touch=True)
+
+    def delete_plan(self, plan_id: str) -> bool:
+        with self.storage.connect() as conn, conn:
+            row = conn.execute(
+                "SELECT 1 FROM plans WHERE id = ? AND deleted_at IS NULL AND plan_kind = 'saved'",
+                (str(plan_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM plans WHERE id = ?", (str(plan_id),))
+        return True
+
+    def _find_workspace_id(self) -> str | None:
+        with self.storage.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM plans
+                WHERE deleted_at IS NULL AND plan_kind = 'workspace'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["id"])
+
+    def _load_one(
+        self,
+        where_clause: str,
+        params: tuple[object, ...] = (),
+        *,
+        touch: bool = False,
+    ) -> dict[str, object] | None:
+        with self.storage.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT id, name, plan_kind, payload_json, created_at, updated_at, last_opened_at
+                FROM plans
+                WHERE deleted_at IS NULL AND {where_clause}
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            targets = self._load_targets(conn, str(row["id"]))
+        if touch:
+            now = _utc_timestamp()
+            with self.storage.connect() as conn, conn:
+                conn.execute("UPDATE plans SET last_opened_at = ? WHERE id = ?", (now, str(row["id"])))
+            last_opened_at = now
+        else:
+            last_opened_at = float(row["last_opened_at"] or 0.0)
+        return {
+            "id": str(row["id"]),
+            "name": str(row["name"]),
+            "plan_kind": str(row["plan_kind"]),
+            "snapshot": _decode_json_object(row["payload_json"], {}),
+            "targets": targets,
+            "created_at": float(row["created_at"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+            "last_opened_at": last_opened_at,
+        }
+
+    def _load_targets(self, conn: sqlite3.Connection, plan_id: str) -> list[dict[str, object]]:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM plan_targets
+            WHERE plan_id = ? AND deleted_at IS NULL
+            ORDER BY sort_order ASC, created_at ASC
+            """,
+            (str(plan_id),),
+        ).fetchall()
+        targets: list[dict[str, object]] = []
+        for row in rows:
+            payload = _decode_json_object(row["payload_json"], {})
+            if isinstance(payload, dict):
+                targets.append(payload)
+        return targets
+
+    def _replace_targets(
+        self,
+        conn: sqlite3.Connection,
+        plan_id: str,
+        targets: Iterable[Mapping[str, object]],
+        *,
+        now: float,
+    ) -> None:
+        conn.execute("DELETE FROM plan_targets WHERE plan_id = ?", (str(plan_id),))
+        for sort_order, target in enumerate(list(targets)):
+            payload = dict(target)
+            target_name = str(payload.get("name") or "").strip()
+            target_key = self._target_key(payload, fallback=target_name or str(sort_order))
+            conn.execute(
+                """
+                INSERT INTO plan_targets (
+                    id, plan_id, target_key, sort_order, payload_json, created_at, updated_at, deleted_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    str(uuid4()),
+                    str(plan_id),
+                    target_key,
+                    int(sort_order),
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+
+    @staticmethod
+    def _target_key(payload: Mapping[str, object], *, fallback: str) -> str:
+        source_catalog = str(payload.get("source_catalog") or "").strip().lower()
+        source_object_id = str(payload.get("source_object_id") or "").strip().lower()
+        if source_catalog and source_object_id:
+            return f"{source_catalog}:{source_object_id}"
+        name = str(payload.get("name") or "").strip().lower()
+        ra = payload.get("ra")
+        dec = payload.get("dec")
+        if name:
+            return name
+        return f"{fallback}:{ra}:{dec}"
+
+
+class ObservationLogRepository:
+    def __init__(self, storage: "AppStorage") -> None:
+        self.storage = storage
+
+    def append(
+        self,
+        *,
+        target_name: str,
+        target_key: str,
+        target_payload: Mapping[str, object],
+        site_name: str,
+        site_payload: Mapping[str, object],
+        notes: str = "",
+        source: str = "",
+        plan_id: str | None = None,
+        observed_at: float | None = None,
+    ) -> str:
+        entry_id = str(uuid4())
+        stamp = float(observed_at or _utc_timestamp())
+        with self.storage.connect() as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO observation_log (
+                    id, observed_at, target_name, target_key, target_payload_json,
+                    site_name, site_payload_json, notes, source, plan_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry_id,
+                    stamp,
+                    str(target_name).strip(),
+                    str(target_key).strip(),
+                    json.dumps(dict(target_payload), ensure_ascii=False),
+                    str(site_name).strip(),
+                    json.dumps(dict(site_payload), ensure_ascii=False),
+                    str(notes or ""),
+                    str(source or ""),
+                    str(plan_id or "") or None,
+                ),
+            )
+        return entry_id
+
+    def list_entries(self, *, search: str = "", limit: int | None = None) -> list[dict[str, object]]:
+        clauses = ["1 = 1"]
+        params: list[object] = []
+        search_text = str(search or "").strip().lower()
+        if search_text:
+            clauses.append("(lower(target_name) LIKE ? OR lower(site_name) LIKE ?)")
+            pattern = f"%{search_text}%"
+            params.extend([pattern, pattern])
+        sql = f"""
+            SELECT id, observed_at, target_name, target_key, target_payload_json,
+                   site_name, site_payload_json, notes, source, plan_id
+            FROM observation_log
+            WHERE {' AND '.join(clauses)}
+            ORDER BY observed_at DESC, target_name ASC
+        """
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self.storage.connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        entries: list[dict[str, object]] = []
+        for row in rows:
+            entries.append(
+                {
+                    "id": str(row["id"]),
+                    "observed_at": float(row["observed_at"] or 0.0),
+                    "target_name": str(row["target_name"]),
+                    "target_key": str(row["target_key"]),
+                    "target_payload": _decode_json_object(row["target_payload_json"], {}),
+                    "site_name": str(row["site_name"]),
+                    "site_payload": _decode_json_object(row["site_payload_json"], {}),
+                    "notes": str(row["notes"] or ""),
+                    "source": str(row["source"] or ""),
+                    "plan_id": str(row["plan_id"] or ""),
+                }
+            )
+        return entries
+
+
+class ChatHistoryRepository:
+    def __init__(self, storage: "AppStorage") -> None:
+        self.storage = storage
+
+    def list_messages(self, plan_id: str) -> list[dict[str, object]]:
+        with self.storage.connect() as conn:
+            thread = conn.execute(
+                "SELECT id, plan_id FROM chat_threads WHERE plan_id = ?",
+                (str(plan_id),),
+            ).fetchone()
+            if thread is None:
+                return []
+            rows = conn.execute(
+                """
+                SELECT id, kind, text, sort_order, payload_json, created_at
+                FROM chat_messages
+                WHERE thread_id = ?
+                ORDER BY sort_order ASC, created_at ASC
+                """,
+                (str(thread["id"]),),
+            ).fetchall()
+        messages: list[dict[str, object]] = []
+        for row in rows:
+            message = {
+                "id": str(row["id"]),
+                "plan_id": str(thread["plan_id"]),
+                "kind": str(row["kind"] or "info"),
+                "text": str(row["text"] or ""),
+                "sort_order": int(row["sort_order"] or 0),
+                "created_at": float(row["created_at"] or 0.0),
+            }
+            payload = _decode_json_object(row["payload_json"], {})
+            if isinstance(payload, dict):
+                message.update(payload)
+            messages.append(message)
+        return messages
+
+    def replace_messages(self, plan_id: str, messages: Iterable[Mapping[str, object]]) -> None:
+        thread_id = self._ensure_thread(plan_id)
+        now = _utc_timestamp()
+        with self.storage.connect() as conn, conn:
+            conn.execute(
+                "UPDATE chat_threads SET updated_at = ? WHERE id = ?",
+                (now, thread_id),
+            )
+            conn.execute("DELETE FROM chat_messages WHERE thread_id = ?", (thread_id,))
+            for sort_order, message in enumerate(list(messages)):
+                payload = dict(message)
+                kind = str(payload.pop("kind", "info") or "info")
+                text = str(payload.pop("text", "") or "")
+                created_at = float(payload.pop("created_at", now) or now)
+                conn.execute(
+                    """
+                    INSERT INTO chat_messages (
+                        id, thread_id, kind, text, sort_order, payload_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        thread_id,
+                        kind,
+                        text,
+                        int(sort_order),
+                        json.dumps(payload, ensure_ascii=False),
+                        created_at,
+                    ),
+                )
+
+    def clear(self, plan_id: str) -> None:
+        with self.storage.connect() as conn, conn:
+            row = conn.execute(
+                "SELECT id FROM chat_threads WHERE plan_id = ?",
+                (str(plan_id),),
+            ).fetchone()
+            if row is None:
+                return
+            conn.execute("DELETE FROM chat_messages WHERE thread_id = ?", (str(row["id"]),))
+            conn.execute("UPDATE chat_threads SET updated_at = ? WHERE id = ?", (_utc_timestamp(), str(row["id"])))
+
+    def _ensure_thread(self, plan_id: str) -> str:
+        with self.storage.connect() as conn, conn:
+            row = conn.execute(
+                "SELECT id FROM chat_threads WHERE plan_id = ?",
+                (str(plan_id),),
+            ).fetchone()
+            if row is not None:
+                return str(row["id"])
+            thread_id = str(uuid4())
+            now = _utc_timestamp()
+            conn.execute(
+                """
+                INSERT INTO chat_threads (id, plan_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (thread_id, str(plan_id), now, now),
+            )
+            return thread_id
+
 
 class AppStorage:
     _MIGRATIONS: list[tuple[int, str, str]] = [
@@ -724,6 +1214,69 @@ class AppStorage:
             );
             """,
         ),
+        (
+            2,
+            "plans-chat-observation-upgrade",
+            """
+            ALTER TABLE plans ADD COLUMN plan_kind TEXT NOT NULL DEFAULT 'saved';
+            ALTER TABLE plans ADD COLUMN last_opened_at REAL NOT NULL DEFAULT 0;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_workspace_unique
+            ON plans (plan_kind)
+            WHERE deleted_at IS NULL AND plan_kind = 'workspace';
+
+            CREATE INDEX IF NOT EXISTS idx_plans_kind_updated
+            ON plans (plan_kind, deleted_at, last_opened_at, updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_plan_targets_plan_sort
+            ON plan_targets (plan_id, deleted_at, sort_order);
+
+            CREATE INDEX IF NOT EXISTS idx_cache_entries_namespace_fetched_at
+            ON cache_entries (namespace, fetched_at);
+
+            CREATE TABLE IF NOT EXISTS observation_log (
+                id TEXT PRIMARY KEY,
+                observed_at REAL NOT NULL,
+                target_name TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                target_payload_json TEXT NOT NULL DEFAULT '{}',
+                site_name TEXT NOT NULL DEFAULT '',
+                site_payload_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                plan_id TEXT REFERENCES plans(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_observation_log_observed_at
+            ON observation_log (observed_at DESC, target_name);
+
+            CREATE INDEX IF NOT EXISTS idx_observation_log_target_key
+            ON observation_log (target_key, observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS chat_threads (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL UNIQUE REFERENCES plans(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_threads_plan
+            ON chat_threads (plan_id);
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL DEFAULT 'info',
+                text TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_sort
+            ON chat_messages (thread_id, sort_order, created_at);
+            """,
+        ),
     ]
 
     def __init__(self, base_dir: Path, *, db_name: str = "app.db") -> None:
@@ -736,6 +1289,8 @@ class AppStorage:
         self.observatories = ObservatoriesRepository(self)
         self.session_templates = SessionTemplatesRepository(self)
         self.plans = PlansRepository(self)
+        self.observation_log = ObservationLogRepository(self)
+        self.chat_history = ChatHistoryRepository(self)
         self._initialize()
 
     def _initialize(self) -> None:
