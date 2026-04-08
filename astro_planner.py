@@ -1324,6 +1324,7 @@ from PySide6.QtCore import (
     QCoreApplication,
     QItemSelectionModel,
     QSettings,
+    QStandardPaths,
     QUrl,
     QUrlQuery,
 )
@@ -1406,6 +1407,84 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 _HAS_MPL_CANVAS = True
+
+APP_SETTINGS_ORG = "YourCompany"
+APP_SETTINGS_APP = "AstroPlanner"
+APP_SETTINGS_ENV_KEY = "ASTROPLANNER_CONFIG_DIR"
+APP_SETTINGS_FILE_NAME = "settings.ini"
+
+
+def _resolve_settings_dir() -> Path:
+    """Return a stable writable directory for app settings."""
+    try:
+        QCoreApplication.setOrganizationName(APP_SETTINGS_ORG)
+        QCoreApplication.setApplicationName(APP_SETTINGS_APP)
+    except Exception:
+        pass
+
+    env_override = str(os.getenv(APP_SETTINGS_ENV_KEY, "") or "").strip()
+    if env_override:
+        return Path(env_override).expanduser()
+    app_cfg = str(QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation) or "").strip()
+    if app_cfg:
+        app_cfg_path = Path(app_cfg)
+        tail = [part.lower() for part in app_cfg_path.parts[-3:]]
+        if APP_SETTINGS_APP.lower() not in tail:
+            return app_cfg_path / APP_SETTINGS_ORG / APP_SETTINGS_APP
+        return app_cfg_path
+    xdg_cfg = str(os.getenv("XDG_CONFIG_HOME", "") or "").strip()
+    if xdg_cfg:
+        return Path(xdg_cfg).expanduser() / APP_SETTINGS_APP
+    return Path.home() / ".config" / APP_SETTINGS_APP
+
+
+def _copy_settings_if_missing(src: QSettings, dst: QSettings) -> int:
+    copied = 0
+    for key in src.allKeys():
+        if dst.contains(key):
+            continue
+        dst.setValue(key, src.value(key))
+        copied += 1
+    return copied
+
+
+def _sync_settings(settings: QSettings) -> None:
+    try:
+        settings.sync()
+        status = settings.status()
+        if status != QSettings.Status.NoError:
+            logger.warning("QSettings sync status=%s file=%s", int(status), settings.fileName())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("QSettings sync failed: %s", exc)
+
+
+def _create_app_settings() -> QSettings:
+    """Create QSettings backed by a deterministic INI file (cross-platform friendly)."""
+    settings_dir = _resolve_settings_dir()
+    try:
+        settings_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    ini_path = settings_dir / APP_SETTINGS_FILE_NAME
+    settings = QSettings(str(ini_path), QSettings.IniFormat)
+
+    # One-time best-effort migration from legacy native backend keys.
+    try:
+        if not settings.allKeys():
+            legacy = QSettings(APP_SETTINGS_ORG, APP_SETTINGS_APP)
+            same_store = False
+            try:
+                same_store = bool(legacy.fileName()) and (legacy.fileName() == settings.fileName())
+            except Exception:
+                same_store = False
+            if not same_store:
+                copied = _copy_settings_if_missing(legacy, settings)
+                if copied > 0:
+                    settings.setValue("__meta/legacyMigrated", True)
+                    _sync_settings(settings)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Settings migration skipped: %s", exc)
+    return settings
 
 
 def _configure_tab_widget(tab_widget: QTabWidget, *, document_mode: bool = True) -> QTabWidget:
@@ -3018,6 +3097,7 @@ class TableSettingsDialog(QDialog):
             s.setValue(f"table/color/{key}", self.selected_colors.get(key))
         # Save default sort column
         s.setValue("table/defaultSortColumn", self.sort_combo.currentIndex())
+        _sync_settings(s)
         self.parent()._apply_table_settings()
 
     def accept(self):
@@ -3836,6 +3916,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("weather/localConditionsLinks", self.weather_local_links_edit.toPlainText().strip())
         s.setValue("weather/cloudMapSource", str(self.weather_cloud_source_combo.currentData() or "earthenv"))
         s.setValue("weather/cloudMapMonthMode", str(self.weather_month_mode_combo.currentData() or "session_month"))
+        _sync_settings(s)
         self.parent()._apply_general_settings()
         if rerun_plan:
             self.parent()._run_plan()
@@ -10994,7 +11075,7 @@ class SuggestedTargetsDialog(QDialog):
         self._settings = (
             parent.settings
             if parent is not None and hasattr(parent, "settings")
-            else QSettings("YourCompany", "AstroPlanner")
+            else _create_app_settings()
         )
         self._filter_defaults = {
             "importance": float(BHTOM_SUGGESTION_MIN_IMPORTANCE),
@@ -15954,7 +16035,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1180, 720)
 
         # Persistent user settings
-        self.settings = QSettings("YourCompany", "AstroPlanner")
+        self.settings = _create_app_settings()
+        logger.info("Using settings file: %s", self.settings.fileName())
         self._migrate_table_settings_schema()
         self._dark_enabled = self.settings.value("general/darkMode", DEFAULT_DARK_MODE, type=bool)
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
@@ -16248,9 +16330,10 @@ class MainWindow(QMainWindow):
         self.polar_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.polar_canvas.setMinimumWidth(250)
         self.polar_canvas.setMinimumHeight(220)
-        self.polar_canvas.setMaximumWidth(340)
-        # Keep enough edge room so N/S labels are not clipped.
-        self.polar_canvas.figure.subplots_adjust(left=0.06, right=0.94, bottom=0.12, top=0.90)
+        self.polar_canvas.setMaximumWidth(16777215)
+        # Keep enough edge room so cardinal labels are not clipped, but let the
+        # polar plot fill more of the available canvas area on large screens.
+        self.polar_canvas.figure.subplots_adjust(left=0.03, right=0.97, bottom=0.06, top=0.97)
         self._radar_target_coords = np.empty((0, 2), dtype=float)
         self._radar_echo_strengths = np.zeros(0, dtype=float)
         self._radar_sweep_timer = QTimer(self)
@@ -17096,6 +17179,10 @@ class MainWindow(QMainWindow):
             self._cleanup_threads()
         except Exception as exc:
             logger.exception("Error during thread cleanup: %s", exc)
+        try:
+            _sync_settings(self.settings)
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # --------------------------------------------------
