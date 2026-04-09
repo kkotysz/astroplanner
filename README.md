@@ -293,6 +293,15 @@ The AI panel supports a local OpenAI-compatible endpoint. The default setup uses
 
 Optional: the repo also provides a Docker Compose `ollama` profile for Linux / CPU tests. On macOS, Ollama's own guidance is to run the standalone app outside Docker.
 
+Recommended app settings by backend:
+
+- Ollama:
+  - `LLM server URL`: `http://localhost:11434`
+  - `LLM model`: `gemma4:e4b`
+- Docker Model Runner:
+  - `LLM server URL`: `http://localhost:12434/engines`
+  - `LLM model`: `docker.io/ai/gemma4:E4B`
+
 Prepare the local LLM:
 
 ```bash

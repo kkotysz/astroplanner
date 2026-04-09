@@ -57,7 +57,7 @@ import re
 import sys
 import threading
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -3704,6 +3704,16 @@ class GeneralSettingsDialog(QDialog):
                 ),
             )
         )
+        self.llm_enable_thinking_chk = QCheckBox("Enable model thinking / reasoning", self)
+        self.llm_enable_thinking_chk.setChecked(
+            parent.settings.value("llm/enableThinking", LLMConfig.DEFAULT_ENABLE_THINKING, type=bool)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_ENABLE_THINKING
+        )
+        self.llm_enable_thinking_chk.setToolTip(
+            "When enabled, the model may spend tokens on internal reasoning. "
+            "This can improve some answers but usually makes responses slower and longer."
+        )
         self.llm_chat_font_spin = QSpinBox(self)
         self.llm_chat_font_spin.setRange(9, 24)
         self.llm_chat_font_spin.setSingleStep(1)
@@ -3775,8 +3785,17 @@ class GeneralSettingsDialog(QDialog):
         ai_layout.addRow(llm_hdr)
         ai_layout.addRow("LLM server URL:", self.llm_url_edit)
         ai_layout.addRow("LLM model:", self.llm_model_edit)
+        llm_endpoint_hint = QLabel(
+            "Ollama: URL http://localhost:11434, model gemma4:e4b\n"
+            "Docker Model Runner: URL http://localhost:12434/engines, model docker.io/ai/gemma4:E4B",
+            self,
+        )
+        llm_endpoint_hint.setObjectName("SectionHint")
+        llm_endpoint_hint.setWordWrap(True)
+        ai_layout.addRow("", llm_endpoint_hint)
         ai_layout.addRow("LLM timeout:", self.llm_timeout_spin)
         ai_layout.addRow("LLM max tokens:", self.llm_max_tokens_spin)
+        ai_layout.addRow("", self.llm_enable_thinking_chk)
         ai_layout.addRow("AI chat font size:", self.llm_chat_font_spin)
         ai_layout.addRow("Chat spacing:", self.llm_chat_spacing_combo)
         ai_layout.addRow("Bubble tint strength:", self.llm_chat_tint_combo)
@@ -4141,6 +4160,7 @@ class GeneralSettingsDialog(QDialog):
         llm_model = self.llm_model_edit.text().strip() or LLMConfig.DEFAULT_MODEL
         llm_timeout = max(15, int(self.llm_timeout_spin.value()))
         llm_max_tokens = max(32, int(self.llm_max_tokens_spin.value()))
+        llm_enable_thinking = bool(self.llm_enable_thinking_chk.isChecked())
         llm_chat_font_pt = max(9, int(self.llm_chat_font_spin.value()))
         llm_chat_spacing = str(self.llm_chat_spacing_combo.currentData() or LLMConfig.DEFAULT_CHAT_SPACING)
         llm_chat_tint = str(self.llm_chat_tint_combo.currentData() or LLMConfig.DEFAULT_CHAT_TINT_STRENGTH)
@@ -4150,6 +4170,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("llm/model", llm_model)
         s.setValue("llm/timeoutSec", llm_timeout)
         s.setValue("llm/maxTokens", llm_max_tokens)
+        s.setValue("llm/enableThinking", llm_enable_thinking)
         s.setValue("llm/chatFontSizePt", llm_chat_font_pt)
         s.setValue("llm/chatSpacing", llm_chat_spacing)
         s.setValue("llm/chatTintStrength", llm_chat_tint)
@@ -12029,6 +12050,7 @@ class LLMConfig:
     DEFAULT_MAX_TOKENS = 192
     DEFAULT_WARMUP_MAX_TOKENS = 8
     DEFAULT_TEMPERATURE = 0.2
+    DEFAULT_ENABLE_THINKING = False
     DEFAULT_CHAT_FONT_PT = 12
     DEFAULT_CHAT_SPACING = "comfortable"
     DEFAULT_CHAT_TINT_STRENGTH = "medium"
@@ -12041,6 +12063,7 @@ class LLMConfig:
         model: str = DEFAULT_MODEL,
         timeout_s: int = DEFAULT_TIMEOUT_S,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        enable_thinking: bool = DEFAULT_ENABLE_THINKING,
     ) -> None:
         normalized_url = str(url or self.DEFAULT_URL).strip().rstrip("/")
         normalized_model = str(model or self.DEFAULT_MODEL).strip()
@@ -12048,6 +12071,7 @@ class LLMConfig:
         self.model = normalized_model or self.DEFAULT_MODEL
         self.timeout_s = max(5, int(timeout_s))
         self.max_tokens = max(32, int(max_tokens))
+        self.enable_thinking = bool(enable_thinking)
 
 
 AI_CHAT_SPACING_CHOICES = [
@@ -12229,12 +12253,34 @@ class LLMWorker(QThread):
             max_tokens = int(self.config.DEFAULT_WARMUP_MAX_TOKENS)
         else:
             max_tokens = int(self.config.max_tokens)
-        return {
+        params: dict[str, object] = {
             "max_tokens": max_tokens,
             "temperature": float(self.config.DEFAULT_TEMPERATURE),
-            "reasoning_effort": "none",
             "stream": True,
         }
+        if self._should_manage_gemma4_thinking_via_template():
+            params["chat_template_kwargs"] = {"enable_thinking": bool(self.config.enable_thinking)}
+        elif not self.config.enable_thinking:
+            params["reasoning_effort"] = "none"
+        return params
+
+    def _is_docker_model_runner_backend(self) -> bool:
+        try:
+            parsed = urlparse(self.config.url)
+        except Exception:
+            return False
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+        path = (parsed.path or "").strip().lower()
+        return (
+            port == 12434
+            or "/engines" in path
+            or host == "model-runner.docker.internal"
+        )
+
+    def _should_manage_gemma4_thinking_via_template(self) -> bool:
+        model_name = str(self.config.model or "").strip().lower()
+        return self._is_docker_model_runner_backend() and "gemma4" in model_name
 
     def run(self) -> None:  # noqa: D401
         if self.isInterruptionRequested():
@@ -16816,6 +16862,7 @@ class MainWindow(QMainWindow):
             model=self.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str),
             timeout_s=self.settings.value("llm/timeoutSec", LLMConfig.DEFAULT_TIMEOUT_S, type=int),
             max_tokens=self.settings.value("llm/maxTokens", LLMConfig.DEFAULT_MAX_TOKENS, type=int),
+            enable_thinking=self.settings.value("llm/enableThinking", LLMConfig.DEFAULT_ENABLE_THINKING, type=bool),
         )
         self._llm_chat_font_size_pt = max(
             9,
@@ -18432,6 +18479,9 @@ class MainWindow(QMainWindow):
         self.llm_config.max_tokens = max(
             32,
             int(self.settings.value("llm/maxTokens", LLMConfig.DEFAULT_MAX_TOKENS, type=int)),
+        )
+        self.llm_config.enable_thinking = bool(
+            self.settings.value("llm/enableThinking", LLMConfig.DEFAULT_ENABLE_THINKING, type=bool)
         )
         self._llm_chat_font_size_pt = max(
             9,

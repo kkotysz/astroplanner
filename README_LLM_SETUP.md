@@ -12,6 +12,11 @@ Default endpoint and model used by AstroPlanner:
 - `LLM server URL`: `http://localhost:11434`
 - `LLM model`: `gemma4:e4b`
 
+Alternative Docker Model Runner settings:
+
+- `LLM server URL`: `http://localhost:12434/engines`
+- `LLM model`: `docker.io/ai/gemma4:E4B`
+
 ## 1. Install Ollama
 
 Install Ollama on the host machine:
@@ -93,6 +98,14 @@ In AstroPlanner:
 3. set `LLM model` to `gemma4:e4b`,
 4. open `AI Assistant` and test.
 
+If you use Docker Model Runner instead of Ollama:
+
+1. open `Settings -> General Settings`,
+2. set `LLM server URL` to `http://localhost:12434/engines`,
+3. set `LLM model` to `docker.io/ai/gemma4:E4B`,
+4. keep `Enable model thinking / reasoning` off unless you explicitly want longer reasoning traces,
+5. open `AI Assistant` and test.
+
 ## 5. Optional larger Gemma 4 variants
 
 If your machine has more RAM/VRAM, you can use larger models by pulling them in Ollama and changing only the model name in AstroPlanner settings.
@@ -151,6 +164,7 @@ Important:
 - the Docker profile uses the same API endpoint: `http://localhost:11434`
 - host Ollama and Dockerized Ollama should not be run on the same port at the same time
 - on macOS, Ollama's official guidance is to use the standalone app outside Docker rather than Docker Desktop
+- Docker Model Runner is a separate backend from Ollama; for its OpenAI-compatible API use `http://localhost:12434/engines`
 
 ## Troubleshooting
 
