@@ -3714,6 +3714,16 @@ class GeneralSettingsDialog(QDialog):
             "When enabled, the model may spend tokens on internal reasoning. "
             "This can improve some answers but usually makes responses slower and longer."
         )
+        self.llm_enable_chat_memory_chk = QCheckBox("Enable short chat memory (last 1-2 turns)", self)
+        self.llm_enable_chat_memory_chk.setChecked(
+            parent.settings.value("llm/enableChatMemory", LLMConfig.DEFAULT_ENABLE_CHAT_MEMORY, type=bool)
+            if parent and hasattr(parent, "settings")
+            else LLMConfig.DEFAULT_ENABLE_CHAT_MEMORY
+        )
+        self.llm_enable_chat_memory_chk.setToolTip(
+            "When enabled, the AI may reuse the last 1-2 user/LLM turns for follow-up questions. "
+            "This helps short follow-ups, but requests can become slower."
+        )
         self.llm_chat_font_spin = QSpinBox(self)
         self.llm_chat_font_spin.setRange(9, 24)
         self.llm_chat_font_spin.setSingleStep(1)
@@ -3796,6 +3806,7 @@ class GeneralSettingsDialog(QDialog):
         ai_layout.addRow("LLM timeout:", self.llm_timeout_spin)
         ai_layout.addRow("LLM max tokens:", self.llm_max_tokens_spin)
         ai_layout.addRow("", self.llm_enable_thinking_chk)
+        ai_layout.addRow("", self.llm_enable_chat_memory_chk)
         ai_layout.addRow("AI chat font size:", self.llm_chat_font_spin)
         ai_layout.addRow("Chat spacing:", self.llm_chat_spacing_combo)
         ai_layout.addRow("Bubble tint strength:", self.llm_chat_tint_combo)
@@ -4161,6 +4172,7 @@ class GeneralSettingsDialog(QDialog):
         llm_timeout = max(15, int(self.llm_timeout_spin.value()))
         llm_max_tokens = max(32, int(self.llm_max_tokens_spin.value()))
         llm_enable_thinking = bool(self.llm_enable_thinking_chk.isChecked())
+        llm_enable_chat_memory = bool(self.llm_enable_chat_memory_chk.isChecked())
         llm_chat_font_pt = max(9, int(self.llm_chat_font_spin.value()))
         llm_chat_spacing = str(self.llm_chat_spacing_combo.currentData() or LLMConfig.DEFAULT_CHAT_SPACING)
         llm_chat_tint = str(self.llm_chat_tint_combo.currentData() or LLMConfig.DEFAULT_CHAT_TINT_STRENGTH)
@@ -4171,6 +4183,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("llm/timeoutSec", llm_timeout)
         s.setValue("llm/maxTokens", llm_max_tokens)
         s.setValue("llm/enableThinking", llm_enable_thinking)
+        s.setValue("llm/enableChatMemory", llm_enable_chat_memory)
         s.setValue("llm/chatFontSizePt", llm_chat_font_pt)
         s.setValue("llm/chatSpacing", llm_chat_spacing)
         s.setValue("llm/chatTintStrength", llm_chat_tint)
@@ -12051,6 +12064,7 @@ class LLMConfig:
     DEFAULT_WARMUP_MAX_TOKENS = 8
     DEFAULT_TEMPERATURE = 0.2
     DEFAULT_ENABLE_THINKING = False
+    DEFAULT_ENABLE_CHAT_MEMORY = False
     DEFAULT_CHAT_FONT_PT = 12
     DEFAULT_CHAT_SPACING = "comfortable"
     DEFAULT_CHAT_TINT_STRENGTH = "medium"
@@ -12064,6 +12078,7 @@ class LLMConfig:
         timeout_s: int = DEFAULT_TIMEOUT_S,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         enable_thinking: bool = DEFAULT_ENABLE_THINKING,
+        enable_chat_memory: bool = DEFAULT_ENABLE_CHAT_MEMORY,
     ) -> None:
         normalized_url = str(url or self.DEFAULT_URL).strip().rstrip("/")
         normalized_model = str(model or self.DEFAULT_MODEL).strip()
@@ -12072,6 +12087,7 @@ class LLMConfig:
         self.timeout_s = max(5, int(timeout_s))
         self.max_tokens = max(32, int(max_tokens))
         self.enable_thinking = bool(enable_thinking)
+        self.enable_chat_memory = bool(enable_chat_memory)
 
 
 AI_CHAT_SPACING_CHOICES = [
@@ -16863,6 +16879,11 @@ class MainWindow(QMainWindow):
             timeout_s=self.settings.value("llm/timeoutSec", LLMConfig.DEFAULT_TIMEOUT_S, type=int),
             max_tokens=self.settings.value("llm/maxTokens", LLMConfig.DEFAULT_MAX_TOKENS, type=int),
             enable_thinking=self.settings.value("llm/enableThinking", LLMConfig.DEFAULT_ENABLE_THINKING, type=bool),
+            enable_chat_memory=self.settings.value(
+                "llm/enableChatMemory",
+                LLMConfig.DEFAULT_ENABLE_CHAT_MEMORY,
+                type=bool,
+            ),
         )
         self._llm_chat_font_size_pt = max(
             9,
@@ -18483,6 +18504,9 @@ class MainWindow(QMainWindow):
         self.llm_config.enable_thinking = bool(
             self.settings.value("llm/enableThinking", LLMConfig.DEFAULT_ENABLE_THINKING, type=bool)
         )
+        self.llm_config.enable_chat_memory = bool(
+            self.settings.value("llm/enableChatMemory", LLMConfig.DEFAULT_ENABLE_CHAT_MEMORY, type=bool)
+        )
         self._llm_chat_font_size_pt = max(
             9,
             int(self.settings.value("llm/chatFontSizePt", LLMConfig.DEFAULT_CHAT_FONT_PT, type=int)),
@@ -18522,6 +18546,7 @@ class MainWindow(QMainWindow):
             )
         )
         self._refresh_ai_warm_indicator()
+        self._refresh_ai_context_hint()
         self._apply_ai_chat_font()
         self._render_ai_messages()
 
@@ -18573,6 +18598,44 @@ class MainWindow(QMainWindow):
     @Slot()
     def _open_ai_settings(self) -> None:
         self.open_general_settings(initial_tab="AI")
+
+    def _refresh_ai_context_hint(self) -> None:
+        memory_enabled = bool(getattr(self.llm_config, "enable_chat_memory", False))
+        if memory_enabled:
+            hint_text = (
+                "Short chat memory enabled.\n"
+                "Last 1-2 turns may be reused."
+            )
+            hint_tooltip = (
+                "Examples: 'Którą z tych SN najlepiej dziś obserwować?' or "
+                "'How should I observe 8C0716_714 tonight?'\n\n"
+                "Short chat memory can help follow-up questions, but requests may be slower."
+            )
+            input_tooltip = (
+                "The AI chat is saved per active plan/workspace. "
+                "Prompts may reuse the last 1-2 user/LLM turns for follow-up questions. "
+                "Use complete questions when the context could be ambiguous."
+            )
+        else:
+            hint_text = (
+                "No chat memory.\n"
+                "Ask complete questions with the object or class name."
+            )
+            hint_tooltip = (
+                "Examples: 'Którą SN z BHTOM najlepiej dziś obserwować?' or "
+                "'How should I observe 8C0716_714 tonight?'"
+            )
+            input_tooltip = (
+                "The AI chat is saved per active plan/workspace. "
+                "Prompts do not reuse previous turns, so use complete questions with the object or class name, "
+                "e.g. 'Która SN z BHTOM jest dziś najlepsza?'"
+            )
+
+        if hasattr(self, "ai_context_hint"):
+            self.ai_context_hint.setText(hint_text)
+            self.ai_context_hint.setToolTip(hint_tooltip)
+        if hasattr(self, "ai_input"):
+            self.ai_input.setToolTip(input_tooltip)
 
     @Slot()
     def _focus_ai_input(self) -> None:
@@ -21981,16 +22044,9 @@ class MainWindow(QMainWindow):
         _set_button_icon_kind(self.ai_settings_btn, "edit")
         btn_col.addWidget(self.ai_settings_btn)
 
-        self.ai_context_hint = QLabel(
-            "No chat memory.\nAsk complete questions with the object or class name.",
-            panel,
-        )
+        self.ai_context_hint = QLabel("", panel)
         self.ai_context_hint.setObjectName("SectionHint")
         self.ai_context_hint.setWordWrap(True)
-        self.ai_context_hint.setToolTip(
-            "Examples: 'Którą SN z BHTOM najlepiej dziś obserwować?' or "
-            "'How should I observe 8C0716_714 tonight?'"
-        )
         btn_col.addWidget(self.ai_context_hint)
 
         warmup_btn = QPushButton("Warm Up LLM", panel)
@@ -22075,10 +22131,6 @@ class MainWindow(QMainWindow):
 
         self.ai_input = QLineEdit(center_widget)
         self.ai_input.setPlaceholderText("Ask about tonight or the selected object...")
-        self.ai_input.setToolTip(
-            "The AI chat is saved per active plan/workspace. "
-            "Use complete questions with the object or class name, e.g. 'Która SN z BHTOM jest dziś najlepsza?'"
-        )
         self.ai_input.returnPressed.connect(self._send_ai_query)
         composer_row.addWidget(self.ai_input, 1)
 
@@ -22093,6 +22145,7 @@ class MainWindow(QMainWindow):
         composer_row.addWidget(send_btn)
         center_col.addLayout(composer_row)
         layout.addWidget(center_widget, 1)
+        self._refresh_ai_context_hint()
         self._refresh_ai_panel_action_buttons()
         self._refresh_ai_warm_indicator()
 
@@ -22129,6 +22182,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_ai_messages", None):
             self._render_ai_messages()
         self._refresh_ai_panel_action_buttons()
+        self._refresh_ai_context_hint()
         self._refresh_ai_warm_indicator()
         return ai_window
 
@@ -24437,25 +24491,69 @@ class MainWindow(QMainWindow):
             return
 
         context = self._build_session_context(user_question=text)
-        prompt = f"Current session context:\n{context}\n\nUser question: {text}"
+        recent_memory = self._build_recent_chat_memory_block()
+        prompt_sections = []
+        if recent_memory:
+            prompt_sections.append(recent_memory)
+        prompt_sections.append(f"Current session context:\n{context}\n\nUser question: {text}")
+        prompt = "\n\n".join(prompt_sections)
         self._dispatch_llm(prompt, tag="chat", label=text)
 
     def _build_selected_target_llm_prompt(self, target: Target, question: str) -> str:
         compact_description = self._build_fast_target_llm_context(target)
-        return (
+        recent_memory = self._build_recent_chat_memory_block()
+        prompt_sections: list[str] = []
+        if recent_memory:
+            prompt_sections.append(recent_memory)
+        prompt_sections.append(
             f"Selected object context:\n"
             f"{compact_description}\n\n"
             f"User question about the selected object: {question}\n\n"
             "Answer in no more than 4 short sentences and stay grounded in the selected object context. "
             "Treat the provided Type and Class family fields as authoritative for classification questions."
         )
+        return "\n\n".join(prompt_sections)
 
     def _build_fast_general_llm_prompt(self, question: str) -> str:
-        return (
+        recent_memory = self._build_recent_chat_memory_block()
+        prompt_sections: list[str] = []
+        if recent_memory:
+            prompt_sections.append(recent_memory)
+        prompt_sections.append(
             f"User question: {question}\n\n"
             "Answer concisely in no more than 4 short sentences. "
             "Do not assume details about any selected object unless the question explicitly asks about it."
         )
+        return "\n\n".join(prompt_sections)
+
+    @staticmethod
+    def _truncate_ai_memory_text(text: str, *, max_chars: int = 280) -> str:
+        normalized = " ".join(str(text or "").split())
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max_chars - 3].rstrip() + "..."
+
+    def _build_recent_chat_memory_block(self, *, max_messages: int = 4) -> str:
+        if not bool(getattr(self.llm_config, "enable_chat_memory", False)):
+            return ""
+
+        recent_sections: list[str] = []
+        for message in reversed(self._ai_messages):
+            kind = str(message.get("kind", "") or "").strip().lower()
+            if kind not in {"user", "ai"}:
+                continue
+            text = self._truncate_ai_memory_text(str(message.get("text", "") or "").strip())
+            if not text:
+                continue
+            role = "User" if kind == "user" else "LLM"
+            recent_sections.append(f"{role}: {text}")
+            if len(recent_sections) >= max_messages:
+                break
+
+        if not recent_sections:
+            return ""
+        recent_sections.reverse()
+        return "Recent chat turns:\n" + "\n".join(recent_sections)
 
     @Slot()
     def _send_ai_selected_target_query(self) -> None:
