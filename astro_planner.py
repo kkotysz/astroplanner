@@ -264,6 +264,7 @@ BHTOM_PAGE_SIZE = 200
 BHTOM_SUGGESTION_MIN_IMPORTANCE = 2.0
 BHTOM_SUGGESTION_CACHE_TTL_S = 60 * 60
 BHTOM_OBSERVATORY_CACHE_TTL_S = 60 * 60
+KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 SIMBAD_COMPACT_CACHE_TTL_S = 30 * 24 * 60 * 60
 SIMBAD_COMPACT_NEGATIVE_CACHE_TTL_S = 6 * 60 * 60
 DEFAULT_LIMITING_MAGNITUDE = 19.0
@@ -280,6 +281,15 @@ class CalcRunStats:
     duration_s: float
     visible_targets: int
     total_targets: int
+
+
+@dataclass(frozen=True)
+class KnowledgeNote:
+    path: Path
+    title: str
+    summary: str
+    tags: tuple[str, ...]
+    sections: dict[str, list[str]]
 
 
 def _decode_simbad_value(value: object) -> str:
@@ -336,6 +346,91 @@ def _normalize_catalog_display_name(value: object) -> str:
     if not text:
         return ""
     return " ".join(text.split())
+
+
+def _normalize_knowledge_tag(value: object) -> str:
+    text = _normalize_catalog_display_name(value).lower()
+    if not text:
+        return ""
+    text = text.replace("_", "-").replace("/", "-")
+    text = re.sub(r"[^a-z0-9+\- ]+", " ", text)
+    text = "-".join(part for part in text.split() if part)
+    return text
+
+
+def _clean_markdown_line(line: str) -> str:
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^[\-\*\u2022]\s+", "", text)
+    text = re.sub(r"^\d+\.\s+", "", text)
+    text = re.sub(r"^\*\*(.+?)\*\*:\s*", r"\1: ", text)
+    text = text.replace("`", "")
+    return text.strip()
+
+
+def _load_knowledge_note(path: Path) -> Optional[KnowledgeNote]:
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    title = ""
+    summary = ""
+    tags: list[str] = []
+    sections: dict[str, list[str]] = {}
+    current_section = ""
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("# ") and not title:
+            title = stripped[2:].strip()
+            continue
+        if stripped.startswith("## "):
+            current_section = stripped[3:].strip().lower()
+            sections.setdefault(current_section, [])
+            continue
+
+        summary_match = re.match(r"^\*?\*?summary\*?\*?:\s*(.+)$", stripped, flags=re.IGNORECASE)
+        if summary_match and not summary:
+            summary = summary_match.group(1).strip()
+            continue
+
+        tags_match = re.match(r"^\*?\*?tags\*?\*?:\s*(.+)$", stripped, flags=re.IGNORECASE)
+        if tags_match and not tags:
+            raw_tags = tags_match.group(1)
+            parsed = re.split(r"[,\s]+", raw_tags)
+            tags = [
+                normalized
+                for token in parsed
+                if (normalized := _normalize_knowledge_tag(str(token).lstrip("#")))
+            ]
+            continue
+
+        if current_section:
+            cleaned = _clean_markdown_line(stripped)
+            if cleaned:
+                sections.setdefault(current_section, []).append(cleaned)
+
+    if not title:
+        title = path.stem.replace("-", " ").title()
+    deduped_tags: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if tag in seen:
+            continue
+        seen.add(tag)
+        deduped_tags.append(tag)
+    return KnowledgeNote(
+        path=path,
+        title=title,
+        summary=summary,
+        tags=tuple(deduped_tags),
+        sections=sections,
+    )
 
 
 def _simbad_column(result, *candidates: str) -> Optional[str]:
@@ -16844,6 +16939,7 @@ class MainWindow(QMainWindow):
         self.target_windows: dict[str, tuple[datetime, datetime]] = {}
         self._simbad_meta_cache: dict[str, tuple[Optional[float], str]] = {}
         self._simbad_compact_cache: dict[str, dict[str, object]] = {}
+        self._knowledge_notes_cache: Optional[list[KnowledgeNote]] = None
         self._gaia_alerts_cache: dict[str, dict[str, str]] = {}
         self._gaia_alerts_cache_loaded_at = 0.0
         self._meta_worker: Optional[MetadataLookupWorker] = None
@@ -22562,7 +22658,13 @@ class MainWindow(QMainWindow):
                     pass
 
         if not self.targets:
-            parts.append("Targets: none")
+            parts.append("Targets in plan: none")
+            suggestion_context = self._build_bhtom_suggestion_shortlist_context(
+                user_question=user_question,
+                max_items=5,
+            )
+            if suggestion_context:
+                parts.append(suggestion_context)
             return "\n".join(parts)
 
         visible_count = sum(bool(enabled) for enabled in getattr(self.table_model, "row_enabled", []))
@@ -22841,6 +22943,178 @@ class MainWindow(QMainWindow):
         if requested_marker == "blazar":
             return "blazar" in normalized
         return False
+
+    def _load_knowledge_notes(self) -> list[KnowledgeNote]:
+        cached = getattr(self, "_knowledge_notes_cache", None)
+        if cached is not None:
+            return cached
+
+        notes: list[KnowledgeNote] = []
+        try:
+            paths = sorted(
+                path
+                for path in KNOWLEDGE_DIR.rglob("*.md")
+                if path.is_file()
+                and "_templates" not in path.parts
+                and path.name != "_index.md"
+            )
+        except Exception:
+            paths = []
+
+        for path in paths:
+            note = _load_knowledge_note(path)
+            if note is not None:
+                notes.append(note)
+        self._knowledge_notes_cache = notes
+        return notes
+
+    def _knowledge_request_tags(self, question: str, target: Optional[Target] = None) -> set[str]:
+        tags: set[str] = set()
+        for marker in self._question_bhtom_type_markers(question):
+            normalized = _normalize_knowledge_tag(marker)
+            if normalized:
+                tags.add(normalized)
+
+        requested_marker = self._requested_object_class_marker(question)
+        if requested_marker:
+            tags.add(_normalize_knowledge_tag(requested_marker))
+
+        normalized_question = _normalize_catalog_display_name(question).lower()
+        keyword_map = {
+            "moonlight": (
+                "moon", "moonlight", "moon sep", "moon separation", "ksiezyc", "księżyc",
+                "lun", "bright moon",
+            ),
+            "bhtom": ("bhtom", "importance", "last mag", "last magnitude"),
+            "simbad": ("simbad",),
+            "gaia-alerts": ("gaia alert", "gaia alerts", "gaia-alerts"),
+            "best-window": (
+                "best window", "window", "over limit", "score", "order", "kolejn", "airmass",
+                "altitude", "wysok", "horizon", "horyzont", "when observe", "kiedy obserw",
+            ),
+            "practical-observing": ("observe", "obserw", "how should i", "jak powinienem"),
+        }
+        for tag, markers in keyword_map.items():
+            if any(marker in normalized_question for marker in markers):
+                tags.add(tag)
+
+        if target is not None:
+            self._ensure_known_target_type(target)
+            family = self._target_class_family(target)
+            if family == "AGN":
+                tags.add("agn")
+                type_norm = _normalize_catalog_display_name(target.object_type).lower()
+                if "qso" in type_norm or "quasar" in type_norm:
+                    tags.add("qso")
+            elif family == "Supernova":
+                tags.update({"supernova", "sn"})
+            elif family == "Nova":
+                tags.add("nova")
+            elif family == "Cataclysmic variable":
+                tags.add("cv")
+            elif family == "Galaxy":
+                tags.add("galaxy")
+            elif family == "Star":
+                tags.add("star")
+            source_tag = _normalize_knowledge_tag(target.source_catalog)
+            if source_tag:
+                tags.add(source_tag)
+            if _normalize_catalog_token(target.source_catalog) == "bhtom":
+                tags.add("bhtom")
+
+        return {tag for tag in tags if tag}
+
+    def _knowledge_note_score(
+        self,
+        note: KnowledgeNote,
+        *,
+        request_tags: set[str],
+        question: str,
+        target: Optional[Target],
+    ) -> int:
+        score = 0
+        note_tags = set(note.tags)
+        overlap = request_tags & note_tags
+        score += len(overlap) * 4
+
+        path_tokens = {
+            _normalize_knowledge_tag(note.path.stem),
+            _normalize_knowledge_tag(note.path.parent.name),
+        }
+        score += len(request_tags & path_tokens) * 3
+
+        normalized_question = _normalize_catalog_display_name(question).lower()
+        if note.summary and any(tag.replace("-", " ") in normalized_question for tag in note_tags):
+            score += 2
+
+        if target is not None:
+            if "bhtom" in note_tags and _normalize_catalog_token(target.source_catalog) == "bhtom":
+                score += 2
+            if "agn" in note_tags and self._target_class_family(target) == "AGN":
+                score += 2
+            if {"supernova", "sn"} & note_tags and self._target_class_family(target) == "Supernova":
+                score += 2
+
+        return score
+
+    @staticmethod
+    def _format_knowledge_note_snippet(note: KnowledgeNote) -> str:
+        lines: list[str] = [f"- {note.title}"]
+        if note.summary:
+            lines.append(f"  Summary: {note.summary}")
+
+        heuristics = list(note.sections.get("key heuristics", []))
+        if heuristics:
+            lines.append("  Key heuristics:")
+            for item in heuristics[:3]:
+                lines.append(f"    - {item}")
+
+        caveats = list(note.sections.get("caveats", []))
+        if caveats:
+            lines.append("  Caveats:")
+            for item in caveats[:2]:
+                lines.append(f"    - {item}")
+        return "\n".join(lines)
+
+    def _build_knowledge_context(
+        self,
+        *,
+        question: str,
+        target: Optional[Target] = None,
+        max_notes: int = 3,
+        max_chars: int = 1600,
+    ) -> str:
+        notes = self._load_knowledge_notes()
+        if not notes:
+            return ""
+
+        request_tags = self._knowledge_request_tags(question, target=target)
+        if not request_tags:
+            return ""
+
+        ranked: list[tuple[int, KnowledgeNote]] = []
+        for note in notes:
+            score = self._knowledge_note_score(note, request_tags=request_tags, question=question, target=target)
+            if score <= 0:
+                continue
+            ranked.append((score, note))
+        if not ranked:
+            return ""
+
+        ranked.sort(key=lambda item: (-item[0], item[1].path.as_posix()))
+        snippets: list[str] = []
+        total_chars = 0
+        for _, note in ranked[:max_notes]:
+            snippet = self._format_knowledge_note_snippet(note)
+            next_total = total_chars + len(snippet) + (2 if snippets else 0)
+            if snippets and next_total > max_chars:
+                break
+            snippets.append(snippet)
+            total_chars = next_total
+
+        if not snippets:
+            return ""
+        return "Local knowledge notes:\n" + "\n".join(snippets)
 
     def _build_local_object_fact_answer(self, question: str) -> Optional[str]:
         target = self._find_referenced_target_in_question(question)
@@ -23183,6 +23457,7 @@ class MainWindow(QMainWindow):
         "Provide concise, practical, and accurate guidance for planning observations. "
         "Keep answers compact by default and avoid unnecessary background. "
         "Use only the provided session context when answering questions about tonight's plan. "
+        "If local knowledge notes are included, treat them as grounded heuristics and caveats for practical advice. "
         "Do not introduce targets that are not listed in the provided session context unless the user explicitly asks for off-plan suggestions. "
         "If a cached BHTOM suggestion shortlist is included in the session context, you may use only those listed BHTOM suggestions as off-plan candidates. "
         "Use target names exactly as they appear in the provided context; do not swap in unrelated Messier, NGC, or other catalog examples. "
@@ -24492,9 +24767,13 @@ class MainWindow(QMainWindow):
 
         context = self._build_session_context(user_question=text)
         recent_memory = self._build_recent_chat_memory_block()
+        referenced_target = self._find_referenced_target_in_question(text)
+        knowledge_context = self._build_knowledge_context(question=text, target=referenced_target)
         prompt_sections = []
         if recent_memory:
             prompt_sections.append(recent_memory)
+        if knowledge_context:
+            prompt_sections.append(knowledge_context)
         prompt_sections.append(f"Current session context:\n{context}\n\nUser question: {text}")
         prompt = "\n\n".join(prompt_sections)
         self._dispatch_llm(prompt, tag="chat", label=text)
@@ -24502,9 +24781,12 @@ class MainWindow(QMainWindow):
     def _build_selected_target_llm_prompt(self, target: Target, question: str) -> str:
         compact_description = self._build_fast_target_llm_context(target)
         recent_memory = self._build_recent_chat_memory_block()
+        knowledge_context = self._build_knowledge_context(question=question, target=target)
         prompt_sections: list[str] = []
         if recent_memory:
             prompt_sections.append(recent_memory)
+        if knowledge_context:
+            prompt_sections.append(knowledge_context)
         prompt_sections.append(
             f"Selected object context:\n"
             f"{compact_description}\n\n"
@@ -24516,9 +24798,13 @@ class MainWindow(QMainWindow):
 
     def _build_fast_general_llm_prompt(self, question: str) -> str:
         recent_memory = self._build_recent_chat_memory_block()
+        referenced_target = self._find_referenced_target_in_question(question)
+        knowledge_context = self._build_knowledge_context(question=question, target=referenced_target)
         prompt_sections: list[str] = []
         if recent_memory:
             prompt_sections.append(recent_memory)
+        if knowledge_context:
+            prompt_sections.append(knowledge_context)
         prompt_sections.append(
             f"User question: {question}\n\n"
             "Answer concisely in no more than 4 short sentences. "
@@ -25374,16 +25660,22 @@ class MainWindow(QMainWindow):
         self._ai_stream_render_timer.stop()
         idx = self._ai_stream_message_index
         if idx is not None and 0 <= idx < len(self._ai_messages):
+            streamed_text = str(self._ai_messages[idx].get("text", "") or "")
+            final_text = str(text or "").strip() or streamed_text
+            action_targets = self._extract_addable_bhtom_targets_from_ai_text(final_text)
+            if not action_targets and streamed_text and streamed_text != final_text:
+                action_targets = self._extract_addable_bhtom_targets_from_ai_text(streamed_text)
             self._ai_messages[idx]["kind"] = "ai"
-            self._ai_messages[idx]["text"] = text
-            self._ai_messages[idx]["action_targets"] = self._extract_addable_bhtom_targets_from_ai_text(text)
+            self._ai_messages[idx]["text"] = final_text
+            self._ai_messages[idx]["action_targets"] = action_targets
             self._ai_stream_message_index = None
             self._render_ai_messages()
         else:
+            final_text = str(text or "").strip()
             self._append_ai_message(
-                text,
+                final_text,
                 is_ai=True,
-                action_targets=self._extract_addable_bhtom_targets_from_ai_text(text),
+                action_targets=self._extract_addable_bhtom_targets_from_ai_text(final_text),
             )
         self._ai_stream_message_index = None
         self._persist_ai_messages_to_storage()
