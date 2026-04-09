@@ -13668,8 +13668,8 @@ class MainWindow(QMainWindow):
                 [],
                 [],
                 linestyle="",
-                marker="x",
-                markersize=6.5,
+                marker="o",
+                markersize=1.5,
                 markeredgewidth=1.35,
                 alpha=0.0,
                 zorder=4,
@@ -13774,7 +13774,7 @@ class MainWindow(QMainWindow):
             if np.any(visible):
                 offsets = coords[visible]
                 vis_strength = strengths[visible]
-                main_sizes = 5.4 + (np.power(vis_strength, 0.78) * 3.6)
+                main_sizes = 1.8 + (np.power(vis_strength, 0.78) * 3.6)
                 main_alphas = np.clip(np.power(vis_strength, 1.55) * 0.52, 0.0, 0.52)
                 echo_color = self._theme_qcolor("polar_target", "#59f3ff")
                 self._ensure_radar_echo_artists(len(offsets))
@@ -16975,10 +16975,10 @@ class MainWindow(QMainWindow):
         self.polar_ax.set_theta_zero_location('N')
         self.polar_ax.set_theta_direction(-1)
         # Plot placeholders: targets, selected target, sun, moon
-        self.polar_scatter = self.polar_ax.scatter([], [], c='blue', marker='x', s=20, label='Targets', alpha=0.5, picker=True)
+        self.polar_scatter = self.polar_ax.scatter([], [], c='blue', marker='o', s=10, label='Targets', alpha=0.5, picker=True)
         self.selected_scatter = self.polar_ax.scatter([], [], c='red', marker='x', s=40, alpha=1, label='Selected')
-        self.radar_echo_glow_scatter = self.polar_ax.scatter([], [], c='cyan', marker='x', s=40, alpha=1.0, linewidths=3.2, zorder=3)
-        self.radar_echo_scatter = self.polar_ax.scatter([], [], c='cyan', marker='x', s=18, alpha=1.0, linewidths=1.35, zorder=4)
+        self.radar_echo_glow_scatter = self.polar_ax.scatter([], [], c='cyan', marker='o', s=10, alpha=1.0, linewidths=3.2, zorder=3)
+        self.radar_echo_scatter = self.polar_ax.scatter([], [], c='cyan', marker='o', s=10, alpha=1.0, linewidths=1.35, zorder=4)
         self.radar_echo_glow_scatter.set_visible(False)
         self.radar_echo_scatter.set_visible(False)
         self._radar_echo_artists: list[Any] = []
