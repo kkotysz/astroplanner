@@ -358,6 +358,15 @@ def _normalize_knowledge_tag(value: object) -> str:
     return text
 
 
+def _mentions_supernova_term(normalized: str) -> bool:
+    text = str(normalized or "").lower()
+    if not text:
+        return False
+    if "supernova" in text or "super nowa" in text or "supernow" in text:
+        return True
+    return bool(re.search(r"(?<![a-z0-9])sn(?![a-z0-9])", text))
+
+
 def _clean_markdown_line(line: str) -> str:
     text = str(line or "").strip()
     if not text:
@@ -3807,7 +3816,8 @@ class GeneralSettingsDialog(QDialog):
         )
         self.llm_enable_thinking_chk.setToolTip(
             "When enabled, the model may spend tokens on internal reasoning. "
-            "This can improve some answers but usually makes responses slower and longer."
+            "This can improve some answers but usually makes responses slower and longer. "
+            "Actual behavior depends on the backend and model."
         )
         self.llm_enable_chat_memory_chk = QCheckBox("Enable short chat memory (last 1-2 turns)", self)
         self.llm_enable_chat_memory_chk.setChecked(
@@ -12958,9 +12968,9 @@ class MainWindow(QMainWindow):
     bhtom_observatory_presets_loading = Signal(bool, str)
 
     def eventFilter(self, watched, event):  # noqa: D401
-        if hasattr(self, "ai_output") and watched is self.ai_output.viewport():
+        if hasattr(self, "ai_output") and watched is self.ai_output:
             if event.type() == QEvent.Type.Resize:
-                new_width = int(self.ai_output.viewport().width())
+                new_width = self._ai_message_layout_width()
                 last_width = int(getattr(self, "_ai_output_last_viewport_width", 0))
                 if abs(new_width - last_width) >= 8:
                     self._ai_output_last_viewport_width = new_width
@@ -17005,6 +17015,7 @@ class MainWindow(QMainWindow):
         self._llm_active_tag = ""
         self._llm_warmup_silent = False
         self._llm_startup_warmup_attempted = False
+        self._ai_last_knowledge_titles: list[str] = []
         self._llm_last_warmup_at = 0.0
         self._llm_last_warmup_key: tuple[str, str] = ("", "")
         self._ai_runtime_status = ""
@@ -18733,6 +18744,24 @@ class MainWindow(QMainWindow):
         if hasattr(self, "ai_input"):
             self.ai_input.setToolTip(input_tooltip)
 
+    def _refresh_ai_knowledge_hint(self, titles: Optional[list[str]] = None) -> None:
+        if titles is not None:
+            self._ai_last_knowledge_titles = [str(title).strip() for title in titles if str(title).strip()]
+        current_titles = list(getattr(self, "_ai_last_knowledge_titles", []) or [])
+        if current_titles:
+            if len(current_titles) > 3:
+                visible = ", ".join(current_titles[:3]) + f" (+{len(current_titles) - 3} more)"
+            else:
+                visible = ", ".join(current_titles)
+            text = f"Using local knowledge: {visible}"
+            tooltip = "Local knowledge notes used for the most recent AI prompt:\n- " + "\n- ".join(current_titles)
+        else:
+            text = "Using local knowledge: none"
+            tooltip = "No local knowledge notes were added to the most recent AI prompt."
+        if hasattr(self, "ai_knowledge_hint"):
+            self.ai_knowledge_hint.setText(text)
+            self.ai_knowledge_hint.setToolTip(tooltip)
+
     @Slot()
     def _focus_ai_input(self) -> None:
         ai_window = self._ensure_ai_window()
@@ -19788,6 +19817,7 @@ class MainWindow(QMainWindow):
         plan_kind: str,
         plan_name: str,
         defer_visual_refresh: bool = False,
+        apply_snapshot_date: bool = True,
     ) -> None:
         loaded_targets: list[Target] = []
         for payload in target_payloads:
@@ -19823,11 +19853,14 @@ class MainWindow(QMainWindow):
                 self.elev_edit.setText(f"{restored_site.elevation}")
                 self.table_model.site = restored_site
 
-        iso_date = str(snapshot.get("date", "") or "").strip()
-        if iso_date:
-            qdate = QDate.fromString(iso_date, Qt.ISODate)
-            if qdate.isValid():
-                self.date_edit.setDate(qdate)
+        if apply_snapshot_date:
+            iso_date = str(snapshot.get("date", "") or "").strip()
+            if iso_date:
+                qdate = QDate.fromString(iso_date, Qt.ISODate)
+                if qdate.isValid():
+                    self.date_edit.setDate(qdate)
+        else:
+            self.date_edit.setDate(QDate.currentDate())
         if "limit_altitude" in snapshot:
             self.limit_spin.setValue(int(round(float(snapshot.get("limit_altitude", self.limit_spin.value()) or self.limit_spin.value()))))
         if "sun_alt_limit" in snapshot:
@@ -19869,7 +19902,13 @@ class MainWindow(QMainWindow):
         self._emit_table_data_changed()
         self._run_plan()
 
-    def _restore_plan_record(self, record: dict[str, object], *, defer_visual_refresh: bool = False) -> None:
+    def _restore_plan_record(
+        self,
+        record: dict[str, object],
+        *,
+        defer_visual_refresh: bool = False,
+        apply_snapshot_date: bool = False,
+    ) -> None:
         snapshot = dict(record.get("snapshot") or {})
         target_payloads = [
             dict(payload)
@@ -19885,6 +19924,7 @@ class MainWindow(QMainWindow):
                 plan_kind=str(record.get("plan_kind", "workspace") or "workspace"),
                 plan_name=str(record.get("name", "Workspace") or "Workspace"),
                 defer_visual_refresh=defer_visual_refresh,
+                apply_snapshot_date=apply_snapshot_date,
             )
         finally:
             self._suspend_plan_autosave = False
@@ -19900,7 +19940,11 @@ class MainWindow(QMainWindow):
             logger.warning("Failed to restore workspace from storage: %s", exc)
             workspace = None
         if workspace:
-            self._restore_plan_record(workspace, defer_visual_refresh=defer_visual_refresh)
+            self._restore_plan_record(
+                workspace,
+                defer_visual_refresh=defer_visual_refresh,
+                apply_snapshot_date=False,
+            )
             if str(workspace.get("id", "")).strip():
                 self._workspace_plan_id = str(workspace.get("id"))
             return True
@@ -22145,6 +22189,14 @@ class MainWindow(QMainWindow):
         self.ai_context_hint.setWordWrap(True)
         btn_col.addWidget(self.ai_context_hint)
 
+        self.ai_knowledge_hint = QLabel("Using local knowledge: none", panel)
+        self.ai_knowledge_hint.setObjectName("SectionHint")
+        self.ai_knowledge_hint.setWordWrap(True)
+        self.ai_knowledge_hint.setToolTip(
+            "Shows which local knowledge notes were added to the most recent AI prompt."
+        )
+        btn_col.addWidget(self.ai_knowledge_hint)
+
         warmup_btn = QPushButton("Warm Up LLM", panel)
         warmup_btn.clicked.connect(self._warmup_llm_manual)
         _set_button_variant(warmup_btn, "ghost")
@@ -22191,6 +22243,7 @@ class MainWindow(QMainWindow):
         self.ai_reset_appearance_btn.setMinimumWidth(describe_width - 12)
         self.ai_settings_btn.setMinimumWidth(describe_width - 12)
         self.ai_context_hint.setFixedWidth(describe_width - 12)
+        self.ai_knowledge_hint.setFixedWidth(describe_width - 12)
         warmup_btn.setMinimumWidth(describe_width - 12)
         clear_btn.setMinimumWidth(describe_width - 12)
         btn_widget.setFixedWidth(describe_width)
@@ -22206,7 +22259,7 @@ class MainWindow(QMainWindow):
         self.ai_output.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.ai_output.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.ai_output.setObjectName("AIChatScroll")
-        self.ai_output.viewport().installEventFilter(self)
+        self.ai_output.installEventFilter(self)
         self._ai_output_last_viewport_width = 0
         self.ai_output_content = QWidget(self.ai_output)
         self.ai_output_content.setObjectName("AIChatContent")
@@ -22242,6 +22295,7 @@ class MainWindow(QMainWindow):
         center_col.addLayout(composer_row)
         layout.addWidget(center_widget, 1)
         self._refresh_ai_context_hint()
+        self._refresh_ai_knowledge_hint()
         self._refresh_ai_panel_action_buttons()
         self._refresh_ai_warm_indicator()
 
@@ -22279,6 +22333,7 @@ class MainWindow(QMainWindow):
             self._render_ai_messages()
         self._refresh_ai_panel_action_buttons()
         self._refresh_ai_context_hint()
+        self._refresh_ai_knowledge_hint()
         self._refresh_ai_warm_indicator()
         return ai_window
 
@@ -22720,7 +22775,7 @@ class MainWindow(QMainWindow):
         def _contains_token(token: str) -> bool:
             return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", normalized))
 
-        if any(token in normalized for token in ("supernova", "super nowa", "supernowa")) or _contains_token("sn"):
+        if _mentions_supernova_term(normalized):
             markers.extend(["supernova", "sn"])
         if "nova" in normalized:
             markers.append("nova")
@@ -22829,7 +22884,7 @@ class MainWindow(QMainWindow):
 
         if any(token in normalized for token in ("quasar", "seyfert", "blazar")) or _contains_token("qso") or _contains_token("agn"):
             return "AGN"
-        if any(token in normalized for token in ("supernova", "super nowa", "supernowa")) or _contains_token("sn"):
+        if _mentions_supernova_term(normalized):
             return "Supernova"
         if _contains_token("nova"):
             return "Nova"
@@ -22902,7 +22957,7 @@ class MainWindow(QMainWindow):
             return "seyfert"
         if "blazar" in normalized:
             return "blazar"
-        if any(token in normalized for token in ("supernova", "super nowa", "supernowa")) or _contains_token("sn"):
+        if _mentions_supernova_term(normalized):
             return "supernova"
         if _contains_token("nova"):
             return "nova"
@@ -22944,6 +22999,44 @@ class MainWindow(QMainWindow):
             return "blazar" in normalized
         return False
 
+    @classmethod
+    def _requested_marker_family(cls, requested_marker: str) -> str:
+        marker = _normalize_knowledge_tag(requested_marker)
+        if marker in {"agn", "qso", "seyfert", "blazar"}:
+            return "AGN"
+        if marker == "supernova":
+            return "Supernova"
+        if marker == "nova":
+            return "Nova"
+        if marker == "xrb":
+            return "X-ray binary"
+        if marker == "cv":
+            return "Cataclysmic variable"
+        if marker == "galaxy":
+            return "Galaxy"
+        if marker == "star":
+            return "Star"
+        return ""
+
+    @classmethod
+    def _knowledge_note_family(cls, note: KnowledgeNote) -> str:
+        note_tags = set(note.tags)
+        if {"agn", "qso", "seyfert", "blazar"} & note_tags:
+            return "AGN"
+        if {"supernova", "sn"} & note_tags:
+            return "Supernova"
+        if "nova" in note_tags:
+            return "Nova"
+        if "xrb" in note_tags:
+            return "X-ray binary"
+        if {"cv", "cataclysmic-variable"} & note_tags:
+            return "Cataclysmic variable"
+        if "galaxy" in note_tags:
+            return "Galaxy"
+        if {"star", "variable-star"} & note_tags:
+            return "Star"
+        return ""
+
     def _load_knowledge_notes(self) -> list[KnowledgeNote]:
         cached = getattr(self, "_knowledge_notes_cache", None)
         if cached is not None:
@@ -22967,6 +23060,50 @@ class MainWindow(QMainWindow):
                 notes.append(note)
         self._knowledge_notes_cache = notes
         return notes
+
+    def _select_knowledge_notes(
+        self,
+        *,
+        question: str,
+        target: Optional[Target] = None,
+        max_notes: int = 3,
+        max_chars: int = 1600,
+    ) -> list[KnowledgeNote]:
+        notes = self._load_knowledge_notes()
+        if not notes:
+            return []
+
+        request_tags = self._knowledge_request_tags(question, target=target)
+        if not request_tags:
+            return []
+
+        requested_family = self._requested_marker_family(self._requested_object_class_marker(question))
+        if not requested_family and target is not None:
+            requested_family = self._target_class_family(target)
+
+        ranked: list[tuple[int, KnowledgeNote]] = []
+        for note in notes:
+            note_family = self._knowledge_note_family(note)
+            if requested_family and note_family and note_family != requested_family:
+                continue
+            score = self._knowledge_note_score(note, request_tags=request_tags, question=question, target=target)
+            if score <= 0:
+                continue
+            ranked.append((score, note))
+        if not ranked:
+            return []
+
+        ranked.sort(key=lambda item: (-item[0], item[1].path.as_posix()))
+        selected: list[KnowledgeNote] = []
+        total_chars = 0
+        for _, note in ranked[:max_notes]:
+            snippet = self._format_knowledge_note_snippet(note)
+            next_total = total_chars + len(snippet) + (2 if selected else 0)
+            if selected and next_total > max_chars:
+                break
+            selected.append(note)
+            total_chars = next_total
+        return selected
 
     def _knowledge_request_tags(self, question: str, target: Optional[Target] = None) -> set[str]:
         tags: set[str] = set()
@@ -23099,36 +23236,15 @@ class MainWindow(QMainWindow):
         max_notes: int = 3,
         max_chars: int = 1600,
     ) -> str:
-        notes = self._load_knowledge_notes()
+        notes = self._select_knowledge_notes(
+            question=question,
+            target=target,
+            max_notes=max_notes,
+            max_chars=max_chars,
+        )
         if not notes:
             return ""
-
-        request_tags = self._knowledge_request_tags(question, target=target)
-        if not request_tags:
-            return ""
-
-        ranked: list[tuple[int, KnowledgeNote]] = []
-        for note in notes:
-            score = self._knowledge_note_score(note, request_tags=request_tags, question=question, target=target)
-            if score <= 0:
-                continue
-            ranked.append((score, note))
-        if not ranked:
-            return ""
-
-        ranked.sort(key=lambda item: (-item[0], item[1].path.as_posix()))
-        snippets: list[str] = []
-        total_chars = 0
-        for _, note in ranked[:max_notes]:
-            snippet = self._format_knowledge_note_snippet(note)
-            next_total = total_chars + len(snippet) + (2 if snippets else 0)
-            if snippets and next_total > max_chars:
-                break
-            snippets.append(snippet)
-            total_chars = next_total
-
-        if not snippets:
-            return ""
+        snippets = [self._format_knowledge_note_snippet(note) for note in notes]
         return "Local knowledge notes:\n" + "\n".join(snippets)
 
     def _build_local_object_fact_answer(self, question: str) -> Optional[str]:
@@ -24758,6 +24874,7 @@ class MainWindow(QMainWindow):
             self.ai_input.clear()
             if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
                 self.ai_toggle_btn.setChecked(True)
+            self._refresh_ai_knowledge_hint([])
             self._append_ai_message(text, is_user=True)
             self._append_ai_message(local_fact_answer, is_ai=True)
             self._set_ai_status("Ready", tone="info")
@@ -24783,7 +24900,14 @@ class MainWindow(QMainWindow):
         context = self._build_session_context(user_question=text)
         recent_memory = self._build_recent_chat_memory_block()
         referenced_target = self._find_referenced_target_in_question(text)
-        knowledge_context = self._build_knowledge_context(question=text, target=referenced_target)
+        knowledge_notes = self._select_knowledge_notes(question=text, target=referenced_target)
+        knowledge_context = (
+            "Local knowledge notes:\n"
+            + "\n".join(self._format_knowledge_note_snippet(note) for note in knowledge_notes)
+            if knowledge_notes
+            else ""
+        )
+        self._refresh_ai_knowledge_hint([note.title for note in knowledge_notes])
         prompt_sections = []
         if recent_memory:
             prompt_sections.append(recent_memory)
@@ -24796,7 +24920,14 @@ class MainWindow(QMainWindow):
     def _build_selected_target_llm_prompt(self, target: Target, question: str) -> str:
         compact_description = self._build_fast_target_llm_context(target)
         recent_memory = self._build_recent_chat_memory_block()
-        knowledge_context = self._build_knowledge_context(question=question, target=target)
+        knowledge_notes = self._select_knowledge_notes(question=question, target=target)
+        knowledge_context = (
+            "Local knowledge notes:\n"
+            + "\n".join(self._format_knowledge_note_snippet(note) for note in knowledge_notes)
+            if knowledge_notes
+            else ""
+        )
+        self._refresh_ai_knowledge_hint([note.title for note in knowledge_notes])
         prompt_sections: list[str] = []
         if recent_memory:
             prompt_sections.append(recent_memory)
@@ -24814,7 +24945,14 @@ class MainWindow(QMainWindow):
     def _build_fast_general_llm_prompt(self, question: str) -> str:
         recent_memory = self._build_recent_chat_memory_block()
         referenced_target = self._find_referenced_target_in_question(question)
-        knowledge_context = self._build_knowledge_context(question=question, target=referenced_target)
+        knowledge_notes = self._select_knowledge_notes(question=question, target=referenced_target)
+        knowledge_context = (
+            "Local knowledge notes:\n"
+            + "\n".join(self._format_knowledge_note_snippet(note) for note in knowledge_notes)
+            if knowledge_notes
+            else ""
+        )
+        self._refresh_ai_knowledge_hint([note.title for note in knowledge_notes])
         prompt_sections: list[str] = []
         if recent_memory:
             prompt_sections.append(recent_memory)
@@ -24884,6 +25022,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
             self.ai_toggle_btn.setChecked(True)
+        self._refresh_ai_knowledge_hint([])
         self._append_ai_message(f"Describe {target.name}", is_user=True)
         self._append_ai_message(self._build_compact_target_description(target), is_ai=True)
         worker = self._llm_worker
@@ -25329,7 +25468,7 @@ class MainWindow(QMainWindow):
         streaming: bool = False,
         action_targets: Optional[list[Target]] = None,
     ) -> tuple[QWidget, dict[str, Any]]:
-        viewport_width = max(320, int(self.ai_output.viewport().width()))
+        viewport_width = self._ai_message_layout_width()
         bubble_max_width = max(240, int(viewport_width * message_max_width_ratio))
 
         row = QWidget(self.ai_output_content)
@@ -25436,6 +25575,23 @@ class MainWindow(QMainWindow):
             "bubble_max_width": bubble_max_width,
             "streaming": streaming,
         }
+
+    def _ai_message_layout_width(self) -> int:
+        if not hasattr(self, "ai_output"):
+            return 320
+        viewport_width = 0
+        try:
+            viewport_width = int(self.ai_output.viewport().width())
+        except Exception:
+            viewport_width = int(self.ai_output.width())
+        reserve = 0
+        scroll = self.ai_output.verticalScrollBar() if hasattr(self.ai_output, "verticalScrollBar") else None
+        if scroll is not None and not scroll.isVisible():
+            try:
+                reserve = max(0, int(scroll.sizeHint().width()))
+            except Exception:
+                reserve = 14
+        return max(320, viewport_width - reserve)
 
     def _update_ai_message_widget(self, idx: int, *, streaming: bool) -> bool:
         if not (0 <= idx < len(self._ai_messages)) or not (0 <= idx < len(self._ai_message_widget_refs)):
