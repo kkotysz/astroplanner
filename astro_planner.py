@@ -51,6 +51,7 @@ import hashlib
 import html as html_module
 import io
 import json
+import locale
 import math
 import os
 import re
@@ -160,6 +161,16 @@ from astroplanner.theme import (
     line_palette_for_theme,
     normalize_theme_key,
     resolve_theme_tokens,
+)
+from astroplanner.i18n import (
+    SUPPORTED_UI_LANGUAGES,
+    current_language,
+    localize_widget_tree,
+    resolve_language_choice,
+    set_current_language,
+    set_translated_text,
+    set_translated_tooltip,
+    translate_text,
 )
 from astroplanner.storage import AppStorage, SettingsAdapter
 
@@ -1434,6 +1445,7 @@ from PySide6.QtCore import (
     QUrl,
     QUrlQuery,
     QIODevice,
+    QLocale,
 )
 from PySide6.QtGui import (
     QAction,
@@ -3388,6 +3400,7 @@ class TableSettingsDialog(QDialog):
             min_width=620,
             min_height=460,
         )
+        localize_widget_tree(self, current_language())
 
     def _refresh_status_color_button(self, key: str, label: str) -> None:
         btn = getattr(self, f"{key}_btn", None)
@@ -3530,6 +3543,19 @@ class GeneralSettingsDialog(QDialog):
         if theme_idx >= 0:
             self.theme_combo.setCurrentIndex(theme_idx)
         general_layout.addRow("Color theme:", self.theme_combo)
+
+        self.language_combo = QComboBox(self)
+        for key, label in SUPPORTED_UI_LANGUAGES:
+            self.language_combo.addItem(label, key)
+        init_language = (
+            str(parent.settings.value("general/uiLanguage", "system", type=str) or "system")
+            if parent and hasattr(parent, "settings")
+            else "system"
+        ).strip().lower()
+        language_idx = self.language_combo.findData(init_language)
+        if language_idx >= 0:
+            self.language_combo.setCurrentIndex(language_idx)
+        general_layout.addRow("Interface language:", self.language_combo)
 
         self.dark_mode_chk = QCheckBox("Enable dark mode", self)
         self.dark_mode_chk.setChecked(
@@ -3773,13 +3799,29 @@ class GeneralSettingsDialog(QDialog):
             if parent and hasattr(parent, "settings")
             else LLMConfig.DEFAULT_URL
         )
-        self.llm_model_edit = QLineEdit(self)
-        self.llm_model_edit.setPlaceholderText(LLMConfig.DEFAULT_MODEL)
-        self.llm_model_edit.setText(
+        self.llm_model_combo = QComboBox(self)
+        self.llm_model_combo.setEditable(True)
+        self.llm_model_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.llm_model_combo.setMinimumContentsLength(22)
+        # PySide6 doesn't expose AdjustToMinimumContentsLength; use AdjustToContents.
+        self.llm_model_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.llm_model_combo.lineEdit().setPlaceholderText(LLMConfig.DEFAULT_MODEL)
+        self.llm_model_combo.setCurrentText(
             parent.settings.value("llm/model", LLMConfig.DEFAULT_MODEL, type=str)
             if parent and hasattr(parent, "settings")
             else LLMConfig.DEFAULT_MODEL
         )
+        self.llm_models_refresh_btn = QPushButton("Detect models", self)
+        self.llm_models_refresh_btn.clicked.connect(self._refresh_llm_models)
+        self.llm_models_status = QLabel("Model list: not loaded", self)
+        self.llm_models_status.setObjectName("SectionHint")
+        self.llm_models_status.setWordWrap(True)
+        self._llm_models_worker: Optional[LLMModelDiscoveryWorker] = None
+        self._llm_models_refresh_timer = QTimer(self)
+        self._llm_models_refresh_timer.setSingleShot(True)
+        self._llm_models_refresh_timer.setInterval(650)
+        self._llm_models_refresh_timer.timeout.connect(self._refresh_llm_models)
+        self.llm_url_edit.textChanged.connect(lambda *_: self._llm_models_refresh_timer.start())
         self.llm_timeout_spin = QSpinBox(self)
         self.llm_timeout_spin.setRange(15, 900)
         self.llm_timeout_spin.setSingleStep(15)
@@ -3899,7 +3941,14 @@ class GeneralSettingsDialog(QDialog):
         llm_hdr.setObjectName("SectionHint")
         ai_layout.addRow(llm_hdr)
         ai_layout.addRow("LLM server URL:", self.llm_url_edit)
-        ai_layout.addRow("LLM model:", self.llm_model_edit)
+        ai_layout.addRow("LLM model:", self.llm_model_combo)
+        llm_model_row = QWidget(self)
+        llm_model_row_l = QHBoxLayout(llm_model_row)
+        llm_model_row_l.setContentsMargins(0, 0, 0, 0)
+        llm_model_row_l.setSpacing(8)
+        llm_model_row_l.addWidget(self.llm_models_refresh_btn, 0)
+        llm_model_row_l.addWidget(self.llm_models_status, 1)
+        ai_layout.addRow("", llm_model_row)
         llm_endpoint_hint = QLabel(
             "Ollama: URL http://localhost:11434, model gemma4:e4b\n"
             "Docker Model Runner: URL http://localhost:12434/engines, model docker.io/ai/gemma4:E4B",
@@ -4159,6 +4208,7 @@ class GeneralSettingsDialog(QDialog):
         initial_key = str(initial_tab or "").strip().lower()
         if initial_key in self._tab_indices:
             self.tabs.setCurrentIndex(self._tab_indices[initial_key])
+        localize_widget_tree(self, current_language())
 
     @Slot(bool)
     def _preview_dark_mode(self, checked: bool):
@@ -4217,6 +4267,41 @@ class GeneralSettingsDialog(QDialog):
         self.radar_speed_row.setVisible(visible)
         self.radar_speed_value_label.setText(f"{self.radar_speed_slider.value() / 100.0:.2f}x")
 
+    def _refresh_llm_models(self) -> None:
+        if self._llm_models_worker is not None and self._llm_models_worker.isRunning():
+            return
+        base_url = str(self.llm_url_edit.text() or "").strip()
+        if not base_url:
+            self.llm_models_status.setText("Model list: set LLM server URL first.")
+            return
+        self.llm_models_status.setText("Model list: detecting…")
+        self._llm_models_worker = LLMModelDiscoveryWorker(base_url, timeout_s=6, parent=self)
+        self._llm_models_worker.modelsReady.connect(self._on_llm_models_ready)
+        self._llm_models_worker.failed.connect(self._on_llm_models_failed)
+        self._llm_models_worker.finished.connect(self._llm_models_worker.deleteLater)
+        self._llm_models_worker.start()
+
+    @Slot(list, str)
+    def _on_llm_models_ready(self, models: list, backend_label: str) -> None:
+        current_text = str(self.llm_model_combo.currentText() or "").strip()
+        self.llm_model_combo.blockSignals(True)
+        self.llm_model_combo.clear()
+        for name in models:
+            if isinstance(name, str) and name.strip():
+                self.llm_model_combo.addItem(name.strip())
+        if current_text:
+            self.llm_model_combo.setCurrentText(current_text)
+        elif self.llm_model_combo.count() > 0:
+            self.llm_model_combo.setCurrentIndex(0)
+        self.llm_model_combo.blockSignals(False)
+        self.llm_models_status.setText(f"Model list: {backend_label} ({len(models)})")
+        self._llm_models_worker = None
+
+    @Slot(str)
+    def _on_llm_models_failed(self, message: str) -> None:
+        self.llm_models_status.setText(f"Model list: {message}")
+        self._llm_models_worker = None
+
     def _apply_changes(self):
         s = self.parent().settings
         rerun_plan = any(
@@ -4234,6 +4319,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("general/uiFontSize", self.ui_font_spin.value())
         selected_theme = normalize_theme_key(self.theme_combo.currentData())
         s.setValue("general/uiTheme", selected_theme)
+        s.setValue("general/uiLanguage", str(self.language_combo.currentData() or "system"))
         for theme_key, color in self._accent_secondary_colors.items():
             if parent := self.parent():
                 if hasattr(parent, "_save_accent_secondary_override"):
@@ -4273,7 +4359,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("general/seestarAlpClientId", max(1, int(self.seestar_alp_client_id_spin.value())))
         s.setValue("general/seestarAlpTimeoutSec", max(1.0, float(self.seestar_alp_timeout_spin.value())))
         llm_url = self.llm_url_edit.text().strip() or LLMConfig.DEFAULT_URL
-        llm_model = self.llm_model_edit.text().strip() or LLMConfig.DEFAULT_MODEL
+        llm_model = self.llm_model_combo.currentText().strip() or LLMConfig.DEFAULT_MODEL
         llm_timeout = max(15, int(self.llm_timeout_spin.value()))
         llm_max_tokens = max(32, int(self.llm_max_tokens_spin.value()))
         llm_enable_thinking = bool(self.llm_enable_thinking_chk.isChecked())
@@ -4898,7 +4984,7 @@ class SeestarSessionPlanDialog(QDialog):
         self.seestar_targets_table = QTableWidget(targets_panel)
         self.seestar_targets_table.setColumnCount(12)
         self.seestar_targets_table.setHorizontalHeaderLabels(
-            [
+            [translate_text(label, current_language()) for label in [
                 "On",
                 "#",
                 "Target",
@@ -4911,7 +4997,7 @@ class SeestarSessionPlanDialog(QDialog):
                 "Exp ms",
                 "LP",
                 "Focus",
-            ]
+            ]]
         )
         self.seestar_targets_table.verticalHeader().setVisible(False)
         self.seestar_targets_table.setAlternatingRowColors(True)
@@ -4968,6 +5054,7 @@ class SeestarSessionPlanDialog(QDialog):
         self._update_automation_fields_enabled()
         self._refresh_target_override_defaults()
         QTimer.singleShot(0, self._adjust_session_splitter_sizes)
+        localize_widget_tree(self, current_language())
 
     def _load_user_session_templates(self) -> dict[str, SeestarSessionTemplate]:
         storage = getattr(self, "_storage", None)
@@ -7553,8 +7640,8 @@ class WeatherDialog(QDialog):
             lbl.setObjectName("SectionHint")
             lbl.setProperty("weather_chip", True)
             lbl.setProperty("weather_chip_role", role)
-            lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-            lbl.setTextFormat(Qt.RichText)
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            lbl.setTextFormat(Qt.PlainText)
             summary_l.addWidget(lbl, 0)
         self.live_temp_label.setProperty("weather_chip_series", "temp")
         self.live_wind_label.setProperty("weather_chip_series", "wind")
@@ -7581,6 +7668,7 @@ class WeatherDialog(QDialog):
             min_height=720,
         )
         self._update_summary_chip_widths()
+        localize_widget_tree(self, current_language())
 
     def _sync_theme_state_from_parent(self) -> None:
         parent = self.parent()
@@ -8960,6 +9048,35 @@ class WeatherDialog(QDialog):
                 return value
         return None
 
+    @staticmethod
+    def _trim_series_for_recent(series: Optional[dict[str, object]], max_points: int) -> Optional[dict[str, object]]:
+        if not isinstance(series, dict):
+            return series
+        ts_raw = series.get("timestamps")
+        ts = [int(v) for v in ts_raw if isinstance(v, (int, float))] if isinstance(ts_raw, list) else []
+        if not ts or max_points <= 0:
+            return series
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        idx = 0
+        for i, t in enumerate(ts):
+            if t <= now_ts:
+                idx = i
+            else:
+                break
+        start = max(0, idx - max_points + 1)
+        end = min(len(ts), start + max_points)
+
+        def _slice(values: object) -> object:
+            if not isinstance(values, list):
+                return values
+            return values[start:end]
+
+        trimmed = dict(series)
+        trimmed["timestamps"] = ts[start:end]
+        for key in ("temp_c", "wind_ms", "cloud_pct", "rh_pct", "pressure_hpa"):
+            trimmed[key] = _slice(series.get(key))
+        return trimmed
+
     def _set_plot_html(self, web_view: Optional["QWebEngineView"], html: str) -> None:
         if web_view is None or not html:
             return
@@ -9021,6 +9138,11 @@ class WeatherDialog(QDialog):
         sections = payload.get("sections") if isinstance(payload.get("sections"), dict) else {}
         errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
 
+        def _avg_local(values: list[float]) -> Optional[float]:
+            if not values:
+                return None
+            return float(sum(values) / len(values))
+
         source_key = str(self.live_source_combo.currentData() or "average")
         current_row: dict[str, object] = {}
         if source_key == "average":
@@ -9033,6 +9155,33 @@ class WeatherDialog(QDialog):
                 "note": "Average values from available conditions providers.",
                 "updated_utc": "-",
             }
+            if all(current_row.get(k) is None for k in ("temp_c", "wind_ms", "cloud_pct", "rh_pct", "pressure_hpa")):
+                # Fallback: compute averages from provider rows when aggregate payload is empty.
+                values_by_metric: dict[str, list[float]] = {k: [] for k in ("temp_c", "wind_ms", "cloud_pct", "rh_pct", "pressure_hpa")}
+                for row in providers.values():
+                    if not isinstance(row, dict):
+                        continue
+                    categories = row.get("categories")
+                    if not (isinstance(categories, list) and "conditions" in categories):
+                        continue
+                    status = str(row.get("status") or "").strip().lower()
+                    if status not in {"ok", "partial"}:
+                        continue
+                    for metric in values_by_metric:
+                        value = _safe_float(row.get(metric))
+                        if value is None or not math.isfinite(float(value)):
+                            continue
+                        values_by_metric[metric].append(float(value))
+                current_row.update(
+                    {
+                        "temp_c": _avg_local(values_by_metric["temp_c"]),
+                        "wind_ms": _avg_local(values_by_metric["wind_ms"]),
+                        "cloud_pct": _avg_local(values_by_metric["cloud_pct"]),
+                        "rh_pct": _avg_local(values_by_metric["rh_pct"]),
+                        "pressure_hpa": _avg_local(values_by_metric["pressure_hpa"]),
+                        "note": "Average values from available conditions providers.",
+                    }
+                )
         else:
             row = providers.get(source_key)
             if isinstance(row, dict):
@@ -9046,6 +9195,19 @@ class WeatherDialog(QDialog):
             self.live_pressure_label,
             "P",
             self._fmt_value(_safe_float(current_row.get('pressure_hpa')), 'hPa'),
+        )
+        self._update_summary_chip_widths()
+
+        logger.info(
+            "Weather chips: src=%s T=%s W=%s C=%s RH=%s P=%s providers=%d avg_keys=%s",
+            source_key,
+            current_row.get("temp_c"),
+            current_row.get("wind_ms"),
+            current_row.get("cloud_pct"),
+            current_row.get("rh_pct"),
+            current_row.get("pressure_hpa"),
+            len(providers),
+            ",".join(sorted(averages.keys())) if isinstance(averages, dict) else "-",
         )
 
         base_status = str(current_row.get("note") or "Live data: idle").strip()
@@ -9188,9 +9350,10 @@ class WeatherDialog(QDialog):
                 self.forecast_image_label.setPixmap(QPixmap())
                 self.forecast_image_label.setText("No forecast data available yet.")
 
-        if self._series_has_points(selected_series):
+        trimmed_series = self._trim_series_for_recent(selected_series, max_points=12)
+        if self._series_has_points(trimmed_series):
             html = self._build_plotly_html(
-                selected_series,
+                trimmed_series,
                 f"Conditions trend: {source_key}",
                 max_points=12,
                 dark=dark,
@@ -9206,7 +9369,7 @@ class WeatherDialog(QDialog):
                 self._render_series_on_canvas(
                     self.conditions_trend_figure,
                     self.conditions_trend_canvas,
-                    selected_series,
+                    trimmed_series,
                     title=f"Conditions trend: {source_key}",
                     max_points=18,
                     dark=dark,
@@ -9215,7 +9378,7 @@ class WeatherDialog(QDialog):
                 )
             elif hasattr(self, "conditions_trend_image_label"):
                 chart_bytes = self._fallback_plot_bytes(
-                    selected_series,
+                    trimmed_series,
                     f"Conditions trend: {source_key}",
                     max_points=12,
                     dark=dark,
@@ -9370,6 +9533,7 @@ class WeatherDialog(QDialog):
                         self.satellite_image_label.setPixmap(QPixmap())
                         self.satellite_image_label.setText("Satellite preview unavailable.")
                     self.satellite_image_label.setToolTip(sat_caption or "")
+        localize_widget_tree(self, current_language())
 
     @Slot()
     def _on_cloud_month_changed(self) -> None:
@@ -9414,12 +9578,9 @@ class WeatherDialog(QDialog):
 
     @staticmethod
     def _weather_chip_markup(prefix: str, value: str) -> str:
-        prefix_text = html_module.escape(str(prefix or "").strip())
-        value_text = html_module.escape(str(value or "-").strip() or "-")
-        return (
-            f"<span style=\"font-weight:500;\">{prefix_text}</span> "
-            f"<span style=\"font-weight:700;\">{value_text}</span>"
-        )
+        prefix_text = str(prefix or "").strip()
+        value_text = str(value or "-").strip() or "-"
+        return f"{prefix_text} {value_text}".strip()
 
     def _set_weather_chip_label(
         self,
@@ -9430,8 +9591,8 @@ class WeatherDialog(QDialog):
         tooltip: Optional[str] = None,
     ) -> None:
         value_text = str(value or "-").strip() or "-"
-        label.setText(self._weather_chip_markup(prefix, value_text))
-        label.setToolTip(str(tooltip or f"{prefix} {value_text}").strip())
+        set_translated_text(label, self._weather_chip_markup(prefix, value_text), current_language())
+        set_translated_tooltip(label, str(tooltip or f"{prefix} {value_text}").strip(), current_language())
 
     def _update_summary_chip_widths(self) -> None:
         chip_font = QFont(self.local_time_label.font())
@@ -9440,6 +9601,26 @@ class WeatherDialog(QDialog):
         chip_metrics = QFontMetrics(chip_font)
         value_metrics = QFontMetrics(value_font)
         horizontal_padding = 26
+
+        # Live condition chips (ensure values are visible, not clipped).
+        live_min_widths = (
+            chip_metrics.horizontalAdvance("T") + value_metrics.horizontalAdvance("88.8°C") + horizontal_padding,
+            chip_metrics.horizontalAdvance("W") + value_metrics.horizontalAdvance("88.8 m/s") + horizontal_padding,
+            chip_metrics.horizontalAdvance("C") + value_metrics.horizontalAdvance("100%") + horizontal_padding,
+            chip_metrics.horizontalAdvance("RH") + value_metrics.horizontalAdvance("100%") + horizontal_padding,
+            chip_metrics.horizontalAdvance("P") + value_metrics.horizontalAdvance("1088.8 hPa") + horizontal_padding,
+        )
+        for lbl, width in zip(
+            (
+                self.live_temp_label,
+                self.live_wind_label,
+                self.live_cloud_label,
+                self.live_rh_label,
+                self.live_pressure_label,
+            ),
+            live_min_widths,
+        ):
+            lbl.setMinimumWidth(max(int(width), 84))
 
         local_width = max(
             chip_metrics.horizontalAdvance("L") + value_metrics.horizontalAdvance("88:88:88") + horizontal_padding,
@@ -9518,6 +9699,7 @@ class WeatherDialog(QDialog):
         self.moon_phase_info_bar.setValue(self._moon_phase_pct)
         self.moon_phase_info_bar.setFormat(f"Phase {self._moon_phase_pct}%")
         self.moon_phase_info_bar.setToolTip(f"Moon phase {self._moon_phase_pct}%")
+        localize_widget_tree(self, current_language())
 
     def _rebuild(self) -> None:
         self._apply_summary_labels()
@@ -9553,6 +9735,7 @@ class WeatherDialog(QDialog):
         self._on_tab_changed(self.tabs.currentIndex())
         self._update_live_views()
         self._start_live_refresh(force=False, include_cloud_map=True, include_satellite=True)
+        localize_widget_tree(self, current_language())
 
 
 class AddTargetDialog(QDialog):
@@ -9647,6 +9830,7 @@ class AddTargetDialog(QDialog):
         self.query_edit.returnPressed.connect(self._resolve_target)
         self.query_edit.textChanged.connect(self._on_query_changed)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        localize_widget_tree(self, current_language())
 
     def _current_source(self) -> str:
         return _normalize_catalog_token(self.source_combo.currentData())
@@ -10596,6 +10780,7 @@ class ObservatoryManagerDialog(QDialog):
         )
         if self.obs_list.count() == 0:
             self._set_editors_enabled(False)
+        localize_widget_tree(self, current_language())
 
     def observatories(self) -> dict[str, Site]:
         return {
@@ -11407,12 +11592,12 @@ class SuggestionTableModel(QAbstractTableModel):
             min_sep = _safe_float(item.get("min_window_moon_sep"))
             return f"{min_sep:.1f}" if min_sep is not None else "-"
         if col == self.COL_ACTION:
-            return "Added" if item.get("added_to_plan") else "Add"
+            return translate_text("Added" if item.get("added_to_plan") else "Add", current_language())
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):  # noqa: N802
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
-            return self.headers[section]
+            return translate_text(self.headers[section], current_language())
         return None
 
     def flags(self, index: QModelIndex):  # noqa: N802
@@ -11717,10 +11902,12 @@ class SuggestedTargetsDialog(QDialog):
         self.table_view.sortByColumn(SuggestionTableModel.COL_SCORE, Qt.DescendingOrder)
         self._apply_filters()
         self._fit_table_columns_to_width()
+        localize_widget_tree(self, current_language())
 
     def set_source_message(self, message: str) -> None:
         self.source_label.setText(str(message or "").strip())
         self.source_label.setVisible(bool(str(message or "").strip()))
+        localize_widget_tree(self, current_language())
 
     def _build_table_loading_placeholder(self, message: str) -> QWidget:
         widget = QWidget(self)
@@ -11760,8 +11947,10 @@ class SuggestedTargetsDialog(QDialog):
             self.table_model.set_action_hover_row(None)
             self.table_view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
             self.table_stack.setCurrentWidget(self.table_loading_widget)
+            localize_widget_tree(self, current_language())
             return
         self.table_stack.setCurrentWidget(self.table_view)
+        localize_widget_tree(self, current_language())
 
     def update_suggestions(self, suggestions: list[dict[str, object]], notes: list[str]) -> None:
         self._notes = list(notes)
@@ -11810,7 +11999,9 @@ class SuggestedTargetsDialog(QDialog):
         name_font.setBold(True)
         name_metrics = QFontMetrics(name_font)
         header_metrics = QFontMetrics(self.table_view.horizontalHeader().font())
-        max_width = header_metrics.horizontalAdvance(SuggestionTableModel.headers[SuggestionTableModel.COL_NAME])
+        max_width = header_metrics.horizontalAdvance(
+            translate_text(SuggestionTableModel.headers[SuggestionTableModel.COL_NAME], current_language())
+        )
         for item in suggestions:
             target = item.get("target")
             if isinstance(target, Target):
@@ -11931,6 +12122,7 @@ class SuggestedTargetsDialog(QDialog):
         else:
             self.notes_label.clear()
             self.notes_label.setVisible(False)
+        localize_widget_tree(self, current_language())
 
     @Slot(QModelIndex)
     def _on_table_clicked(self, index: QModelIndex) -> None:
@@ -12194,6 +12386,101 @@ class LLMConfig:
         self.enable_thinking = bool(enable_thinking)
         self.enable_chat_memory = bool(enable_chat_memory)
 
+
+def _llm_models_from_openai_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return []
+    models: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if isinstance(model_id, str) and model_id.strip():
+            models.append(model_id.strip())
+    return models
+
+
+def _llm_models_from_ollama_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("models")
+    if not isinstance(data, list):
+        return []
+    models: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            models.append(name.strip())
+    return models
+
+
+def _llm_model_endpoints(base_url: str) -> list[tuple[str, str]]:
+    """Return candidate (endpoint, backend_label) tuples."""
+    normalized = str(base_url or "").strip().rstrip("/")
+    if not normalized:
+        return []
+    candidates: list[tuple[str, str]] = []
+
+    def add(endpoint: str, label: str) -> None:
+        if endpoint and (endpoint, label) not in candidates:
+            candidates.append((endpoint, label))
+
+    # Ollama-style
+    add(f"{normalized}/api/tags", "Ollama")
+
+    # OpenAI-compatible
+    if normalized.endswith("/v1/models"):
+        add(normalized, "OpenAI-compatible")
+    elif normalized.endswith("/v1"):
+        add(f"{normalized}/models", "OpenAI-compatible")
+    else:
+        add(f"{normalized}/v1/models", "OpenAI-compatible")
+
+    return candidates
+
+
+def _fetch_llm_models(base_url: str, *, timeout_s: int = 6) -> tuple[list[str], str, str]:
+    """Return (models, backend_label, error)."""
+    for endpoint, backend in _llm_model_endpoints(base_url):
+        try:
+            req = Request(endpoint, headers={"User-Agent": "AstroPlanner"})
+            with urlopen(req, timeout=timeout_s) as resp:
+                raw = resp.read()
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as exc:  # noqa: BLE001
+            continue
+        models = _llm_models_from_ollama_payload(payload) if "ollama" in backend.lower() else _llm_models_from_openai_payload(payload)
+        if not models and "ollama" not in backend.lower():
+            # Some OpenAI-compatible servers return "models" instead of "data".
+            models = _llm_models_from_ollama_payload(payload)
+        if models:
+            return sorted(set(models)), backend, ""
+    return [], "", "No models endpoint responded."
+
+
+class LLMModelDiscoveryWorker(QThread):
+    modelsReady = Signal(list, str)
+    failed = Signal(str)
+
+    def __init__(self, url: str, *, timeout_s: int = 6, parent=None) -> None:
+        super().__init__(parent)
+        self.url = str(url or "").strip()
+        self.timeout_s = max(2, int(timeout_s))
+
+    def run(self) -> None:
+        if not self.url:
+            self.failed.emit("Set the LLM server URL first.")
+            return
+        models, backend, error = _fetch_llm_models(self.url, timeout_s=self.timeout_s)
+        if models:
+            self.modelsReady.emit(models, backend or "Detected")
+            return
+        self.failed.emit(error or "No models found.")
 
 AI_CHAT_SPACING_CHOICES = [
     ("compact", "Compact"),
@@ -12803,7 +13090,7 @@ class TargetTableModel(QAbstractTableModel):
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):  # noqa: N802
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
-            return self.headers[section]
+            return translate_text(self.headers[section], current_language())
         return None
 
     def sort(self, column: int, order: Qt.SortOrder = Qt.AscendingOrder) -> None:
@@ -16914,6 +17201,12 @@ class MainWindow(QMainWindow):
         # Persistent user settings
         self.settings = _create_app_settings()
         self.app_storage = getattr(self.settings, "storage", None)
+        try:
+            self._system_locale_name = str(QLocale.system().name() or "")
+        except Exception:
+            self._system_locale_name = str(locale.getdefaultlocale()[0] or "")
+        self._ui_language_choice = str(self.settings.value("general/uiLanguage", "system", type=str) or "system")
+        self._ui_language = set_current_language(self._ui_language_choice, system_locale=self._system_locale_name)
         self._workspace_plan_id = ""
         self._active_plan_id = ""
         self._active_plan_kind = "workspace"
@@ -17543,35 +17836,40 @@ class MainWindow(QMainWindow):
         filters_row_bottom.addStretch(1)
         filters_layout.addLayout(filters_row_bottom)
 
-        add_btn = QPushButton("Add Target…")
+        add_btn = QPushButton("Add")
         add_btn.setMinimumHeight(24)
         add_btn.clicked.connect(self._add_target_dialog)
+        add_btn.setToolTip("Add a new target to the plan")
         _set_button_variant(add_btn, "primary")
         _set_button_icon_kind(add_btn, "add")
 
-        toggle_obs_btn = QPushButton("Toggle Observed")
+        toggle_obs_btn = QPushButton("Observed")
         toggle_obs_btn.setMinimumHeight(24)
         toggle_obs_btn.clicked.connect(self._toggle_observed_selected)
+        toggle_obs_btn.setToolTip("Toggle observed state for the selected target")
         _set_button_variant(toggle_obs_btn, "neutral")
         _set_button_icon_kind(toggle_obs_btn, "toggle")
-        self.edit_object_btn = QPushButton("Edit Object…")
+        self.edit_object_btn = QPushButton("Edit")
         self.edit_object_btn.setMinimumHeight(24)
         self.edit_object_btn.clicked.connect(self._edit_object_for_selected)
         self.edit_object_btn.setEnabled(False)
+        self.edit_object_btn.setToolTip("Edit the selected target")
         _set_button_variant(self.edit_object_btn, "neutral")
         _set_button_icon_kind(self.edit_object_btn, "edit")
 
-        self.open_saved_plan_btn = QPushButton("Open Saved Plan…")
+        self.open_saved_plan_btn = QPushButton("Open Plan")
         self.open_saved_plan_btn.setMinimumHeight(24)
         self.open_saved_plan_btn.clicked.connect(self._open_saved_plan)
+        self.open_saved_plan_btn.setToolTip("Open a saved plan from local storage")
         _set_button_variant(self.open_saved_plan_btn, "secondary")
         _set_button_icon_kind(self.open_saved_plan_btn, "load")
-        self.save_plan_as_btn = QPushButton("Save Plan As…")
+        self.save_plan_as_btn = QPushButton("Save Plan")
         self.save_plan_as_btn.setMinimumHeight(24)
         self.save_plan_as_btn.clicked.connect(self._save_plan_as)
+        self.save_plan_as_btn.setToolTip("Save the current plan under a chosen name")
         _set_button_variant(self.save_plan_as_btn, "secondary")
         _set_button_icon_kind(self.save_plan_as_btn, "save")
-        suggest_targets_btn = QPushButton("Suggest Targets")
+        suggest_targets_btn = QPushButton("Suggest")
         suggest_targets_btn.setMinimumHeight(24)
         suggest_targets_btn.clicked.connect(self._ai_suggest_targets)
         suggest_targets_btn.setToolTip(
@@ -17580,15 +17878,16 @@ class MainWindow(QMainWindow):
         )
         _set_button_variant(suggest_targets_btn, "primary")
         _set_button_icon_kind(suggest_targets_btn, "suggest")
-        self.quick_targets_btn = QPushButton("Quick Targets")
+        self.quick_targets_btn = QPushButton("Quick")
         self.quick_targets_btn.setMinimumHeight(24)
         self.quick_targets_btn.clicked.connect(self._quick_add_suggested_targets)
         self._update_quick_targets_button_tooltip()
         _set_button_variant(self.quick_targets_btn, "primary")
         _set_button_icon_kind(self.quick_targets_btn, "quick")
-        self.seestar_session_btn = QPushButton("Seestar Session…")
+        self.seestar_session_btn = QPushButton("Seestar")
         self.seestar_session_btn.setMinimumHeight(24)
         self.seestar_session_btn.clicked.connect(self._open_seestar_session)
+        self.seestar_session_btn.setToolTip("Open Seestar session settings")
         _set_button_variant(self.seestar_session_btn, "neutral")
         _set_button_icon_kind(self.seestar_session_btn, "seestar")
         self.weather_btn = QPushButton("Weather")
@@ -17597,7 +17896,7 @@ class MainWindow(QMainWindow):
         self.weather_btn.clicked.connect(self._open_weather_window)
         _set_button_variant(self.weather_btn, "secondary")
         _set_button_icon_kind(self.weather_btn, "weather")
-        self.ai_toggle_btn = QPushButton("AI Assistant")
+        self.ai_toggle_btn = QPushButton("AI")
         self.ai_toggle_btn.setMinimumHeight(24)
         self.ai_toggle_btn.setCheckable(True)
         self.ai_toggle_btn.setChecked(False)
@@ -18034,7 +18333,37 @@ class MainWindow(QMainWindow):
         self._clock_timer.start(1000)
         self._update_status_bar()
         self._update_selected_details()
+        self._apply_localization()
         QTimer.singleShot(0, self._run_startup_sequence)
+
+    def _apply_localization(self) -> None:
+        lang = resolve_language_choice(
+            getattr(self, "_ui_language", current_language()),
+            system_locale=getattr(self, "_system_locale_name", ""),
+        )
+        set_current_language(lang, system_locale=getattr(self, "_system_locale_name", ""))
+        self._ui_language = lang
+        localize_widget_tree(self, lang)
+        if hasattr(self, "table_model"):
+            try:
+                self.table_model.headerDataChanged.emit(Qt.Horizontal, 0, self.table_model.columnCount() - 1)
+            except Exception:
+                pass
+        for dialog in (
+            getattr(self, "ai_window", None),
+            getattr(self, "weather_window", None),
+            getattr(self, "_bhtom_dialog", None),
+        ):
+            if not isinstance(dialog, QDialog):
+                continue
+            localize_widget_tree(dialog, lang)
+            model = getattr(dialog, "table_model", None)
+            if model is not None and hasattr(model, "columnCount") and hasattr(model, "headerDataChanged"):
+                try:
+                    model.headerDataChanged.emit(Qt.Horizontal, 0, model.columnCount() - 1)
+                except Exception:
+                    pass
+
     def _start_clock_worker(self):
         # Don’t create new workers while exiting
         if getattr(self, "_shutting_down", False):
@@ -18129,6 +18458,10 @@ class MainWindow(QMainWindow):
         self.dark_act.setChecked(bool(getattr(self, "_dark_enabled", False)))
         self.dark_act.setShortcutContext(Qt.ApplicationShortcut)
         self.dark_act.toggled.connect(lambda checked: self._set_dark_mode_enabled(bool(checked), persist=True))
+        self.quit_act = QAction("Quit", self, shortcut=QKeySequence.Quit)
+        self.quit_act.setMenuRole(QAction.QuitRole)
+        self.quit_act.setShortcutContext(Qt.ApplicationShortcut)
+        self.quit_act.triggered.connect(self.close)
         self.ai_describe_act = QAction("Describe selected object", self, shortcut=QKeySequence("Ctrl+I"))
         self.ai_describe_act.triggered.connect(self._ai_describe_target)
         self.ai_suggest_act = QAction("Suggest targets for tonight", self, shortcut=QKeySequence("Ctrl+Shift+I"))
@@ -18180,6 +18513,7 @@ class MainWindow(QMainWindow):
             self.exp_act,
             self.seestar_session_act,
             self.dark_act,
+            self.quit_act,
             self.ai_describe_act,
             self.ai_suggest_act,
             self.ai_warmup_act,
@@ -18206,7 +18540,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.dark_act)
         file_menu.addSeparator()
-        file_menu.addAction("E&xit", self.close)
+        file_menu.addAction(self.quit_act)
 
         target_menu = menubar.addMenu("&Targets")
         target_menu.addAction(self.add_act)
@@ -18233,14 +18567,17 @@ class MainWindow(QMainWindow):
         # Settings menu
         settings_menu = menubar.addMenu("&Settings")
         self.gen_settings_act = QAction("General Settings…", self)
+        self.gen_settings_act.setMenuRole(QAction.NoRole)
         self.gen_settings_act.setShortcuts([QKeySequence("Ctrl+,"), QKeySequence("Ctrl+;")])
         self.gen_settings_act.setShortcutContext(Qt.ApplicationShortcut)
         self.gen_settings_act.triggered.connect(self.open_general_settings)
         settings_menu.addAction(self.gen_settings_act)
         self.tbl_settings_act = QAction("Table Settings…", self)
+        self.tbl_settings_act.setMenuRole(QAction.NoRole)
         self.tbl_settings_act.triggered.connect(self.open_table_settings)
         settings_menu.addAction(self.tbl_settings_act)
         self.obs_manager_act = QAction("Observatory Manager…", self)
+        self.obs_manager_act.setMenuRole(QAction.NoRole)
         self.obs_manager_act.triggered.connect(self._open_observatory_manager)
         settings_menu.addAction(self.obs_manager_act)
 
@@ -18560,6 +18897,8 @@ class MainWindow(QMainWindow):
         prev_color_blind_mode = bool(getattr(self, "color_blind_mode", False))
         prev_radar_sweep_enabled = bool(getattr(self, "_radar_sweep_enabled", False))
         prev_radar_sweep_speed = int(getattr(self, "_radar_sweep_speed", 140))
+        prev_ui_language_choice = str(getattr(self, "_ui_language_choice", "system") or "system")
+        prev_ui_language = str(getattr(self, "_ui_language", current_language()) or current_language())
         self.show_sun_path  = self.settings.value("general/showSunPath",  True, type=bool)
         self.show_moon_path = self.settings.value("general/showMoonPath", True, type=bool)
         self.show_obj_path  = self.settings.value("general/showObjPath",  True, type=bool)
@@ -18567,6 +18906,12 @@ class MainWindow(QMainWindow):
         self._theme_name = normalize_theme_key(self.settings.value("general/uiTheme", DEFAULT_UI_THEME, type=str))
         self._accent_secondary_override = self._load_accent_secondary_override(self._theme_name)
         self._ui_font_size = _sanitize_ui_font_size(self.settings.value("general/uiFontSize", 11, type=int))
+        self._ui_language_choice = str(self.settings.value("general/uiLanguage", "system", type=str) or "system")
+        self._ui_language = resolve_language_choice(
+            self._ui_language_choice,
+            system_locale=getattr(self, "_system_locale_name", ""),
+        )
+        set_current_language(self._ui_language, system_locale=getattr(self, "_system_locale_name", ""))
         self.color_blind_mode = self.settings.value("general/colorBlindMode", False, type=bool)
         self._radar_sweep_enabled = self.settings.value("general/radarSweepAnimation", False, type=bool)
         self._radar_sweep_speed = max(40, min(260, self.settings.value("general/radarSweepSpeed", 140, type=int)))
@@ -18652,6 +18997,12 @@ class MainWindow(QMainWindow):
                 prev_radar_sweep_speed != self._radar_sweep_speed,
             )
         )
+        language_changed = any(
+            (
+                prev_ui_language_choice != self._ui_language_choice,
+                prev_ui_language != self._ui_language,
+            )
+        )
         self._refresh_ai_warm_indicator()
         self._refresh_ai_context_hint()
         self._apply_ai_chat_font()
@@ -18694,6 +19045,8 @@ class MainWindow(QMainWindow):
         if style_changed:
             self._apply_table_settings()
             self._apply_styles()
+        if language_changed:
+            self._apply_localization()
         self._update_radar_sweep_state()
         self._update_status_bar()
         self._refresh_weather_window_context()
@@ -18739,10 +19092,10 @@ class MainWindow(QMainWindow):
             )
 
         if hasattr(self, "ai_context_hint"):
-            self.ai_context_hint.setText(hint_text)
-            self.ai_context_hint.setToolTip(hint_tooltip)
+            set_translated_text(self.ai_context_hint, hint_text, current_language())
+            set_translated_tooltip(self.ai_context_hint, hint_tooltip, current_language())
         if hasattr(self, "ai_input"):
-            self.ai_input.setToolTip(input_tooltip)
+            set_translated_tooltip(self.ai_input, input_tooltip, current_language())
 
     def _refresh_ai_knowledge_hint(self, titles: Optional[list[str]] = None) -> None:
         if titles is not None:
@@ -18759,8 +19112,8 @@ class MainWindow(QMainWindow):
             text = "Using local knowledge: none"
             tooltip = "No local knowledge notes were added to the most recent AI prompt."
         if hasattr(self, "ai_knowledge_hint"):
-            self.ai_knowledge_hint.setText(text)
-            self.ai_knowledge_hint.setToolTip(tooltip)
+            set_translated_text(self.ai_knowledge_hint, text, current_language())
+            set_translated_tooltip(self.ai_knowledge_hint, tooltip, current_language())
 
     @Slot()
     def _focus_ai_input(self) -> None:
@@ -18875,32 +19228,38 @@ class MainWindow(QMainWindow):
         if hasattr(self, "min_moon_sep_spin") and self.min_moon_sep_spin.value() > 0:
             parts.append(f"moon≥{self.min_moon_sep_spin.value()}°")
         if hasattr(self, "hide_observed_chk") and self.hide_observed_chk.isChecked():
-            parts.append("hide observed")
+            parts.append(translate_text("hide observed", current_language()))
         if hasattr(self, "sun_alt_limit_spin"):
             parts.append(f"sun≤{self._sun_alt_limit():.0f}°")
 
         total = len(self.targets)
         visible = sum(1 for flag in self.table_model.row_enabled if flag) if self.table_model.row_enabled else total
-        active_filters = ", ".join(parts) if parts else "none"
-        self.status_filters_label.setText(f"Filters: {active_filters} | Visible: {visible}/{total}")
+        active_filters = ", ".join(parts) if parts else translate_text("none", current_language())
+        set_translated_text(
+            self.status_filters_label,
+            f"Filters: {active_filters} | Visible: {visible}/{total}",
+            current_language(),
+        )
 
         if self.worker is not None and self.worker.isRunning():
-            self.status_calc_label.setText("Last calc: running...")
+            set_translated_text(self.status_calc_label, "Last calc: running...", current_language())
             return
         stats = self._last_calc_stats
         if stats.total_targets > 0:
-            self.status_calc_label.setText(
-                f"Last calc: {stats.duration_s:.2f}s | {stats.visible_targets}/{stats.total_targets}"
+            set_translated_text(
+                self.status_calc_label,
+                f"Last calc: {stats.duration_s:.2f}s | {stats.visible_targets}/{stats.total_targets}",
+                current_language(),
             )
         else:
-            self.status_calc_label.setText("Last calc: -")
+            set_translated_text(self.status_calc_label, "Last calc: -", current_language())
 
     @Slot(object, object)
     def _update_selected_details(self, *_):
         rows = self._selected_rows()
         if not rows:
             self.sel_name_label.setText("-")
-            self.sel_type_title_label.setText("Type / Mag:")
+            set_translated_text(self.sel_type_title_label, "Type / Mag:", current_language())
             self.sel_type_label.setText("-")
             self.sel_score_label.setText("-")
             self.sel_window_label.setText("-")
@@ -18921,8 +19280,10 @@ class MainWindow(QMainWindow):
         tgt = self.targets[row]
         self._ensure_known_target_type(tgt)
         self.sel_name_label.setText(tgt.name)
-        self.sel_type_title_label.setText(
-            "Type / Last Mag:" if _target_magnitude_label(tgt) == "Last Mag" else "Type / Mag:"
+        set_translated_text(
+            self.sel_type_title_label,
+            "Type / Last Mag:" if _target_magnitude_label(tgt) == "Last Mag" else "Type / Mag:",
+            current_language(),
         )
         mag_txt = f"{tgt.magnitude:.2f}" if tgt.magnitude is not None else "-"
         type_txt = tgt.object_type or "-"
@@ -21109,7 +21470,9 @@ class MainWindow(QMainWindow):
         sel_names = [self.targets[i].name for i in sel_rows]
         for name, line, is_over in self.vis_lines:
             self._apply_visibility_line_style(line, is_over=is_over, is_selected=(name in sel_names))
-        self.plot_canvas.draw_idle()
+        plot_canvas = getattr(self, "plot_canvas", None)
+        if plot_canvas is not None:
+            plot_canvas.draw_idle()
         if isinstance(getattr(self, "last_payload", None), dict):
             self._render_visibility_web_plot(self.last_payload)
 
@@ -22320,6 +22683,7 @@ class MainWindow(QMainWindow):
         panel = self._build_ai_panel(window)
         window_l.addWidget(panel, 1)
         window.finished.connect(self._on_ai_window_finished)
+        localize_widget_tree(window, current_language())
         return window
 
     def _ensure_ai_window(self) -> QDialog:
@@ -22349,7 +22713,7 @@ class MainWindow(QMainWindow):
             else:
                 ai_window.hide()
         if hasattr(self, "ai_toggle_btn"):
-            self.ai_toggle_btn.setText("Hide AI" if checked else "AI Assistant")
+            set_translated_text(self.ai_toggle_btn, "Hide AI" if checked else "AI", current_language())
 
     @Slot(int)
     def _on_ai_window_finished(self, _result: int) -> None:
@@ -22360,7 +22724,7 @@ class MainWindow(QMainWindow):
         blocker = QSignalBlocker(self.ai_toggle_btn)
         self.ai_toggle_btn.setChecked(False)
         del blocker
-        self.ai_toggle_btn.setText("AI Assistant")
+        set_translated_text(self.ai_toggle_btn, "AI", current_language())
 
     def _llm_warmup_cache_key(self) -> tuple[str, str]:
         return (
@@ -22460,8 +22824,8 @@ class MainWindow(QMainWindow):
             badge_glow_color = self._theme_qcolor("state_success", "#67ff9a")
 
         if hasattr(self, "ai_warm_badge_label"):
-            self.ai_warm_badge_label.setText(badge_text)
-            self.ai_warm_badge_label.setToolTip(badge_text)
+            set_translated_text(self.ai_warm_badge_label, badge_text, current_language())
+            set_translated_tooltip(self.ai_warm_badge_label, badge_text, current_language())
             _set_label_tone(self.ai_warm_badge_label, badge_tone)
             self._apply_label_glow_effect(self.ai_warm_badge_label, badge_glow_color, blur_radius=22.0)
 
@@ -23081,6 +23445,21 @@ class MainWindow(QMainWindow):
         if not requested_family and target is not None:
             requested_family = self._target_class_family(target)
 
+        if target is None and not requested_family:
+            global_note_tags = {
+                "bhtom",
+                "last-mag-vs-mag",
+                "simbad",
+                "tns",
+                "gaia-alerts",
+                "best-window",
+                "moonlight",
+                "choosing-between-similar-targets",
+                "small-scope-practicality",
+            }
+            if not (request_tags & global_note_tags):
+                return []
+
         ranked: list[tuple[int, KnowledgeNote]] = []
         for note in notes:
             note_family = self._knowledge_note_family(note)
@@ -23249,7 +23628,7 @@ class MainWindow(QMainWindow):
         return "Local knowledge notes:\n" + "\n".join(snippets)
 
     def _build_local_object_fact_answer(self, question: str) -> Optional[str]:
-        target = self._find_referenced_target_in_question(question)
+        target = self._resolve_object_query_target(question, selected_target=self._selected_target_or_none())
         if target is None:
             return None
 
@@ -23272,7 +23651,7 @@ class MainWindow(QMainWindow):
             "galaxy": "galaxy",
             "star": "star",
         }
-        if requested_marker:
+        if requested_marker and self._looks_like_object_class_query(normalized):
             matches = self._type_matches_requested_class(type_label, requested_marker)
             class_label = class_label_map.get(requested_marker, requested_marker)
             if matches:
@@ -23309,6 +23688,128 @@ class MainWindow(QMainWindow):
             return answer
 
         return None
+
+    @staticmethod
+    def _looks_like_observing_guidance_query(text: str) -> bool:
+        normalized = _normalize_catalog_display_name(text).lower()
+        if not normalized:
+            return False
+        phrases = (
+            "how to observe",
+            "how should i observe",
+            "best way to observe",
+            "observe it",
+            "how do i observe",
+            "jak obserwowac",
+            "jak obserwować",
+            "jak go obserwowac",
+            "jak go obserwować",
+            "jak powinienem obserwowac",
+            "jak powinienem obserwować",
+            "jak powinienem go obserwowac",
+            "jak powinienem go obserwować",
+            "jak obserwowac ten",
+            "jak obserwować ten",
+        )
+        return any(phrase in normalized for phrase in phrases)
+
+    def _build_local_object_observing_answer(self, question: str) -> Optional[str]:
+        if not self._looks_like_observing_guidance_query(question):
+            return None
+
+        target = self._resolve_object_query_target(question, selected_target=self._selected_target_or_none())
+        if target is None:
+            return None
+
+        self._ensure_known_target_type(target)
+        family = self._target_class_family(target)
+        metrics = self.target_metrics.get(target.name)
+        best_window = self._format_target_best_window_compact(target)
+
+        row_index: Optional[int] = None
+        for idx, existing in enumerate(self.targets):
+            if _targets_match(existing, target):
+                row_index = idx
+                break
+
+        moon_sep_now: Optional[float] = None
+        if row_index is not None and row_index < len(self.table_model.current_seps):
+            candidate = self.table_model.current_seps[row_index]
+            if math.isfinite(candidate):
+                moon_sep_now = float(candidate)
+
+        moon_sep_threshold = float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0
+        magnitude_label = _target_magnitude_label(target)
+        magnitude_text = (
+            f"{magnitude_label} {float(target.magnitude):.2f}"
+            if target.magnitude is not None and math.isfinite(float(target.magnitude))
+            else ""
+        )
+
+        is_polish = any(
+            token in _normalize_catalog_display_name(question).lower()
+            for token in ("jak ", "obserw", "dzis", "dziś", "księ", "ksie", "powinienem")
+        )
+
+        if is_polish:
+            lines: list[str] = []
+            lead = f"{target.name}: "
+            lead_parts: list[str] = []
+            if best_window:
+                lead_parts.append(f"najlepsze okno {best_window}")
+            if metrics is not None:
+                lead_parts.append(f"max alt {metrics.max_altitude_deg:.0f}°")
+                lead_parts.append(f"ponad limit {metrics.hours_above_limit:.1f} h")
+            if magnitude_text:
+                lead_parts.append(magnitude_text)
+            if lead_parts:
+                lines.append(lead + ", ".join(lead_parts) + ".")
+            else:
+                lines.append(f"{target.name}: obserwuj go w najwyższym segmencie dostępnego okna.")
+
+            if family in {"Supernova", "Nova", "Cataclysmic variable", "AGN"}:
+                lines.append("To kompaktowy cel punktowy: priorytet to niski airmass, stabilne prowadzenie i dłuższa ciągła integracja.")
+            elif family == "Galaxy":
+                lines.append("To cel rozmyty: ważniejsze są ciemniejsze niebo i najwyższy fragment okna niż sam score.")
+            else:
+                lines.append("Priorytetem jest najwyższy fragment okna i możliwie niski airmass, a nie krótkie przeskoki między celami.")
+
+            if moon_sep_now is not None and moon_sep_threshold > 0:
+                if moon_sep_now >= moon_sep_threshold:
+                    lines.append(f"Separacja od Księżyca {moon_sep_now:.1f}° jest bezpieczna względem progu {moon_sep_threshold:.0f}°.")
+                else:
+                    lines.append(f"Separacja od Księżyca {moon_sep_now:.1f}° jest poniżej progu {moon_sep_threshold:.0f}°; kontrast może być gorszy.")
+
+            return "\n".join(f"- {line}" for line in lines[:3])
+
+        lines_en: list[str] = []
+        lead_parts_en: list[str] = []
+        if best_window:
+            lead_parts_en.append(f"best window {best_window}")
+        if metrics is not None:
+            lead_parts_en.append(f"max alt {metrics.max_altitude_deg:.0f}°")
+            lead_parts_en.append(f"over limit {metrics.hours_above_limit:.1f} h")
+        if magnitude_text:
+            lead_parts_en.append(magnitude_text)
+        if lead_parts_en:
+            lines_en.append(f"{target.name}: " + ", ".join(lead_parts_en) + ".")
+        else:
+            lines_en.append(f"{target.name}: observe it during the highest-altitude segment of the available window.")
+
+        if family in {"Supernova", "Nova", "Cataclysmic variable", "AGN"}:
+            lines_en.append("Treat it as a compact point source: prioritize low airmass, stable tracking, and longer continuous integration.")
+        elif family == "Galaxy":
+            lines_en.append("Treat it as a diffuse target: dark sky and the highest clean segment matter more than score alone.")
+        else:
+            lines_en.append("Prioritize the highest segment of the window and lower airmass rather than hopping between short looks.")
+
+        if moon_sep_now is not None and moon_sep_threshold > 0:
+            if moon_sep_now >= moon_sep_threshold:
+                lines_en.append(f"Moon separation {moon_sep_now:.1f}° is safely above the {moon_sep_threshold:.0f}° threshold.")
+            else:
+                lines_en.append(f"Moon separation {moon_sep_now:.1f}° is below the {moon_sep_threshold:.0f}° threshold, so contrast may suffer.")
+
+        return "\n".join(f"- {line}" for line in lines_en[:3])
 
     @staticmethod
     def _find_normalized_text_position(text: str, candidate: str) -> Optional[int]:
@@ -23397,6 +23898,83 @@ class MainWindow(QMainWindow):
             "jak obserwować ten cel",
         )
         return any(phrase in normalized for phrase in explicit_phrases)
+
+    @staticmethod
+    def _looks_like_object_class_query(text: str) -> bool:
+        normalized = _normalize_catalog_display_name(text).lower()
+        if not normalized:
+            return False
+        class_markers = (
+            "what type",
+            "type of object",
+            "what kind",
+            "classified as",
+            "classification",
+            "class of object",
+            "what is",
+            "czym jest",
+            "co to jest",
+            "co to za obiekt",
+            "jaki typ",
+            "jaki to typ",
+            "jaki to obiekt",
+            "czy to",
+            "czy ten",
+            "czy ta",
+            "czy jest",
+            "is it",
+            "is this",
+            "is that",
+            "is the",
+        )
+        if any(marker in normalized for marker in class_markers):
+            return True
+        return normalized.startswith("is ")
+
+    def _resolve_recent_chat_target_reference(self, *, max_messages: int = 6) -> Optional[Target]:
+        if not bool(getattr(self.llm_config, "enable_chat_memory", False)):
+            return None
+
+        recent_user_texts: list[str] = []
+        recent_ai_texts: list[str] = []
+        for message in reversed(self._ai_messages):
+            kind = str(message.get("kind", "") or "").strip().lower()
+            if kind not in {"user", "ai"}:
+                continue
+            text = str(message.get("text", "") or "").strip()
+            if not text:
+                continue
+            if kind == "user":
+                recent_user_texts.append(text)
+            else:
+                recent_ai_texts.append(text)
+            if len(recent_user_texts) + len(recent_ai_texts) >= max_messages:
+                break
+
+        for text in recent_user_texts:
+            target = self._find_referenced_target_in_question(text)
+            if target is not None:
+                return target
+        for text in recent_ai_texts:
+            target = self._find_referenced_target_in_question(text)
+            if target is not None:
+                return target
+        return None
+
+    def _resolve_object_query_target(self, question: str, *, selected_target: Optional[Target]) -> Optional[Target]:
+        explicit_target = self._find_referenced_target_in_question(question)
+        if explicit_target is not None:
+            return explicit_target
+
+        if self._looks_like_object_scoped_query(question):
+            recent_target = self._resolve_recent_chat_target_reference()
+            if recent_target is not None:
+                return recent_target
+            return selected_target
+
+        if selected_target is not None and self._should_auto_route_selected_target_query(question, selected_target):
+            return selected_target
+        return None
 
     def _should_auto_route_selected_target_query(self, text: str, target: Optional[Target]) -> bool:
         if target is None:
@@ -23588,6 +24166,7 @@ class MainWindow(QMainWindow):
         "You are an expert astronomy observation assistant. "
         "Provide concise, practical, and accurate guidance for planning observations. "
         "Keep answers compact by default and avoid unnecessary background. "
+        "Do not repeat the same metric, sentence, or recommendation. "
         "Use only the provided session context when answering questions about tonight's plan. "
         "If local knowledge notes are included, treat them as grounded heuristics and caveats for practical advice. "
         "Do not introduce targets that are not listed in the provided session context unless the user explicitly asks for off-plan suggestions. "
@@ -24870,6 +25449,18 @@ class MainWindow(QMainWindow):
         if not text:
             return
         worker = self._llm_worker
+        selected_target = self._selected_target_or_none()
+        resolved_object_target = self._resolve_object_query_target(text, selected_target=selected_target)
+        local_observing_answer = self._build_local_object_observing_answer(text)
+        if local_observing_answer is not None and not (worker is not None and worker.isRunning()):
+            self.ai_input.clear()
+            if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
+                self.ai_toggle_btn.setChecked(True)
+            self._refresh_ai_knowledge_hint([])
+            self._append_ai_message(text, is_user=True)
+            self._append_ai_message(local_observing_answer, is_ai=True)
+            self._set_ai_status("Ready", tone="info")
+            return
         local_fact_answer = self._build_local_object_fact_answer(text)
         if local_fact_answer is not None and not (worker is not None and worker.isRunning()):
             self.ai_input.clear()
@@ -24880,8 +25471,7 @@ class MainWindow(QMainWindow):
             self._append_ai_message(local_fact_answer, is_ai=True)
             self._set_ai_status("Ready", tone="info")
             return
-        selected_target = self._selected_target_or_none()
-        if self._looks_like_object_scoped_query(text) and selected_target is None:
+        if self._looks_like_object_scoped_query(text) and resolved_object_target is None:
             QMessageBox.information(
                 self,
                 "No selection",
@@ -24890,9 +25480,9 @@ class MainWindow(QMainWindow):
             return
 
         self.ai_input.clear()
-        if self._should_auto_route_selected_target_query(text, selected_target):
+        if self._should_auto_route_selected_target_query(text, resolved_object_target):
             self._dispatch_selected_target_llm_question(
-                selected_target,
+                resolved_object_target,
                 text,
                 label=text,
             )
@@ -24900,8 +25490,12 @@ class MainWindow(QMainWindow):
 
         context = self._build_session_context(user_question=text)
         recent_memory = self._build_recent_chat_memory_block()
-        referenced_target = self._find_referenced_target_in_question(text)
-        knowledge_notes = self._select_knowledge_notes(question=text, target=referenced_target)
+        knowledge_target = (
+            resolved_object_target
+            if self._looks_like_object_scoped_query(text)
+            else self._find_referenced_target_in_question(text)
+        )
+        knowledge_notes = self._select_knowledge_notes(question=text, target=knowledge_target)
         knowledge_context = (
             "Local knowledge notes:\n"
             + "\n".join(self._format_knowledge_note_snippet(note) for note in knowledge_notes)
@@ -24938,15 +25532,25 @@ class MainWindow(QMainWindow):
             f"Selected object context:\n"
             f"{compact_description}\n\n"
             f"User question about the selected object: {question}\n\n"
-            "Answer in no more than 4 short sentences and stay grounded in the selected object context. "
-            "Treat the provided Type and Class family fields as authoritative for classification questions."
+            "Answer in at most 3 short sentences or 3 short bullets and stay grounded in the selected object context. "
+            "Treat the provided Type and Class family fields as authoritative for classification questions. "
+            "Do not switch to a different object. Do not recommend other targets unless the user explicitly asks. "
+            "Do not repeat the same metric, sentence, or phrase."
         )
         return "\n\n".join(prompt_sections)
 
     def _build_fast_general_llm_prompt(self, question: str) -> str:
         recent_memory = self._build_recent_chat_memory_block()
-        referenced_target = self._find_referenced_target_in_question(question)
-        knowledge_notes = self._select_knowledge_notes(question=question, target=referenced_target)
+        resolved_object_target = self._resolve_object_query_target(
+            question,
+            selected_target=self._selected_target_or_none(),
+        )
+        knowledge_target = (
+            resolved_object_target
+            if self._looks_like_object_scoped_query(question)
+            else self._find_referenced_target_in_question(question)
+        )
+        knowledge_notes = self._select_knowledge_notes(question=question, target=knowledge_target)
         knowledge_context = (
             "Local knowledge notes:\n"
             + "\n".join(self._format_knowledge_note_snippet(note) for note in knowledge_notes)
@@ -25341,14 +25945,31 @@ class MainWindow(QMainWindow):
                 list_kind = None
                 list_items = []
                 return
-            tag = "ol" if list_kind == "ol" else "ul"
-            items_html = "".join(
-                f"<li>{self._format_ai_message_inline_markdown(html_module.escape(item))}</li>"
-                for item in list_items
-            )
-            blocks.append(
-                f'<{tag} style="margin:4px 0 4px 18px;padding:0;">{items_html}</{tag}>'
-            )
+            if list_kind == "ol":
+                rows_html = "".join(
+                    (
+                        '<tr>'
+                        f'<td valign="top" style="padding:0 8px 4px 0;white-space:nowrap;font-weight:600;">{idx}.</td>'
+                        f'<td valign="top" style="padding:0 0 4px 0;">'
+                        f'{self._format_ai_message_inline_markdown(html_module.escape(item))}'
+                        "</td>"
+                        "</tr>"
+                    )
+                    for idx, item in enumerate(list_items, start=1)
+                )
+                blocks.append(
+                    '<table style="margin:4px 0 4px 0;border:none;border-collapse:collapse;">'
+                    f"{rows_html}"
+                    "</table>"
+                )
+            else:
+                items_html = "".join(
+                    f"<li>{self._format_ai_message_inline_markdown(html_module.escape(item))}</li>"
+                    for item in list_items
+                )
+                blocks.append(
+                    f'<ul style="margin:4px 0 4px 18px;padding:0;">{items_html}</ul>'
+                )
             list_kind = None
             list_items = []
 
