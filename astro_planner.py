@@ -23084,8 +23084,9 @@ class MainWindow(QMainWindow):
         ranked: list[tuple[int, KnowledgeNote]] = []
         for note in notes:
             note_family = self._knowledge_note_family(note)
-            if requested_family and note_family and note_family != requested_family:
-                continue
+            if requested_family and "object-classes" in note.path.parts:
+                if note_family != requested_family:
+                    continue
             score = self._knowledge_note_score(note, request_tags=request_tags, question=question, target=target)
             if score <= 0:
                 continue
