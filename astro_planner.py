@@ -22986,13 +22986,23 @@ class MainWindow(QMainWindow):
                 "lun", "bright moon",
             ),
             "bhtom": ("bhtom", "importance", "last mag", "last magnitude"),
+            "last-mag-vs-mag": ("last mag", "last magnitude", "catalog mag", "mag vs last mag"),
             "simbad": ("simbad",),
+            "tns": ("tns", "transient name server"),
             "gaia-alerts": ("gaia alert", "gaia alerts", "gaia-alerts"),
             "best-window": (
                 "best window", "window", "over limit", "score", "order", "kolejn", "airmass",
                 "altitude", "wysok", "horizon", "horyzont", "when observe", "kiedy obserw",
             ),
             "practical-observing": ("observe", "obserw", "how should i", "jak powinienem"),
+            "choosing-between-similar-targets": (
+                "which is best", "which one is best", "ktory najlepiej", "która najlepiej",
+                "porown", "porówn", "compare", "comparison", "vs", "better target",
+            ),
+            "small-scope-practicality": (
+                "small scope", "small telescope", "small setup", "seestar",
+                "easy target", "practical", "realistically", "ma sens",
+            ),
         }
         for tag, markers in keyword_map.items():
             if any(marker in normalized_question for marker in markers):
@@ -23016,6 +23026,11 @@ class MainWindow(QMainWindow):
                 tags.add("galaxy")
             elif family == "Star":
                 tags.add("star")
+                type_norm = _normalize_catalog_display_name(target.object_type).lower()
+                if "variable" in type_norm:
+                    tags.add("variable-star")
+            if "cluster" in _normalize_catalog_display_name(target.object_type).lower():
+                tags.add("open-cluster")
             source_tag = _normalize_knowledge_tag(target.source_catalog)
             if source_tag:
                 tags.add(source_tag)
