@@ -303,6 +303,52 @@ class KnowledgeNote:
     sections: dict[str, list[str]]
 
 
+@dataclass(frozen=True)
+class ClassQuerySpec:
+    requested_class: str
+    count: int
+    wants_list: bool
+    wants_more: bool
+    choice_followup: bool
+    prefer_bhtom_only: bool = False
+    exclude_observed: bool = False
+    exclude_previous_results: bool = False
+    prefer_brighter: bool = False
+
+
+@dataclass(frozen=True)
+class ObjectQuerySpec:
+    target: Optional[Target]
+    object_scoped: bool
+    wants_guidance: bool
+    wants_fact: bool
+    wants_selected_llm: bool
+    blocked_no_selection: bool
+
+
+@dataclass(frozen=True)
+class CompareQuerySpec:
+    targets: tuple[Target, ...]
+    criterion: str
+    return_best_only: bool
+    include_reason: bool
+
+
+@dataclass(frozen=True)
+class AIIntent:
+    kind: str
+    question: str
+    label: str
+    target: Optional[Target] = None
+    requested_class: str = ""
+    class_query: Optional[ClassQuerySpec] = None
+    object_query: Optional[ObjectQuerySpec] = None
+    compare_query: Optional[CompareQuerySpec] = None
+    local_text: str = ""
+    suggested_targets: tuple[Target, ...] = ()
+    action_targets: tuple[Target, ...] = ()
+
+
 def _decode_simbad_value(value: object) -> str:
     if isinstance(value, (bytes, bytearray)):
         return value.decode("utf-8", errors="ignore").strip()
@@ -1013,9 +1059,11 @@ def _rank_local_target_suggestions_from_candidates(
         end_idx = min(int(best_run[-1]) + 1, len(time_datetimes) - 1)
         window_start = time_datetimes[start_idx]
         window_end = time_datetimes[end_idx]
-        best_window_airmass = _airmass_from_altitude_values(altitude[best_run])
-        finite_window_airmass = best_window_airmass[np.isfinite(best_window_airmass)]
-        best_airmass = float(np.min(finite_window_airmass)) if finite_window_airmass.size > 0 else None
+        # Airmass filter/display should reflect "any time during the observing night"
+        # (sun-alt + altitude-limit mask), not only the longest best-window run.
+        night_airmass = _airmass_from_altitude_values(altitude[valid_mask])
+        finite_night_airmass = night_airmass[np.isfinite(night_airmass)]
+        best_airmass = float(np.min(finite_night_airmass)) if finite_night_airmass.size > 0 else None
         finite_window_moon_sep = moon_sep[best_run][np.isfinite(moon_sep[best_run])]
         min_window_moon_sep = (
             float(np.min(finite_window_moon_sep))
@@ -3981,6 +4029,14 @@ class GeneralSettingsDialog(QDialog):
         bhtom_hdr.setObjectName("SectionHint")
         integrations_layout.addRow(bhtom_hdr)
         integrations_layout.addRow("BHTOM API token:", self.bhtom_api_edit)
+        self.bhtom_refresh_startup_chk = QCheckBox("Always refresh BHTOM cache on startup", self)
+        self.bhtom_refresh_startup_chk.setChecked(
+            parent.settings.value("general/bhtomRefreshOnStartup", True, type=bool)
+            if parent and hasattr(parent, "settings")
+            else True
+        )
+        self.bhtom_refresh_startup_chk.setToolTip("Fetch a fresh BHTOM candidate list after launch and overwrite cache.")
+        integrations_layout.addRow(self.bhtom_refresh_startup_chk)
 
         # TNS credentials (optional, used for TNS resolver)
         self.tns_api_edit = QLineEdit(self)
@@ -4120,7 +4176,8 @@ class GeneralSettingsDialog(QDialog):
 
         custom_hint = QLabel(
             "Custom conditions URL is configured per observatory in Observatory Manager. "
-            "JSON contract: temp_c, wind_ms, cloud_pct, rh_pct (required), pressure_hpa/updated_utc/source_label (optional).",
+            "Accepted formats: AstroPlanner JSON (temp_c/wind_ms/cloud_pct/rh_pct/pressure_hpa; missing values show as N/A) "
+            "or Weather.com PWS observations/all/1day JSON.",
             self,
         )
         custom_hint.setObjectName("SectionHint")
@@ -4381,6 +4438,7 @@ class GeneralSettingsDialog(QDialog):
         s.setValue("llm/chatMessageWidth", llm_chat_width)
         s.setValue("llm/statusErrorClearSec", llm_status_error_clear_s)
         s.setValue("general/bhtomApiToken", self.bhtom_api_edit.text().strip())
+        s.setValue("general/bhtomRefreshOnStartup", bool(self.bhtom_refresh_startup_chk.isChecked()))
         s.setValue("general/tnsApiKey", self.tns_api_edit.text().strip())
         s.setValue("general/tnsBotId", self.tns_bot_id_edit.text().strip())
         s.setValue("general/tnsBotName", self.tns_bot_name_edit.text().strip())
@@ -6675,34 +6733,46 @@ class WeatherLiveWorker(QThread):
         if not isinstance(payload, dict):
             raise RuntimeError("Custom URL must return a JSON object.")
 
+        observations = payload.get("observations")
+        if isinstance(observations, list) and any(isinstance(row, dict) for row in observations):
+            return WeatherLiveWorker._parse_weathercom_pws_payload(payload, fallback_label)
+
         current = payload.get("current") if isinstance(payload.get("current"), dict) else payload
         if not isinstance(current, dict):
             raise RuntimeError("Custom JSON current block is invalid.")
 
-        temp = _safe_float(current.get("temp_c"))
-        wind = _safe_float(current.get("wind_ms"))
-        cloud = _safe_float(current.get("cloud_pct"))
-        rh = _safe_float(current.get("rh_pct"))
-        if any(value is None for value in (temp, wind, cloud, rh)):
+        metric_values = {
+            "temp_c": _safe_float(current.get("temp_c")),
+            "wind_ms": _safe_float(current.get("wind_ms")),
+            "cloud_pct": _safe_float(current.get("cloud_pct")),
+            "rh_pct": _safe_float(current.get("rh_pct")),
+            "pressure_hpa": _safe_float(current.get("pressure_hpa")),
+        }
+        if all(value is None for value in metric_values.values()):
             raise RuntimeError(
-                "Custom JSON must include temp_c, wind_ms, cloud_pct and rh_pct in current/top-level object."
+                "Custom JSON must include at least one of temp_c, wind_ms, cloud_pct, rh_pct or pressure_hpa "
+                "in current/top-level object."
             )
-        pressure = _safe_float(current.get("pressure_hpa"))
         updated_utc = str(current.get("updated_utc") or payload.get("updated_utc") or "").strip()
         if not updated_utc:
             updated_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         label = str(current.get("source_label") or payload.get("source_label") or fallback_label).strip()
+        missing_metrics = [key for key, value in metric_values.items() if value is None]
+        status = "partial" if missing_metrics else "ok"
+        note = "Custom station endpoint."
+        if missing_metrics:
+            note = f"Custom station endpoint. Missing: {', '.join(missing_metrics)}."
         provider = {
             "label": label or fallback_label,
             "source_label": label or fallback_label,
-            "temp_c": float(temp),
-            "wind_ms": float(wind),
-            "cloud_pct": float(cloud),
-            "rh_pct": float(rh),
-            "pressure_hpa": pressure,
-            "status": "ok",
+            "temp_c": metric_values["temp_c"],
+            "wind_ms": metric_values["wind_ms"],
+            "cloud_pct": metric_values["cloud_pct"],
+            "rh_pct": metric_values["rh_pct"],
+            "pressure_hpa": metric_values["pressure_hpa"],
+            "status": status,
             "updated_utc": updated_utc,
-            "note": "Custom station endpoint.",
+            "note": note,
             "categories": ["conditions"],
         }
 
@@ -6715,6 +6785,114 @@ class WeatherLiveWorker(QThread):
             "cloud_pct": WeatherLiveWorker._to_float_list(series_payload.get("cloud_pct")),
             "rh_pct": WeatherLiveWorker._to_float_list(series_payload.get("rh_pct")),
             "pressure_hpa": WeatherLiveWorker._to_float_list(series_payload.get("pressure_hpa")),
+        }
+        return provider, series
+
+    @staticmethod
+    def _parse_weathercom_pws_payload(payload: dict[str, object], fallback_label: str) -> tuple[dict[str, object], dict[str, object]]:
+        observations = payload.get("observations")
+        if not isinstance(observations, list):
+            raise RuntimeError("Weather.com PWS payload does not contain observations.")
+        rows = [row for row in observations if isinstance(row, dict)]
+        if not rows:
+            raise RuntimeError("Weather.com PWS payload does not contain usable observations.")
+
+        def _metric(row: dict[str, object], key: str) -> Optional[float]:
+            metric_payload = row.get("metric")
+            if not isinstance(metric_payload, dict):
+                return None
+            return _safe_float(metric_payload.get(key))
+
+        def _pressure_hpa(row: dict[str, object]) -> Optional[float]:
+            values = [value for value in (_metric(row, "pressureMax"), _metric(row, "pressureMin")) if value is not None]
+            if not values:
+                return None
+            return float(sum(values) / len(values))
+
+        def _best_metric(row: dict[str, object], keys: tuple[str, ...]) -> Optional[float]:
+            for key in keys:
+                value = _metric(row, key)
+                if value is not None and math.isfinite(value):
+                    return float(value)
+            return None
+
+        def _best_humidity(row: dict[str, object]) -> Optional[float]:
+            for key in ("humidityAvg", "humidityHigh", "humidityLow"):
+                value = _safe_float(row.get(key))
+                if value is not None and math.isfinite(value):
+                    return float(value)
+            return None
+
+        rows_sorted = sorted(
+            rows,
+            key=lambda r: _safe_float(r.get("epoch")) if _safe_float(r.get("epoch")) is not None else -1,
+        )
+        latest = rows_sorted[-1]
+        station_id = str(latest.get("stationID") or "").strip()
+        label = f"Weather.com PWS {station_id}" if station_id else fallback_label
+        updated_utc = str(latest.get("obsTimeUtc") or "").strip()
+        if not updated_utc:
+            updated_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        temp_latest = _best_metric(latest, ("tempAvg", "tempHigh", "tempLow"))
+        wind_latest = _best_metric(latest, ("windspeedAvg", "windspeedHigh", "windspeedLow"))
+        rh_latest = _best_humidity(latest)
+        pressure_latest = _pressure_hpa(latest)
+        missing_metrics = [
+            name
+            for name, value in (
+                ("temp_c", temp_latest),
+                ("wind_ms", wind_latest),
+                ("rh_pct", rh_latest),
+                ("pressure_hpa", pressure_latest),
+            )
+            if value is None
+        ]
+        status = "partial" if missing_metrics else "ok"
+
+        provider = {
+            "label": label,
+            "source_label": label,
+            "temp_c": temp_latest,
+            "wind_ms": wind_latest,
+            "cloud_pct": None,
+            "rh_pct": rh_latest,
+            "pressure_hpa": pressure_latest,
+            "status": status,
+            "updated_utc": updated_utc,
+            "note": "Weather.com PWS endpoint. cloud_pct is not provided by this feed.",
+            "categories": ["conditions"],
+        }
+
+        timestamps: list[int] = []
+        temp_series: list[float] = []
+        wind_series: list[float] = []
+        rh_series: list[float] = []
+        pressure_series: list[float] = []
+        for row in rows_sorted:
+            epoch = _safe_float(row.get("epoch"))
+            if epoch is not None and math.isfinite(epoch):
+                timestamps.append(int(epoch))
+            temp = _best_metric(row, ("tempAvg", "tempHigh", "tempLow"))
+            if temp is not None and math.isfinite(temp):
+                temp_series.append(float(temp))
+            wind = _best_metric(row, ("windspeedAvg", "windspeedHigh", "windspeedLow"))
+            if wind is not None and math.isfinite(wind):
+                wind_series.append(float(wind))
+            rh = _best_humidity(row)
+            if rh is not None and math.isfinite(rh):
+                rh_series.append(float(rh))
+            pressure = _pressure_hpa(row)
+            if pressure is not None and math.isfinite(pressure):
+                pressure_series.append(float(pressure))
+
+        series = {
+            "timestamps": timestamps,
+            "temp_c": temp_series,
+            "wind_ms": wind_series,
+            "cloud_pct": [],
+            "rh_pct": rh_series,
+            "pressure_hpa": pressure_series,
         }
         return provider, series
 
@@ -7860,7 +8038,7 @@ class WeatherDialog(QDialog):
     @staticmethod
     def _fmt_value(value: Optional[float], unit: str, precision: int = 1) -> str:
         if value is None or not math.isfinite(float(value)):
-            return "-"
+            return "N/A"
         return f"{float(value):.{precision}f} {unit}".strip()
 
     @staticmethod
@@ -9569,6 +9747,10 @@ class WeatherDialog(QDialog):
         text = str(value or "").strip()
         if not text or text == "-":
             return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            pass
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
             try:
                 return datetime.strptime(text, fmt)
@@ -10205,6 +10387,58 @@ class BhtomSuggestionWorker(QThread):
             self.completed.emit(self.request_id, [], [], [], str(exc))
 
 
+class BhtomCandidatePrefetchWorker(QThread):
+    """Background loader for BHTOM candidate cache refresh (no ranking)."""
+
+    completed = Signal(int, list, str)
+
+    def __init__(self, request_id: int, base_url: str, token: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName(self.__class__.__name__)
+        self.request_id = int(request_id)
+        self.base_url = str(base_url)
+        self.token = str(token)
+
+    def run(self):
+        try:
+            candidates: list[dict[str, object]] = []
+            seen_keys: set[str] = set()
+            for page in range(1, BHTOM_MAX_SUGGESTION_PAGES + 1):
+                if self.isInterruptionRequested():
+                    self.completed.emit(self.request_id, [], "cancelled")
+                    return
+                payload = _fetch_bhtom_target_page_payload(
+                    endpoint_base_url=self.base_url,
+                    token=self.token,
+                    page=page,
+                )
+                items = _extract_bhtom_items(payload)
+                if not items:
+                    break
+                for item in items:
+                    if self.isInterruptionRequested():
+                        self.completed.emit(self.request_id, [], "cancelled")
+                        return
+                    candidate = _build_bhtom_candidate_from_item(item)
+                    if candidate is None:
+                        continue
+                    target = candidate.get("target")
+                    if not isinstance(target, Target):
+                        continue
+                    dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+                    if not dedupe_key or dedupe_key in seen_keys:
+                        continue
+                    seen_keys.add(dedupe_key)
+                    candidates.append(candidate)
+                if not _bhtom_payload_has_more(payload, page, len(items)):
+                    break
+            if not candidates:
+                raise RuntimeError("BHTOM returned no usable target candidates.")
+            self.completed.emit(self.request_id, candidates, "")
+        except Exception as exc:  # noqa: BLE001
+            self.completed.emit(self.request_id, [], str(exc))
+
+
 class BhtomObservatoryPresetWorker(QThread):
     """Background loader for BHTOM observatory/camera presets."""
 
@@ -10574,7 +10808,10 @@ class ObservatoryManagerDialog(QDialog):
         self.fov_display.setMinimumHeight(34)
         self.custom_conditions_url_edit = QLineEdit(right_col)
         self.custom_conditions_url_edit.setPlaceholderText("https://example.com/station.json")
-        self.custom_conditions_url_edit.setToolTip("Optional endpoint used when Weather source = Custom URL.")
+        self.custom_conditions_url_edit.setToolTip(
+            "Optional endpoint used when Weather source = Custom URL. Supports AstroPlanner JSON and "
+            "Weather.com PWS observations/all/1day feeds."
+        )
         self.custom_conditions_url_edit.setMinimumHeight(34)
         self.lookup_btn = QPushButton("Lookup Coordinates", right_col)
         self.lookup_btn.setToolTip("Resolve latitude/longitude/elevation from observatory name")
@@ -11797,7 +12034,10 @@ class SuggestedTargetsDialog(QDialog):
         self.airmass_spin.setDecimals(2)
         self.airmass_spin.setSingleStep(0.1)
         self.airmass_spin.setValue(99.0)
-        self.airmass_spin.setToolTip("Maximum minimum airmass in the best observing window. Leave at 99 to disable this filter.")
+        self.airmass_spin.setToolTip(
+            "Maximum minimum airmass reached at any point of the observing night "
+            "(within Sun-alt and altitude-limit masks). Leave at 99 to disable."
+        )
         filters_row.addWidget(self.airmass_spin)
 
         filters_row.addWidget(QLabel("Mag ≤", self))
@@ -11851,7 +12091,7 @@ class SuggestedTargetsDialog(QDialog):
         self.table_view.viewport().installEventFilter(self)
         header = self.table_view.horizontalHeader()
         header.setSectionsClickable(True)
-        header.setStretchLastSection(False)
+        header.setStretchLastSection(True)
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.table_view.setColumnWidth(
             SuggestionTableModel.COL_NAME,
@@ -17306,6 +17546,8 @@ class MainWindow(QMainWindow):
         )
         self._llm_worker: Optional[LLMWorker] = None
         self._llm_active_tag = ""
+        self._llm_active_requested_class = ""
+        self._llm_active_primary_target: Optional[Target] = None
         self._llm_warmup_silent = False
         self._llm_startup_warmup_attempted = False
         self._ai_last_knowledge_titles: list[str] = []
@@ -17344,7 +17586,10 @@ class MainWindow(QMainWindow):
         self._bhtom_candidate_cache_key: Optional[tuple[str, str]] = None
         self._bhtom_candidate_cache: Optional[list[dict[str, object]]] = None
         self._bhtom_candidate_cache_loaded_at = 0.0
+        self._bhtom_last_network_fetch_key: Optional[tuple[str, str]] = None
         self._bhtom_ranked_suggestions_cache: list[dict[str, object]] = []
+        self._bhtom_candidate_prefetch_worker: Optional[BhtomCandidatePrefetchWorker] = None
+        self._bhtom_candidate_prefetch_request_id = 0
         self._bhtom_observatory_cache_key: Optional[tuple[str, str]] = None
         self._bhtom_observatory_cache: Optional[list[dict[str, object]]] = None
         self._bhtom_observatory_cache_loaded_at = 0.0
@@ -17407,6 +17652,7 @@ class MainWindow(QMainWindow):
         # Make columns only as wide as their contents
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
+        header.setStretchLastSection(True)
         self.table_view.verticalHeader().setVisible(False)
         self.table_view.setShowGrid(False)
         self.table_view.setModel(self.table_model)
@@ -19766,6 +20012,18 @@ class MainWindow(QMainWindow):
             self._bhtom_worker_cache_key = None
             self._bhtom_worker_source = ""
             self._bhtom_dialog = None
+        cand_worker = getattr(self, "_bhtom_candidate_prefetch_worker", None)
+        if cand_worker is not None:
+            try:
+                if cand_worker.isRunning():
+                    cand_worker.requestInterruption()
+                    cand_worker.quit()
+                    if not cand_worker.wait(1500):
+                        cand_worker.terminate()
+                        cand_worker.wait(400)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to stop BhtomCandidatePrefetchWorker: %s", exc)
+            self._bhtom_candidate_prefetch_worker = None
         obs_worker = getattr(self, "_bhtom_observatory_worker", None)
         if obs_worker is not None:
             try:
@@ -19892,6 +20150,19 @@ class MainWindow(QMainWindow):
                     for target in action_targets
                     if isinstance(target, Target)
                 ]
+            requested_class = str(message.get("requested_class", "") or "").strip()
+            if requested_class:
+                payload["requested_class"] = requested_class
+            primary_target = message.get("primary_target")
+            if isinstance(primary_target, Target):
+                payload["primary_target"] = primary_target.model_dump(mode="json")
+            suggested_targets = message.get("suggested_targets")
+            if isinstance(suggested_targets, list):
+                payload["suggested_targets"] = [
+                    target.model_dump(mode="json")
+                    for target in suggested_targets
+                    if isinstance(target, Target)
+                ]
             serialized.append(payload)
         return serialized
 
@@ -19915,6 +20186,27 @@ class MainWindow(QMainWindow):
                         continue
                 if action_targets:
                     message["action_targets"] = action_targets
+            requested_class = str(row.get("requested_class", "") or "").strip()
+            if requested_class:
+                message["requested_class"] = requested_class
+            primary_target_payload = row.get("primary_target")
+            if isinstance(primary_target_payload, dict):
+                try:
+                    message["primary_target"] = Target(**primary_target_payload)
+                except Exception:
+                    pass
+            suggested_targets_payload = row.get("suggested_targets")
+            if isinstance(suggested_targets_payload, list):
+                suggested_targets: list[Target] = []
+                for target_payload in suggested_targets_payload:
+                    if not isinstance(target_payload, dict):
+                        continue
+                    try:
+                        suggested_targets.append(Target(**target_payload))
+                    except Exception:
+                        continue
+                if suggested_targets:
+                    message["suggested_targets"] = suggested_targets
             restored.append(message)
         return restored
 
@@ -20000,6 +20292,11 @@ class MainWindow(QMainWindow):
         token = self._bhtom_api_token_optional()
         if not token:
             return
+        refresh_on_startup = bool(self.settings.value("general/bhtomRefreshOnStartup", True, type=bool))
+        if refresh_on_startup:
+            self._set_bhtom_status("BHTOM: refreshing cache...", busy=True)
+            self._start_bhtom_candidate_prefetch(force_refresh=True)
+            return
         base_url = self._bhtom_api_base_url()
         cached_candidates = self._cached_bhtom_candidates(token=token, base_url=base_url)
         if not cached_candidates:
@@ -20008,7 +20305,96 @@ class MainWindow(QMainWindow):
         self._bhtom_candidate_cache = list(cached_candidates)
         self._bhtom_candidate_cache_loaded_at = perf_counter()
         self._refresh_cached_bhtom_suggestions()
-        self._set_bhtom_status(f"BHTOM: cache ({len(cached_candidates)})", busy=False)
+        ranked_count = len(self._bhtom_ranked_suggestions_cache or [])
+        if ranked_count > 0:
+            self._set_bhtom_status(
+                f"BHTOM: cache ({ranked_count} ranked / {len(cached_candidates)} cached)",
+                busy=False,
+            )
+        else:
+            self._set_bhtom_status(f"BHTOM: cache ({len(cached_candidates)} cached)", busy=False)
+
+    def _start_bhtom_candidate_prefetch(self, *, force_refresh: bool = False) -> bool:
+        token = self._bhtom_api_token_optional()
+        if not token:
+            return False
+        worker = getattr(self, "_bhtom_candidate_prefetch_worker", None)
+        if worker is not None and worker.isRunning():
+            return False
+        base_url = self._bhtom_api_base_url()
+        self._bhtom_candidate_prefetch_request_id += 1
+        req_id = self._bhtom_candidate_prefetch_request_id
+        prefetch_worker = BhtomCandidatePrefetchWorker(
+            request_id=req_id,
+            base_url=base_url,
+            token=token,
+            parent=self,
+        )
+        prefetch_worker.completed.connect(self._on_bhtom_candidate_prefetch_completed)
+        prefetch_worker.finished.connect(lambda w=prefetch_worker: self._on_bhtom_candidate_prefetch_finished(w))
+        prefetch_worker.finished.connect(prefetch_worker.deleteLater)
+        self._bhtom_candidate_prefetch_worker = prefetch_worker
+        self._set_bhtom_status("BHTOM: refreshing cache...", busy=True)
+        prefetch_worker.start()
+        return True
+
+    @Slot(int, list, str)
+    def _on_bhtom_candidate_prefetch_completed(self, request_id: int, candidates: list, err: str) -> None:
+        if request_id != self._bhtom_candidate_prefetch_request_id:
+            return
+        if err:
+            # Fallback to cached data if refresh failed.
+            token = self._bhtom_api_token_optional()
+            base_url = self._bhtom_api_base_url()
+            cached = self._cached_bhtom_candidates(token=token, base_url=base_url, force_refresh=False)
+            if cached:
+                self._bhtom_candidate_cache_key = (base_url, token)
+                self._bhtom_candidate_cache = list(cached)
+                self._bhtom_candidate_cache_loaded_at = perf_counter()
+                self._refresh_cached_bhtom_suggestions()
+                ranked_count = len(self._bhtom_ranked_suggestions_cache or [])
+                if ranked_count > 0:
+                    self._set_bhtom_status(
+                        f"BHTOM: stale cache ({ranked_count} ranked / {len(cached)} cached), refresh failed",
+                        busy=False,
+                    )
+                else:
+                    self._set_bhtom_status(f"BHTOM: stale cache ({len(cached)} cached), refresh failed", busy=False)
+            else:
+                self._set_bhtom_status("BHTOM: cache refresh failed", busy=False)
+            logger.warning("BHTOM candidate prefetch failed: %s", err)
+            return
+        token = self._bhtom_api_token_optional()
+        base_url = self._bhtom_api_base_url()
+        cache_key = (base_url, token)
+        self._bhtom_candidate_cache_key = cache_key
+        self._bhtom_candidate_cache = list(candidates)
+        self._bhtom_candidate_cache_loaded_at = perf_counter()
+        self._bhtom_last_network_fetch_key = cache_key
+        self._refresh_cached_bhtom_suggestions()
+        storage = getattr(self, "app_storage", None)
+        if storage is not None:
+            try:
+                storage.cache.set_json(
+                    "bhtom_candidates",
+                    self._bhtom_storage_cache_key(token=token, base_url=base_url),
+                    self._serialize_bhtom_candidates(candidates),
+                    ttl_s=BHTOM_SUGGESTION_CACHE_TTL_S,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to persist BHTOM candidates after refresh: %s", exc)
+        ranked_count = len(self._bhtom_ranked_suggestions_cache or [])
+        if ranked_count > 0:
+            self._set_bhtom_status(
+                f"BHTOM: cache refreshed ({ranked_count} ranked / {len(candidates)} cached)",
+                busy=False,
+            )
+        else:
+            self._set_bhtom_status(f"BHTOM: cache refreshed ({len(candidates)} cached)", busy=False)
+
+    def _on_bhtom_candidate_prefetch_finished(self, worker: BhtomCandidatePrefetchWorker) -> None:
+        if self._bhtom_candidate_prefetch_worker is worker:
+            self._bhtom_candidate_prefetch_worker = None
 
     def _refresh_cached_bhtom_suggestions(self) -> None:
         self._bhtom_ranked_suggestions_cache = []
@@ -22755,6 +23141,8 @@ class MainWindow(QMainWindow):
                 self._set_ai_status("Ready", tone="info")
             return False
         self._llm_warmup_silent = bool(silent)
+        self._llm_active_requested_class = ""
+        self._llm_active_primary_target = None
         if not silent:
             self._set_ai_status("Warming up LLM...", tone="info")
         worker = LLMWorker(
@@ -23092,21 +23480,33 @@ class MainWindow(QMainWindow):
         else:
             parts.append(f"Targets in plan: {len(self.targets)}")
 
+        class_query = self._parse_class_query_spec(user_question)
+        requested_marker = class_query.requested_class if class_query is not None else ""
         selected_row = self._selected_target_row_index()
         if selected_row is not None and 0 <= selected_row < len(self.targets):
             selected_target = self.targets[selected_row]
-            parts.append(
-                "Selected target:\n"
-                + self._build_llm_target_summary_line(
-                    selected_row,
-                    selected_target,
-                    include_current_snapshot=include_current_snapshot,
+            self._ensure_known_target_type(selected_target)
+            if not requested_marker or self._type_matches_requested_class(selected_target.object_type, requested_marker):
+                parts.append(
+                    "Selected target:\n"
+                    + self._build_llm_target_summary_line(
+                        selected_row,
+                        selected_target,
+                        include_current_snapshot=include_current_snapshot,
+                    )
                 )
-            )
 
         summary_indices, omitted_count = self._session_context_target_indices(
             max_items=8,
         )
+        if requested_marker:
+            filtered_indices: list[int] = []
+            for idx in summary_indices:
+                self._ensure_known_target_type(self.targets[idx])
+                if self._type_matches_requested_class(self.targets[idx].object_type, requested_marker):
+                    filtered_indices.append(idx)
+            omitted_count += max(0, len(summary_indices) - len(filtered_indices))
+            summary_indices = filtered_indices
         if summary_indices:
             rows = [
                 self._build_llm_target_summary_line(
@@ -23173,7 +23573,12 @@ class MainWindow(QMainWindow):
         if not suggestions:
             return ""
 
-        type_markers = self._question_bhtom_type_markers(user_question)
+        type_markers = list(self._question_bhtom_type_markers(user_question))
+        class_query = self._parse_class_query_spec(user_question)
+        if class_query is not None:
+            marker = _normalize_knowledge_tag(class_query.requested_class)
+            if marker and marker not in type_markers:
+                type_markers.append(marker)
         shortlist = suggestions
         shortlist_label = "Cached BHTOM suggestion shortlist (not yet in plan)"
         max_rows = max_items
@@ -23304,6 +23709,112 @@ class MainWindow(QMainWindow):
         matched.sort(key=lambda item: (item[0], item[1], item[2], item[3].name.lower()))
         return matched[0][3]
 
+    def _find_referenced_targets_in_question(self, text: str, *, max_targets: int = 6) -> list[Target]:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            return []
+
+        candidates: list[tuple[int, Target]] = [(0, target) for target in self.targets]
+        suggestions = list(getattr(self, "_bhtom_ranked_suggestions_cache", []) or [])
+        for item in suggestions:
+            target = item.get("target")
+            if isinstance(target, Target):
+                candidates.append((1, target))
+
+        matched: list[tuple[int, int, int, str, Target]] = []
+        seen: set[str] = set()
+        for source_rank, target in candidates:
+            dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            positions: list[tuple[int, int]] = []
+            for candidate_name in {target.name.strip(), str(target.source_object_id or "").strip()}:
+                if not candidate_name:
+                    continue
+                pos = self._find_normalized_text_position(raw_text, candidate_name)
+                if pos is None:
+                    continue
+                match_len = len(re.sub(r"[^a-z0-9]+", "", _normalize_catalog_display_name(candidate_name).lower()))
+                positions.append((pos, match_len))
+            if not positions:
+                continue
+            seen.add(dedupe_key)
+            best_pos, best_len = min(positions, key=lambda item: (item[0], -item[1]))
+            matched.append((best_pos, -best_len, source_rank, target.name.lower(), target))
+
+        matched.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        return [item[4] for item in matched[: max(1, int(max_targets))]]
+
+    def _plan_row_index_for_target(self, target: Target) -> Optional[int]:
+        for idx, existing in enumerate(self.targets):
+            if _targets_match(existing, target):
+                return idx
+        return None
+
+    def _lookup_target_observing_candidate(self, target: Target) -> Optional[dict[str, object]]:
+        row_index = self._plan_row_index_for_target(target)
+        if row_index is not None and 0 <= row_index < len(self.targets):
+            plan_target = self.targets[row_index]
+            self._ensure_known_target_type(plan_target)
+            metrics = self.target_metrics.get(plan_target.name)
+            if metrics is not None:
+                current_alt = None
+                if row_index < len(self.table_model.current_alts):
+                    alt_now = self.table_model.current_alts[row_index]
+                    if math.isfinite(alt_now):
+                        current_alt = float(alt_now)
+                moon_sep = None
+                if row_index < len(self.table_model.current_seps):
+                    sep_now = self.table_model.current_seps[row_index]
+                    if math.isfinite(sep_now):
+                        moon_sep = float(sep_now)
+                return {
+                    "target": plan_target,
+                    "metrics": metrics,
+                    "best_window": self._format_target_best_window_compact(plan_target),
+                    "current_alt": current_alt,
+                    "moon_sep": moon_sep,
+                    "source": "plan",
+                }
+
+        suggestions = list(getattr(self, "_bhtom_ranked_suggestions_cache", []) or [])
+        for item in suggestions:
+            suggestion_target = item.get("target")
+            metrics = item.get("metrics")
+            if not isinstance(suggestion_target, Target) or not isinstance(metrics, TargetNightMetrics):
+                continue
+            if not _targets_match(suggestion_target, target):
+                continue
+            self._ensure_known_target_type(suggestion_target)
+            best_window = ""
+            window_start = item.get("window_start")
+            window_end = item.get("window_end")
+            if isinstance(window_start, datetime) and isinstance(window_end, datetime):
+                best_window = f"{window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}"
+            return {
+                "target": suggestion_target,
+                "metrics": metrics,
+                "best_window": best_window,
+                "current_alt": None,
+                "moon_sep": _safe_float(item.get("min_window_moon_sep")),
+                "source": "bhtom",
+                "best_airmass": _safe_float(item.get("best_airmass")),
+                "importance": _safe_float(item.get("importance")),
+            }
+
+        self._ensure_known_target_type(target)
+        metrics = self.target_metrics.get(target.name)
+        if metrics is None:
+            return None
+        return {
+            "target": target,
+            "metrics": metrics,
+            "best_window": self._format_target_best_window_compact(target),
+            "current_alt": None,
+            "moon_sep": None,
+            "source": _normalize_catalog_token(target.source_catalog) or "target",
+        }
+
     @staticmethod
     def _requested_object_class_marker(question: str) -> str:
         normalized = _normalize_catalog_display_name(question).lower()
@@ -23334,6 +23845,15 @@ class MainWindow(QMainWindow):
         if _contains_token("star") or "gwiazd" in normalized:
             return "star"
         return ""
+
+    @staticmethod
+    def _question_action_flags(normalized: str, groups: dict[str, tuple[str, ...]]) -> dict[str, bool]:
+        if not normalized:
+            return {name: False for name in groups}
+        return {
+            name: any(marker in normalized for marker in markers)
+            for name, markers in groups.items()
+        }
 
     @classmethod
     def _type_matches_requested_class(cls, type_label: str, requested_marker: str) -> bool:
@@ -23627,8 +24147,8 @@ class MainWindow(QMainWindow):
         snippets = [self._format_knowledge_note_snippet(note) for note in notes]
         return "Local knowledge notes:\n" + "\n".join(snippets)
 
-    def _build_local_object_fact_answer(self, question: str) -> Optional[str]:
-        target = self._resolve_object_query_target(question, selected_target=self._selected_target_or_none())
+    def _build_local_object_fact_answer(self, question: str, *, target: Optional[Target] = None) -> Optional[str]:
+        target = target or self._resolve_object_query_target(question, selected_target=self._selected_target_or_none())
         if target is None:
             return None
 
@@ -23713,11 +24233,545 @@ class MainWindow(QMainWindow):
         )
         return any(phrase in normalized for phrase in phrases)
 
-    def _build_local_object_observing_answer(self, question: str) -> Optional[str]:
+    def _parse_class_query_spec(self, question: str) -> Optional[ClassQuerySpec]:
+        normalized = _normalize_catalog_display_name(question).lower()
+        if not normalized:
+            return None
+
+        explicit_requested_class = self._requested_object_class_marker(normalized)
+        filter_flags = self._question_action_flags(
+            normalized,
+            {
+                "bhtom_only": (
+                    "bhtom only",
+                    "only bhtom",
+                    "only from bhtom",
+                    "from bhtom only",
+                    "tylko z bhtom",
+                    "tylko bhtom",
+                ),
+                "exclude_observed": (
+                    "exclude observed",
+                    "without observed",
+                    "hide observed",
+                    "not observed",
+                    "unobserved",
+                    "nieobserw",
+                    "nie obserw",
+                    "bez obserw",
+                ),
+                "prefer_brighter": (
+                    "brighter",
+                    "brightest",
+                    "jaśniejs",
+                    "jasniejs",
+                    "jaśniejsze",
+                    "jasniejsze",
+                    "najjaś",
+                    "najas",
+                ),
+            },
+        )
+        flags = self._question_action_flags(
+            normalized,
+            {
+                "observe": (
+                    "which",
+                    "best",
+                    "recommend",
+                    "observe",
+                    "obserw",
+                    "moge",
+                    "mogę",
+                    "today",
+                    "tonight",
+                    "dzis",
+                    "dziś",
+                    "któr",
+                    "jaki",
+                ),
+                "list": (
+                    "other",
+                    "others",
+                    "more",
+                    "list",
+                    "show",
+                    "give me",
+                    "top ",
+                    "jakie",
+                    "jakie sa",
+                    "jakie są",
+                    "inne",
+                    "wymien",
+                    "wymień",
+                    "pokaz",
+                    "pokaż",
+                    "lista",
+                    "podaj",
+                ),
+                "more": (
+                    "other",
+                    "others",
+                    "more",
+                    "another",
+                    "inne",
+                    "kolejne",
+                    "więcej",
+                    "wiecej",
+                    "next",
+                ),
+                "choice": (
+                    "which one",
+                    "which is best",
+                    "which is better",
+                    "ktory",
+                    "która",
+                    "ktora",
+                    "który",
+                ),
+            },
+        )
+        has_action_marker = bool(flags["observe"])
+        wants_list = bool(flags["list"]) or bool(re.search(r"\b([2-9]|10)\b", normalized))
+        wants_more = bool(flags["more"])
+        choice_followup = bool(flags["choice"])
+        prefer_bhtom_only = bool(filter_flags["bhtom_only"])
+        exclude_observed = bool(filter_flags["exclude_observed"])
+        prefer_brighter = bool(filter_flags["prefer_brighter"])
+        semantic_followup = prefer_bhtom_only or exclude_observed or prefer_brighter
+        requested_class = explicit_requested_class
+        if not requested_class and (wants_list or wants_more or choice_followup or semantic_followup):
+            requested_class = str(self._recent_ai_conversation_state().get("requested_class", "") or "").strip()
+
+        if not requested_class:
+            return None
+        if not explicit_requested_class and not (wants_list or wants_more or choice_followup or semantic_followup):
+            return None
+        if explicit_requested_class and not (
+            has_action_marker or wants_list or wants_more or choice_followup or semantic_followup
+        ):
+            return None
+
+        if semantic_followup and not wants_list and not choice_followup:
+            wants_list = True
+        count = self._class_query_requested_count(question, default_count=5 if wants_list else 3)
+        return ClassQuerySpec(
+            requested_class=requested_class,
+            count=count,
+            wants_list=wants_list,
+            wants_more=wants_more,
+            choice_followup=choice_followup,
+            prefer_bhtom_only=prefer_bhtom_only,
+            exclude_observed=exclude_observed,
+            exclude_previous_results=wants_more,
+            prefer_brighter=prefer_brighter,
+        )
+
+    def _looks_like_class_observing_query(self, text: str) -> bool:
+        return self._parse_class_query_spec(text) is not None
+
+    @staticmethod
+    def _requested_marker_label(requested_marker: str) -> str:
+        marker = _normalize_knowledge_tag(requested_marker)
+        mapping = {
+            "agn": "AGN",
+            "qso": "QSO",
+            "seyfert": "Seyfert",
+            "blazar": "blazar",
+            "supernova": "SN",
+            "nova": "nova",
+            "xrb": "X-ray binary",
+            "cv": "CV",
+            "galaxy": "galaxy",
+            "star": "star",
+        }
+        return mapping.get(marker, requested_marker or "target")
+
+    def _collect_class_observing_candidates(self, class_query: ClassQuerySpec) -> list[dict[str, object]]:
+        marker = _normalize_knowledge_tag(class_query.requested_class)
+        if not marker:
+            return []
+
+        candidates: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for row_index, target in enumerate(self.targets):
+            self._ensure_known_target_type(target)
+            if not self._type_matches_requested_class(target.object_type, marker):
+                continue
+            if class_query.prefer_bhtom_only and _normalize_catalog_token(target.source_catalog) != "bhtom":
+                continue
+            if class_query.exclude_observed and bool(target.observed):
+                continue
+            metrics = self.target_metrics.get(target.name)
+            if metrics is None:
+                continue
+            current_alt = None
+            if row_index < len(self.table_model.current_alts):
+                alt_now = self.table_model.current_alts[row_index]
+                if math.isfinite(alt_now):
+                    current_alt = float(alt_now)
+            moon_sep = None
+            if row_index < len(self.table_model.current_seps):
+                sep_now = self.table_model.current_seps[row_index]
+                if math.isfinite(sep_now):
+                    moon_sep = float(sep_now)
+            dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            candidates.append(
+                {
+                    "target": target,
+                    "metrics": metrics,
+                    "best_window": self._format_target_best_window_compact(target),
+                    "current_alt": current_alt,
+                    "moon_sep": moon_sep,
+                    "source": "plan",
+                }
+            )
+
+        suggestions = list(getattr(self, "_bhtom_ranked_suggestions_cache", []) or [])
+        for item in suggestions:
+            target = item.get("target")
+            metrics = item.get("metrics")
+            if not isinstance(target, Target) or not isinstance(metrics, TargetNightMetrics):
+                continue
+            self._ensure_known_target_type(target)
+            if not self._type_matches_requested_class(target.object_type, marker):
+                continue
+            if class_query.exclude_observed and bool(target.observed):
+                continue
+            dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            best_window = ""
+            window_start = item.get("window_start")
+            window_end = item.get("window_end")
+            if isinstance(window_start, datetime) and isinstance(window_end, datetime):
+                best_window = f"{window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}"
+            candidates.append(
+                {
+                    "target": target,
+                    "metrics": metrics,
+                    "best_window": best_window,
+                    "current_alt": None,
+                    "moon_sep": _safe_float(item.get("min_window_moon_sep")),
+                    "source": "bhtom",
+                }
+            )
+        return candidates
+
+    def _recent_ai_conversation_state(self, *, max_messages: int = 8) -> dict[str, Any]:
+        requested_class = ""
+        primary_target: Optional[Target] = None
+        suggested_targets: list[Target] = []
+
+        considered = 0
+        for message in reversed(self._ai_messages):
+            kind = str(message.get("kind", "") or "").strip().lower()
+            if kind not in {"user", "ai"}:
+                continue
+            considered += 1
+            if not requested_class:
+                requested_class = str(message.get("requested_class", "") or "").strip()
+            if primary_target is None:
+                candidate_target = message.get("primary_target")
+                if isinstance(candidate_target, Target):
+                    primary_target = candidate_target
+            if not suggested_targets:
+                candidate_targets = message.get("suggested_targets")
+                if isinstance(candidate_targets, list):
+                    suggested_targets = [target for target in candidate_targets if isinstance(target, Target)]
+            if requested_class and primary_target is not None and suggested_targets:
+                break
+            if considered >= max_messages:
+                break
+
+        if primary_target is None and suggested_targets:
+            primary_target = suggested_targets[0]
+
+        return {
+            "requested_class": requested_class,
+            "primary_target": primary_target,
+            "suggested_targets": suggested_targets,
+        }
+
+    def _resolve_recent_class_marker(self, *, max_messages: int = 6) -> str:
+        recent_state = self._recent_ai_conversation_state(max_messages=max_messages)
+        requested_class = str(recent_state.get("requested_class", "") or "").strip()
+        if requested_class:
+            return requested_class
+
+        recent_user_texts: list[str] = []
+        for message in reversed(self._ai_messages):
+            kind = str(message.get("kind", "") or "").strip().lower()
+            if kind != "user":
+                continue
+            text = str(message.get("text", "") or "").strip()
+            if not text:
+                continue
+            recent_user_texts.append(text)
+            if len(recent_user_texts) >= max_messages:
+                break
+
+        for text in recent_user_texts:
+            marker = self._requested_object_class_marker(text)
+            if marker:
+                return marker
+        return ""
+
+    @staticmethod
+    def _class_query_requested_count(question: str, *, default_count: int = 3, max_count: int = 10) -> int:
+        normalized = _normalize_catalog_display_name(question).lower()
+        if not normalized:
+            return default_count
+
+        digit_match = re.search(r"\b([1-9]|10)\b", normalized)
+        if digit_match:
+            return max(1, min(max_count, int(digit_match.group(1))))
+
+        word_map = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+            "jeden": 1,
+            "dwa": 2,
+            "trzy": 3,
+            "cztery": 4,
+            "piec": 5,
+            "pięć": 5,
+            "szesc": 6,
+            "sześć": 6,
+            "siedem": 7,
+            "osiem": 8,
+            "dziewiec": 9,
+            "dziewięć": 9,
+            "dziesiec": 10,
+            "dziesięć": 10,
+        }
+        for token, value in word_map.items():
+            if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", normalized):
+                return max(1, min(max_count, value))
+        return default_count
+
+    def _build_local_class_observing_response(self, question: str) -> Optional[dict[str, Any]]:
+        class_query = self._parse_class_query_spec(question)
+        if class_query is None:
+            return None
+
+        recent_state = self._recent_ai_conversation_state()
+        requested_marker = class_query.requested_class
+        if not requested_marker:
+            return None
+
+        candidates = self._collect_class_observing_candidates(class_query)
+        label = self._requested_marker_label(requested_marker)
+        is_polish = any(
+            token in _normalize_catalog_display_name(question).lower()
+            for token in ("jak ", "obserw", "dzis", "dziś", "któr", "jaki", "mogę", "moge")
+        )
+        if not candidates:
+            if is_polish:
+                return {
+                    "text": f"Brak pasujących celów klasy {label} w planie ani w cache BHTOM.",
+                    "requested_class": requested_marker,
+                    "primary_target": None,
+                    "suggested_targets": [],
+                }
+            return {
+                "text": f"No matching {label} targets are available in the plan or cached BHTOM suggestions.",
+                "requested_class": requested_marker,
+                "primary_target": None,
+                "suggested_targets": [],
+            }
+
+        wants_list = bool(class_query.wants_list)
+        wants_more = bool(class_query.wants_more)
+        choice_followup = bool(class_query.choice_followup)
+        requested_count = int(class_query.count)
+        excluded_targets: list[Target] = []
+        if class_query.exclude_previous_results:
+            recent_suggested = list(recent_state.get("suggested_targets", []) or [])
+            for recent_target in recent_suggested:
+                if not isinstance(recent_target, Target):
+                    continue
+                self._ensure_known_target_type(recent_target)
+                if self._type_matches_requested_class(recent_target.object_type, requested_marker):
+                    excluded_targets.append(recent_target)
+            if not excluded_targets:
+                recent_target = recent_state.get("primary_target")
+                if isinstance(recent_target, Target):
+                    self._ensure_known_target_type(recent_target)
+                    if self._type_matches_requested_class(recent_target.object_type, requested_marker):
+                        excluded_targets.append(recent_target)
+
+        def _sort_key(item: dict[str, object]) -> tuple[object, ...]:
+            metrics = item.get("metrics")
+            score = float(metrics.score) if isinstance(metrics, TargetNightMetrics) else -1.0
+            hours_above = float(metrics.hours_above_limit) if isinstance(metrics, TargetNightMetrics) else -1.0
+            current_alt = _safe_float(item.get("current_alt"))
+            current_alt_sort = float(current_alt) if current_alt is not None else -1.0
+            target = item.get("target")
+            magnitude = float(target.magnitude) if isinstance(target, Target) and target.magnitude is not None and math.isfinite(float(target.magnitude)) else float("inf")
+            source_rank = 0 if str(item.get("source") or "") == "plan" else 1
+            name = target.name if isinstance(target, Target) else ""
+            if class_query.prefer_brighter:
+                return (magnitude, -score, -hours_above, -current_alt_sort, source_rank, name.lower())
+            return (-score, -hours_above, -current_alt_sort, magnitude, source_rank, name.lower())
+
+        candidates.sort(key=_sort_key)
+        if choice_followup:
+            recent_keys = {
+                _normalize_catalog_token(target.source_object_id or target.name)
+                for target in list(recent_state.get("suggested_targets", []) or [])
+                if isinstance(target, Target)
+            }
+            if recent_keys:
+                filtered_candidates = []
+                for item in candidates:
+                    item_target = item.get("target")
+                    if not isinstance(item_target, Target):
+                        continue
+                    item_key = _normalize_catalog_token(item_target.source_object_id or item_target.name)
+                    if item_key and item_key in recent_keys:
+                        filtered_candidates.append(item)
+                if filtered_candidates:
+                    candidates = filtered_candidates
+        if excluded_targets:
+            excluded_keys = {
+                _normalize_catalog_token(target.source_object_id or target.name)
+                for target in excluded_targets
+                if isinstance(target, Target)
+            }
+            filtered_candidates = []
+            for item in candidates:
+                item_target = item.get("target")
+                if not isinstance(item_target, Target):
+                    continue
+                item_key = _normalize_catalog_token(item_target.source_object_id or item_target.name)
+                if item_key and item_key in excluded_keys:
+                    continue
+                filtered_candidates.append(item)
+            if filtered_candidates:
+                candidates = filtered_candidates
+            elif wants_more:
+                if is_polish:
+                    return {
+                        "text": f"Nie mam już więcej celów klasy {label} poza tymi, które już pokazałem.",
+                        "requested_class": requested_marker,
+                        "primary_target": excluded_targets[0] if excluded_targets else None,
+                        "suggested_targets": list(excluded_targets),
+                    }
+                return {
+                    "text": f"No more {label} targets are available beyond the ones already shown.",
+                    "requested_class": requested_marker,
+                    "primary_target": excluded_targets[0] if excluded_targets else None,
+                    "suggested_targets": list(excluded_targets),
+                }
+
+        top = candidates[0]
+        target = top.get("target")
+        metrics = top.get("metrics")
+        if not isinstance(target, Target) or not isinstance(metrics, TargetNightMetrics):
+            return None
+
+        displayed_targets: list[Target] = []
+        if wants_list:
+            rows: list[str] = []
+            for item in candidates[: max(1, requested_count)]:
+                item_target = item.get("target")
+                item_metrics = item.get("metrics")
+                if not isinstance(item_target, Target) or not isinstance(item_metrics, TargetNightMetrics):
+                    continue
+                displayed_targets.append(item_target)
+                item_window = str(item.get("best_window") or "").strip()
+                item_alt = _safe_float(item.get("current_alt"))
+                item_source = str(item.get("source") or "plan")
+                parts = [f"score {item_metrics.score:.1f}"]
+                if item_window:
+                    parts.append(f"best {item_window}")
+                if item_alt is not None and math.isfinite(item_alt):
+                    parts.append(f"now alt {item_alt:.1f}°")
+                if item_source == "bhtom":
+                    parts.append("BHTOM")
+                rows.append(f"- {item_target.name}: " + ", ".join(parts))
+            if is_polish:
+                return {
+                    "text": f"{label} dostępne teraz:\n" + "\n".join(rows),
+                    "requested_class": requested_marker,
+                    "primary_target": displayed_targets[0] if displayed_targets else target,
+                    "suggested_targets": displayed_targets,
+                }
+            return {
+                "text": f"{label} options now:\n" + "\n".join(rows),
+                "requested_class": requested_marker,
+                "primary_target": displayed_targets[0] if displayed_targets else target,
+                "suggested_targets": displayed_targets,
+            }
+
+        best_window = str(top.get("best_window") or "").strip()
+        current_alt = _safe_float(top.get("current_alt"))
+        source = str(top.get("source") or "plan")
+        details = [f"score {metrics.score:.1f}"]
+        if best_window:
+            details.append(f"best {best_window}")
+        details.append(f"max alt {metrics.max_altitude_deg:.0f}°")
+        if current_alt is not None and math.isfinite(current_alt):
+            details.append(f"now alt {current_alt:.1f}°")
+        if source == "bhtom":
+            details.append("from BHTOM cache")
+
+        backups: list[str] = []
+        displayed_targets.append(target)
+        for item in candidates[1:3]:
+            backup_target = item.get("target")
+            backup_metrics = item.get("metrics")
+            if not isinstance(backup_target, Target) or not isinstance(backup_metrics, TargetNightMetrics):
+                continue
+            backups.append(f"{backup_target.name} ({backup_metrics.score:.1f})")
+            displayed_targets.append(backup_target)
+
+        if is_polish:
+            answer = f"Najlepszy {label} teraz: {target.name} — {', '.join(details)}."
+            if backups:
+                answer += " Rezerwa: " + ", ".join(backups) + "."
+            return {
+                "text": answer,
+                "requested_class": requested_marker,
+                "primary_target": target,
+                "suggested_targets": displayed_targets,
+            }
+
+        answer = f"Best {label} now: {target.name} — {', '.join(details)}."
+        if backups:
+            answer += " Backups: " + ", ".join(backups) + "."
+        return {
+            "text": answer,
+            "requested_class": requested_marker,
+            "primary_target": target,
+            "suggested_targets": displayed_targets,
+        }
+
+    def _build_local_class_observing_answer(self, question: str) -> Optional[str]:
+        response = self._build_local_class_observing_response(question)
+        if not response:
+            return None
+        text = str(response.get("text", "") or "").strip()
+        return text or None
+
+    def _build_local_object_observing_answer(self, question: str, *, target: Optional[Target] = None) -> Optional[str]:
         if not self._looks_like_observing_guidance_query(question):
             return None
 
-        target = self._resolve_object_query_target(question, selected_target=self._selected_target_or_none())
+        target = target or self._resolve_object_query_target(question, selected_target=self._selected_target_or_none())
         if target is None:
             return None
 
@@ -23932,6 +24986,15 @@ class MainWindow(QMainWindow):
         return normalized.startswith("is ")
 
     def _resolve_recent_chat_target_reference(self, *, max_messages: int = 6) -> Optional[Target]:
+        recent_state = self._recent_ai_conversation_state(max_messages=max_messages)
+        primary_target = recent_state.get("primary_target")
+        if isinstance(primary_target, Target):
+            return primary_target
+        suggested_targets = recent_state.get("suggested_targets")
+        if isinstance(suggested_targets, list):
+            for target in suggested_targets:
+                if isinstance(target, Target):
+                    return target
         if not bool(getattr(self.llm_config, "enable_chat_memory", False)):
             return None
 
@@ -23960,6 +25023,261 @@ class MainWindow(QMainWindow):
             if target is not None:
                 return target
         return None
+
+    def _parse_object_query_spec(
+        self,
+        question: str,
+        *,
+        selected_target: Optional[Target] = None,
+    ) -> Optional[ObjectQuerySpec]:
+        text = str(question or "").strip()
+        if not text:
+            return None
+        resolved_target = self._resolve_object_query_target(question, selected_target=selected_target)
+        object_scoped = self._looks_like_object_scoped_query(question)
+        wants_guidance = self._looks_like_observing_guidance_query(question)
+        wants_fact = self._looks_like_object_class_query(question) or any(
+            marker in _normalize_catalog_display_name(question).lower()
+            for marker in (
+                "what type",
+                "type of object",
+                "what is",
+                "what kind",
+                "jaki typ",
+                "jaki to typ",
+                "jaki to obiekt",
+                "co to za obiekt",
+                "czym jest",
+                "co to jest",
+            )
+        )
+        wants_selected_llm = self._should_auto_route_selected_target_query(question, resolved_target)
+        blocked_no_selection = bool(object_scoped and resolved_target is None)
+        if not (object_scoped or wants_guidance or wants_fact or wants_selected_llm or blocked_no_selection):
+            return None
+        return ObjectQuerySpec(
+            target=resolved_target,
+            object_scoped=object_scoped,
+            wants_guidance=wants_guidance,
+            wants_fact=wants_fact,
+            wants_selected_llm=wants_selected_llm,
+            blocked_no_selection=blocked_no_selection,
+        )
+
+    def _parse_compare_query_spec(
+        self,
+        question: str,
+        *,
+        selected_target: Optional[Target] = None,
+    ) -> Optional[CompareQuerySpec]:
+        normalized = _normalize_catalog_display_name(question).lower()
+        if not normalized:
+            return None
+
+        flags = self._question_action_flags(
+            normalized,
+            {
+                "compare": (
+                    "compare",
+                    "comparison",
+                    "vs",
+                    "versus",
+                    "between",
+                    "porown",
+                    "porówn",
+                    "better",
+                    "lepszy",
+                    "lepsza",
+                ),
+                "choose": (
+                    "which one",
+                    "which is better",
+                    "which is best",
+                    "which target",
+                    "which object",
+                    "ktory",
+                    "który",
+                    "ktora",
+                    "która",
+                    "best of",
+                    "best between",
+                ),
+                "brightness": (
+                    "brighter",
+                    "brightest",
+                    "jaśniejs",
+                    "jasniejs",
+                    "jaśniejsze",
+                    "jasniejsze",
+                    "najjaś",
+                    "najas",
+                ),
+                "reason": (
+                    "why",
+                    "reason",
+                    "justify",
+                    "uzasad",
+                    "dlaczego",
+                    "czemu",
+                ),
+            },
+        )
+
+        explicit_targets = self._find_referenced_targets_in_question(question, max_targets=6)
+        if len(explicit_targets) == 1 and isinstance(selected_target, Target) and not _targets_match(explicit_targets[0], selected_target):
+            explicit_targets.append(selected_target)
+
+        if len(explicit_targets) < 2 and (flags["compare"] or flags["choose"]):
+            recent_targets = [
+                target
+                for target in list(self._recent_ai_conversation_state().get("suggested_targets", []) or [])
+                if isinstance(target, Target)
+            ]
+            if len(recent_targets) >= 2:
+                explicit_targets = recent_targets[: min(5, len(recent_targets))]
+
+        if len(explicit_targets) < 2:
+            return None
+        if not (flags["compare"] or flags["choose"]):
+            return None
+
+        deduped: list[Target] = []
+        seen: set[str] = set()
+        for target in explicit_targets:
+            dedupe_key = _normalize_catalog_token(target.source_object_id or target.name)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            deduped.append(target)
+
+        if len(deduped) < 2:
+            return None
+
+        return CompareQuerySpec(
+            targets=tuple(deduped),
+            criterion="brightness" if flags["brightness"] else "overall",
+            return_best_only=bool(flags["choose"]),
+            include_reason=bool(flags["reason"] or flags["choose"]),
+        )
+
+    def _build_local_compare_response(
+        self,
+        question: str,
+        *,
+        compare_query: CompareQuerySpec,
+    ) -> Optional[dict[str, Any]]:
+        items: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for target in compare_query.targets:
+            entry = self._lookup_target_observing_candidate(target)
+            if not isinstance(entry, dict):
+                continue
+            candidate_target = entry.get("target")
+            metrics = entry.get("metrics")
+            if not isinstance(candidate_target, Target) or not isinstance(metrics, TargetNightMetrics):
+                continue
+            dedupe_key = _normalize_catalog_token(candidate_target.source_object_id or candidate_target.name)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            items.append(entry)
+
+        if len(items) < 2:
+            return None
+
+        is_polish = any(
+            token in _normalize_catalog_display_name(question).lower()
+            for token in ("porown", "porówn", "któr", "ktora", "która", "lepszy", "lepsza")
+        )
+
+        def _sort_key(item: dict[str, object]) -> tuple[object, ...]:
+            target = item["target"]
+            metrics = item["metrics"]
+            assert isinstance(target, Target)
+            assert isinstance(metrics, TargetNightMetrics)
+            magnitude = (
+                float(target.magnitude)
+                if target.magnitude is not None and math.isfinite(float(target.magnitude))
+                else float("inf")
+            )
+            current_alt = _safe_float(item.get("current_alt"))
+            current_alt_sort = float(current_alt) if current_alt is not None else -1.0
+            if compare_query.criterion == "brightness":
+                return (magnitude, -float(metrics.score), -current_alt_sort, target.name.lower())
+            return (-float(metrics.score), -float(metrics.hours_above_limit), -current_alt_sort, magnitude, target.name.lower())
+
+        items.sort(key=_sort_key)
+        best_item = items[0]
+        best_target = best_item["target"]
+        best_metrics = best_item["metrics"]
+        assert isinstance(best_target, Target)
+        assert isinstance(best_metrics, TargetNightMetrics)
+
+        def _format_item_summary(item: dict[str, object]) -> str:
+            target = item["target"]
+            metrics = item["metrics"]
+            assert isinstance(target, Target)
+            assert isinstance(metrics, TargetNightMetrics)
+            bits = [f"score {metrics.score:.1f}"]
+            magnitude_label = _target_magnitude_label(target)
+            if target.magnitude is not None and math.isfinite(float(target.magnitude)):
+                bits.append(f"{magnitude_label} {float(target.magnitude):.2f}")
+            best_window = str(item.get("best_window") or "").strip()
+            if best_window:
+                bits.append(f"best {best_window}")
+            current_alt = _safe_float(item.get("current_alt"))
+            if current_alt is not None and math.isfinite(current_alt):
+                bits.append(f"now alt {current_alt:.1f}°")
+            best_airmass = _safe_float(item.get("best_airmass"))
+            if best_airmass is not None and math.isfinite(best_airmass):
+                bits.append(f"min airmass {best_airmass:.2f}")
+            return f"{target.name} ({', '.join(bits)})"
+
+        compared_targets = [item["target"] for item in items if isinstance(item.get("target"), Target)]
+        compared_names = ", ".join(target.name for target in compared_targets[:5])
+        action_targets = [target for target in compared_targets if not self._plan_contains_target(target)]
+
+        if compare_query.return_best_only:
+            reasons: list[str] = []
+            if compare_query.criterion == "brightness":
+                if best_target.magnitude is not None and math.isfinite(float(best_target.magnitude)):
+                    reasons.append(f"brightest with {_target_magnitude_label(best_target).lower()} {float(best_target.magnitude):.2f}")
+            else:
+                reasons.append(f"highest score {best_metrics.score:.1f}")
+                if best_metrics.hours_above_limit > 0:
+                    reasons.append(f"over limit {best_metrics.hours_above_limit:.1f} h")
+            best_window = str(best_item.get("best_window") or "").strip()
+            if best_window:
+                reasons.append(f"best {best_window}")
+            if is_polish:
+                reason_text = ", ".join(reasons[:3]) if reasons else "najlepszy łączny profil obserwacyjny"
+                text = f"Najlepszy wybór między {compared_names}: {best_target.name} — {reason_text}."
+                return {
+                    "text": text,
+                    "primary_target": best_target,
+                    "suggested_targets": compared_targets,
+                    "action_targets": action_targets,
+                }
+            reason_text = ", ".join(reasons[:3]) if reasons else "best combined observing profile"
+            text = f"Best choice between {compared_names}: {best_target.name} — {reason_text}."
+            return {
+                "text": text,
+                "primary_target": best_target,
+                "suggested_targets": compared_targets,
+                "action_targets": action_targets,
+            }
+
+        rows = [_format_item_summary(item) for item in items]
+        if is_polish:
+            text = "Porównanie:\n" + "\n".join(f"- {row}" for row in rows)
+        else:
+            text = "Comparison:\n" + "\n".join(f"- {row}" for row in rows)
+        return {
+            "text": text,
+            "primary_target": best_target,
+            "suggested_targets": compared_targets,
+            "action_targets": action_targets,
+        }
 
     def _resolve_object_query_target(self, question: str, *, selected_target: Optional[Target]) -> Optional[Target]:
         explicit_target = self._find_referenced_target_in_question(question)
@@ -24037,7 +25355,12 @@ class MainWindow(QMainWindow):
 
     def _dispatch_selected_target_llm_question(self, target: Target, question: str, *, label: str) -> None:
         prompt = self._build_selected_target_llm_prompt(target, question)
-        self._dispatch_llm(prompt, tag="chat_selected", label=label)
+        self._dispatch_llm(
+            prompt,
+            tag="chat_selected",
+            label=label,
+            primary_target=target,
+        )
 
     def _build_deterministic_observation_order(self) -> tuple[list[dict[str, object]], list[str]]:
         payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
@@ -24167,6 +25490,7 @@ class MainWindow(QMainWindow):
         "Provide concise, practical, and accurate guidance for planning observations. "
         "Keep answers compact by default and avoid unnecessary background. "
         "Do not repeat the same metric, sentence, or recommendation. "
+        "If the user asks about a specific class such as QSO, AGN, supernova, nova, CV, or galaxy, restrict the answer to that class only. "
         "Use only the provided session context when answering questions about tonight's plan. "
         "If local knowledge notes are included, treat them as grounded heuristics and caveats for practical advice. "
         "Do not introduce targets that are not listed in the provided session context unless the user explicitly asks for off-plan suggestions. "
@@ -24551,6 +25875,19 @@ class MainWindow(QMainWindow):
             raise RuntimeError("BHTOM features require an API token in Settings -> General Settings.")
         return token
 
+    def _current_bhtom_cache_identity(self) -> Optional[tuple[str, str]]:
+        token = self._bhtom_api_token_optional()
+        if not token:
+            return None
+        return (self._bhtom_api_base_url(), token)
+
+    def _bhtom_should_fetch_from_network_now(self) -> bool:
+        """Return True when Suggest/Quick should force one network refresh in this session."""
+        identity = self._current_bhtom_cache_identity()
+        if identity is None:
+            return False
+        return self._bhtom_last_network_fetch_key != identity
+
     def _bhtom_token_hash(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -24901,6 +26238,7 @@ class MainWindow(QMainWindow):
         *,
         token: Optional[str] = None,
         base_url: Optional[str] = None,
+        force_refresh: bool = False,
     ) -> Optional[list[dict[str, object]]]:
         resolved_token = (token or "").strip()
         if not resolved_token:
@@ -24911,14 +26249,14 @@ class MainWindow(QMainWindow):
         resolved_base_url = (base_url or self._bhtom_api_base_url()).strip().rstrip("/")
         cache_key = (resolved_base_url, resolved_token)
         cache_age = perf_counter() - self._bhtom_candidate_cache_loaded_at
-        if (
+        if not force_refresh and (
             self._bhtom_candidate_cache_key == cache_key
             and self._bhtom_candidate_cache is not None
             and cache_age < BHTOM_SUGGESTION_CACHE_TTL_S
         ):
             return list(self._bhtom_candidate_cache)
         storage = getattr(self, "app_storage", None)
-        if storage is not None:
+        if storage is not None and not force_refresh:
             try:
                 persisted = storage.cache.get_json(
                     "bhtom_candidates",
@@ -24935,11 +26273,32 @@ class MainWindow(QMainWindow):
                     return list(candidates)
         return None
 
-    def _fetch_bhtom_target_candidates(self) -> list[dict[str, object]]:
+    def _clear_bhtom_candidate_cache(self, *, token: Optional[str] = None, base_url: Optional[str] = None) -> None:
+        resolved_token = (token or "").strip()
+        if not resolved_token:
+            try:
+                resolved_token = self._bhtom_api_token()
+            except Exception:
+                resolved_token = ""
+        resolved_base_url = (base_url or self._bhtom_api_base_url()).strip().rstrip("/")
+        self._bhtom_candidate_cache_key = None
+        self._bhtom_candidate_cache = None
+        self._bhtom_candidate_cache_loaded_at = 0.0
+        storage = getattr(self, "app_storage", None)
+        if storage is not None:
+            try:
+                storage.cache.delete(
+                    "bhtom_candidates",
+                    self._bhtom_storage_cache_key(token=resolved_token, base_url=resolved_base_url),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to clear BHTOM candidate cache: %s", exc)
+
+    def _fetch_bhtom_target_candidates(self, *, force_refresh: bool = False) -> list[dict[str, object]]:
         token = self._bhtom_api_token()
         base_url = self._bhtom_api_base_url()
         cache_key = (base_url, token)
-        cached = self._cached_bhtom_candidates(token=token, base_url=base_url)
+        cached = self._cached_bhtom_candidates(token=token, base_url=base_url, force_refresh=force_refresh)
         if cached is not None:
             return cached
 
@@ -24977,6 +26336,7 @@ class MainWindow(QMainWindow):
         self._bhtom_candidate_cache_key = cache_key
         self._bhtom_candidate_cache = list(candidates)
         self._bhtom_candidate_cache_loaded_at = perf_counter()
+        self._bhtom_last_network_fetch_key = cache_key
         storage = getattr(self, "app_storage", None)
         if storage is not None:
             try:
@@ -25039,12 +26399,15 @@ class MainWindow(QMainWindow):
             return bhtom_type
         return target.object_type
 
-    def _reload_local_target_suggestions(self) -> tuple[list[dict[str, object]], list[str]]:
-        self._bhtom_candidate_cache_key = None
-        self._bhtom_candidate_cache = None
-        self._bhtom_candidate_cache_loaded_at = 0.0
+    def _reload_local_target_suggestions(self, *, force_refresh: bool = False) -> tuple[list[dict[str, object]], list[str]]:
+        if force_refresh:
+            self._clear_bhtom_candidate_cache()
+        else:
+            self._bhtom_candidate_cache_key = None
+            self._bhtom_candidate_cache = None
+            self._bhtom_candidate_cache_loaded_at = 0.0
         self._bhtom_ranked_suggestions_cache = []
-        return self._build_local_target_suggestions()
+        return self._build_local_target_suggestions(force_refresh=force_refresh)
 
     def _build_bhtom_suggestion_context(self) -> tuple[Optional[dict[str, object]], Optional[str]]:
         payload = self.full_payload if isinstance(getattr(self, "full_payload", None), dict) else None
@@ -25080,7 +26443,7 @@ class MainWindow(QMainWindow):
         }
         return context, None
 
-    def _start_bhtom_worker(self, *, mode: str, emit_partials: bool) -> bool:
+    def _start_bhtom_worker(self, *, mode: str, emit_partials: bool, force_refresh: bool = False) -> bool:
         existing = self._bhtom_worker
         if existing is not None and existing.isRunning():
             title = "Quick Targets" if mode == "quick" else "Suggest Targets"
@@ -25099,7 +26462,11 @@ class MainWindow(QMainWindow):
         base_url = str(context["bhtom_base_url"])
         token = str(context["bhtom_token"])
         self._bhtom_worker_cache_key = (base_url, token)
-        cached_candidates = self._cached_bhtom_candidates(token=token, base_url=base_url)
+        cached_candidates = self._cached_bhtom_candidates(
+            token=token,
+            base_url=base_url,
+            force_refresh=force_refresh,
+        )
         if cached_candidates is not None:
             logger.info("Using cached BHTOM candidates (%d entries).", len(cached_candidates))
         self._bhtom_worker_source = "cache" if cached_candidates is not None else "network"
@@ -25208,10 +26575,12 @@ class MainWindow(QMainWindow):
             self._set_ai_status("Ready", tone="info")
             return
 
+        cached_candidate_count = 0
         if cache_key is not None and raw_candidates:
             self._bhtom_candidate_cache_key = cache_key
             self._bhtom_candidate_cache = list(raw_candidates)
             self._bhtom_candidate_cache_loaded_at = perf_counter()
+            cached_candidate_count = len(raw_candidates)
             storage = getattr(self, "app_storage", None)
             if storage is not None:
                 try:
@@ -25223,6 +26592,10 @@ class MainWindow(QMainWindow):
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to persist BHTOM candidates from worker: %s", exc)
+        elif cache_key is not None and self._bhtom_candidate_cache_key == cache_key and self._bhtom_candidate_cache:
+            cached_candidate_count = len(self._bhtom_candidate_cache)
+        if source == "network" and cache_key is not None:
+            self._bhtom_last_network_fetch_key = cache_key
         self._bhtom_ranked_suggestions_cache = list(suggestions)
 
         if mode == "suggest":
@@ -25231,10 +26604,22 @@ class MainWindow(QMainWindow):
                 dlg.update_suggestions(suggestions, notes)
                 dlg.set_source_message(_bhtom_suggestion_source_message(source or "network"))
                 dlg.set_loading_state(False, "Loaded")
-            self._set_bhtom_status(f"BHTOM: ready ({len(suggestions)})", busy=False)
+            if cached_candidate_count > 0:
+                self._set_bhtom_status(
+                    f"BHTOM: ready ({len(suggestions)} ranked / {cached_candidate_count} cached)",
+                    busy=False,
+                )
+            else:
+                self._set_bhtom_status(f"BHTOM: ready ({len(suggestions)} ranked)", busy=False)
         elif mode == "quick":
             self._apply_quick_targets_from_suggestions(suggestions, notes)
-            self._set_bhtom_status(f"BHTOM: ready ({len(suggestions)})", busy=False)
+            if cached_candidate_count > 0:
+                self._set_bhtom_status(
+                    f"BHTOM: ready ({len(suggestions)} ranked / {cached_candidate_count} cached)",
+                    busy=False,
+                )
+            else:
+                self._set_bhtom_status(f"BHTOM: ready ({len(suggestions)} ranked)", busy=False)
         else:
             self._set_bhtom_status("BHTOM: idle", busy=False)
 
@@ -25248,11 +26633,11 @@ class MainWindow(QMainWindow):
         self._bhtom_dialog = None
         self._set_ai_status("Ready", tone="info")
 
-    def _build_local_target_suggestions(self) -> tuple[list[dict[str, object]], list[str]]:
+    def _build_local_target_suggestions(self, *, force_refresh: bool = False) -> tuple[list[dict[str, object]], list[str]]:
         context, error = self._build_bhtom_suggestion_context()
         if context is None:
             return [], [error or "Unable to prepare BHTOM context."]
-        candidates = self._fetch_bhtom_target_candidates()
+        candidates = self._fetch_bhtom_target_candidates(force_refresh=force_refresh)
         suggestions, notes = _rank_local_target_suggestions_from_candidates(
             payload=context["payload"],  # type: ignore[index]
             site=context["site"],  # type: ignore[index]
@@ -25323,7 +26708,8 @@ class MainWindow(QMainWindow):
     def _quick_add_suggested_targets(self) -> None:
         self._set_ai_status("Loading suggestions...", tone="info")
         self._set_bhtom_status("BHTOM: loading quick targets...", busy=True)
-        if not self._start_bhtom_worker(mode="quick", emit_partials=True):
+        force_refresh = self._bhtom_should_fetch_from_network_now()
+        if not self._start_bhtom_worker(mode="quick", emit_partials=True, force_refresh=force_refresh):
             self._set_bhtom_status("BHTOM: idle", busy=False)
             self._set_ai_status("Ready", tone="info")
             return
@@ -25443,35 +26829,122 @@ class MainWindow(QMainWindow):
         if status_bar is not None:
             status_bar.showMessage(summary, 5000)
 
-    @Slot()
-    def _send_ai_query(self) -> None:
-        text = self.ai_input.text().strip() if hasattr(self, "ai_input") else ""
+    def _resolve_ai_intent(self, question: str) -> AIIntent:
+        text = str(question or "").strip()
         if not text:
-            return
-        worker = self._llm_worker
+            return AIIntent(kind="empty", question="", label="")
+
         selected_target = self._selected_target_or_none()
-        resolved_object_target = self._resolve_object_query_target(text, selected_target=selected_target)
-        local_observing_answer = self._build_local_object_observing_answer(text)
-        if local_observing_answer is not None and not (worker is not None and worker.isRunning()):
-            self.ai_input.clear()
-            if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
-                self.ai_toggle_btn.setChecked(True)
-            self._refresh_ai_knowledge_hint([])
-            self._append_ai_message(text, is_user=True)
-            self._append_ai_message(local_observing_answer, is_ai=True)
-            self._set_ai_status("Ready", tone="info")
+        class_query = self._parse_class_query_spec(text)
+        object_query = self._parse_object_query_spec(text, selected_target=selected_target)
+        compare_query = self._parse_compare_query_spec(text, selected_target=selected_target)
+        if compare_query is not None:
+            local_compare_response = self._build_local_compare_response(text, compare_query=compare_query)
+            if local_compare_response is not None:
+                primary_target = local_compare_response.get("primary_target")
+                suggested_targets = tuple(
+                    target
+                    for target in (local_compare_response.get("suggested_targets") or [])
+                    if isinstance(target, Target)
+                )
+                action_targets = tuple(
+                    target
+                    for target in (local_compare_response.get("action_targets") or [])
+                    if isinstance(target, Target)
+                )
+                return AIIntent(
+                    kind="local_compare",
+                    question=text,
+                    label=text,
+                    target=primary_target if isinstance(primary_target, Target) else None,
+                    requested_class=class_query.requested_class if class_query is not None else "",
+                    class_query=class_query,
+                    object_query=object_query,
+                    compare_query=compare_query,
+                    local_text=str(local_compare_response.get("text", "") or "").strip(),
+                    suggested_targets=suggested_targets,
+                    action_targets=action_targets,
+                )
+
+        local_class_response = self._build_local_class_observing_response(text)
+        if local_class_response is not None:
+            requested_class = str(local_class_response.get("requested_class", "") or "").strip()
+            primary_target = local_class_response.get("primary_target")
+            suggested_targets = tuple(
+                target
+                for target in (local_class_response.get("suggested_targets") or [])
+                if isinstance(target, Target)
+            )
+            action_targets = tuple(
+                target for target in suggested_targets if not self._plan_contains_target(target)
+            )
+            return AIIntent(
+                kind="local_class",
+                question=text,
+                label=text,
+                target=primary_target if isinstance(primary_target, Target) else None,
+                requested_class=requested_class,
+                class_query=class_query,
+                object_query=object_query,
+                compare_query=compare_query,
+                local_text=str(local_class_response.get("text", "") or "").strip(),
+                suggested_targets=suggested_targets,
+                action_targets=action_targets,
+            )
+
+        resolved_object_target = object_query.target if object_query is not None else None
+        local_observing_answer = self._build_local_object_observing_answer(text, target=resolved_object_target)
+        if local_observing_answer is not None:
+            return AIIntent(
+                kind="local_object_guidance",
+                question=text,
+                label=text,
+                target=resolved_object_target if isinstance(resolved_object_target, Target) else None,
+                object_query=object_query,
+                compare_query=compare_query,
+                local_text=local_observing_answer,
+            )
+
+        local_fact_answer = self._build_local_object_fact_answer(text, target=resolved_object_target)
+        if local_fact_answer is not None:
+            return AIIntent(
+                kind="local_object_fact",
+                question=text,
+                label=text,
+                target=resolved_object_target if isinstance(resolved_object_target, Target) else None,
+                object_query=object_query,
+                compare_query=compare_query,
+                local_text=local_fact_answer,
+            )
+
+        if object_query is not None and object_query.blocked_no_selection:
+            return AIIntent(kind="blocked_no_selection", question=text, label=text)
+
+        if object_query is not None and object_query.wants_selected_llm and isinstance(resolved_object_target, Target):
+            return AIIntent(
+                kind="llm_selected",
+                question=text,
+                label=text,
+                target=resolved_object_target if isinstance(resolved_object_target, Target) else None,
+                object_query=object_query,
+                compare_query=compare_query,
+            )
+
+        return AIIntent(
+            kind="llm_session",
+            question=text,
+            label=text,
+            target=resolved_object_target if isinstance(resolved_object_target, Target) else None,
+            requested_class=class_query.requested_class if class_query is not None else "",
+            class_query=class_query,
+            object_query=object_query,
+            compare_query=compare_query,
+        )
+
+    def _execute_ai_intent(self, intent: AIIntent) -> None:
+        if intent.kind == "empty":
             return
-        local_fact_answer = self._build_local_object_fact_answer(text)
-        if local_fact_answer is not None and not (worker is not None and worker.isRunning()):
-            self.ai_input.clear()
-            if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
-                self.ai_toggle_btn.setChecked(True)
-            self._refresh_ai_knowledge_hint([])
-            self._append_ai_message(text, is_user=True)
-            self._append_ai_message(local_fact_answer, is_ai=True)
-            self._set_ai_status("Ready", tone="info")
-            return
-        if self._looks_like_object_scoped_query(text) and resolved_object_target is None:
+        if intent.kind == "blocked_no_selection":
             QMessageBox.information(
                 self,
                 "No selection",
@@ -25479,23 +26952,93 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.ai_input.clear()
-        if self._should_auto_route_selected_target_query(text, resolved_object_target):
-            self._dispatch_selected_target_llm_question(
-                resolved_object_target,
-                text,
-                label=text,
+        worker = self._llm_worker
+        if worker is not None and worker.isRunning():
+            self._append_ai_message(
+                "The AI assistant is still processing the previous request.",
+                is_error=True,
             )
             return
 
-        context = self._build_session_context(user_question=text)
-        recent_memory = self._build_recent_chat_memory_block()
+        if hasattr(self, "ai_input"):
+            self.ai_input.clear()
+        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
+            self.ai_toggle_btn.setChecked(True)
+
+        if intent.kind == "local_class":
+            self._refresh_ai_knowledge_hint([])
+            self._append_ai_message(
+                intent.label,
+                is_user=True,
+                requested_class=intent.requested_class,
+                primary_target=intent.target,
+            )
+            self._append_ai_message(
+                intent.local_text,
+                is_ai=True,
+                requested_class=intent.requested_class,
+                primary_target=intent.target,
+                suggested_targets=list(intent.suggested_targets),
+                action_targets=list(intent.action_targets),
+            )
+            self._set_ai_status("Ready", tone="info")
+            return
+
+        if intent.kind == "local_compare":
+            self._refresh_ai_knowledge_hint([])
+            self._append_ai_message(
+                intent.label,
+                is_user=True,
+                requested_class=intent.requested_class,
+                primary_target=intent.target,
+            )
+            self._append_ai_message(
+                intent.local_text,
+                is_ai=True,
+                requested_class=intent.requested_class,
+                primary_target=intent.target,
+                suggested_targets=list(intent.suggested_targets),
+                action_targets=list(intent.action_targets),
+            )
+            self._set_ai_status("Ready", tone="info")
+            return
+
+        if intent.kind == "local_object_guidance":
+            self._refresh_ai_knowledge_hint([])
+            self._append_ai_message(intent.label, is_user=True, primary_target=intent.target)
+            self._append_ai_message(intent.local_text, is_ai=True, primary_target=intent.target)
+            self._set_ai_status("Ready", tone="info")
+            return
+
+        if intent.kind == "local_object_fact":
+            self._refresh_ai_knowledge_hint([])
+            self._append_ai_message(intent.label, is_user=True, primary_target=intent.target)
+            self._append_ai_message(intent.local_text, is_ai=True, primary_target=intent.target)
+            self._set_ai_status("Ready", tone="info")
+            return
+
+        if intent.kind == "llm_selected" and isinstance(intent.target, Target):
+            prompt = self._build_selected_target_llm_prompt(intent.target, intent.question)
+            self._dispatch_llm(
+                prompt,
+                tag="chat_selected",
+                label=intent.label,
+                requested_class=intent.requested_class,
+                primary_target=intent.target,
+            )
+            return
+
+        if intent.kind != "llm_session":
+            return
+
         knowledge_target = (
-            resolved_object_target
-            if self._looks_like_object_scoped_query(text)
-            else self._find_referenced_target_in_question(text)
+            intent.target
+            if isinstance(intent.target, Target) and self._looks_like_object_scoped_query(intent.question)
+            else intent.target or self._find_referenced_target_in_question(intent.question)
         )
-        knowledge_notes = self._select_knowledge_notes(question=text, target=knowledge_target)
+        context = self._build_session_context(user_question=intent.question)
+        recent_memory = self._build_recent_chat_memory_block()
+        knowledge_notes = self._select_knowledge_notes(question=intent.question, target=knowledge_target)
         knowledge_context = (
             "Local knowledge notes:\n"
             + "\n".join(self._format_knowledge_note_snippet(note) for note in knowledge_notes)
@@ -25508,9 +27051,25 @@ class MainWindow(QMainWindow):
             prompt_sections.append(recent_memory)
         if knowledge_context:
             prompt_sections.append(knowledge_context)
-        prompt_sections.append(f"Current session context:\n{context}\n\nUser question: {text}")
+        prompt_sections.append(
+            f"Current session context:\n{context}\n\nUser question: {intent.question}"
+        )
         prompt = "\n\n".join(prompt_sections)
-        self._dispatch_llm(prompt, tag="chat", label=text)
+        self._dispatch_llm(
+            prompt,
+            tag="chat",
+            label=intent.label,
+            requested_class=intent.requested_class,
+            primary_target=intent.target,
+        )
+
+    @Slot()
+    def _send_ai_query(self) -> None:
+        text = self.ai_input.text().strip() if hasattr(self, "ai_input") else ""
+        if not text:
+            return
+        intent = self._resolve_ai_intent(text)
+        self._execute_ai_intent(intent)
 
     def _build_selected_target_llm_prompt(self, target: Target, question: str) -> str:
         compact_description = self._build_fast_target_llm_context(target)
@@ -25650,7 +27209,7 @@ class MainWindow(QMainWindow):
             initial_score_filter=float(self.min_score_spin.value()) if hasattr(self, "min_score_spin") else 0.0,
             bhtom_base_url=self._bhtom_api_base_url(),
             add_callback=self._append_target_to_plan,
-            reload_callback=None,
+            reload_callback=lambda: self._reload_local_target_suggestions(force_refresh=True),
             parent=self,
         )
         dlg.set_source_message(_bhtom_suggestion_source_message("loading"))
@@ -25658,7 +27217,8 @@ class MainWindow(QMainWindow):
         self._bhtom_dialog = dlg
         dlg.finished.connect(self._on_suggest_dialog_closed)
         self._set_bhtom_status("BHTOM: loading suggestions...", busy=True)
-        if not self._start_bhtom_worker(mode="suggest", emit_partials=True):
+        force_refresh = self._bhtom_should_fetch_from_network_now()
+        if not self._start_bhtom_worker(mode="suggest", emit_partials=True, force_refresh=force_refresh):
             self._bhtom_dialog = None
             dlg.set_loading_state(False, "Loading failed")
             self._set_bhtom_status("BHTOM: idle", busy=False)
@@ -25670,7 +27230,15 @@ class MainWindow(QMainWindow):
         if worker is None or not worker.isRunning():
             self._set_ai_status("Ready", tone="info")
 
-    def _dispatch_llm(self, prompt: str, tag: str, label: str) -> None:
+    def _dispatch_llm(
+        self,
+        prompt: str,
+        tag: str,
+        label: str,
+        *,
+        requested_class: str = "",
+        primary_target: Optional[Target] = None,
+    ) -> None:
         worker = self._llm_worker
         if worker is not None and worker.isRunning():
             self._append_ai_message(
@@ -25680,9 +27248,16 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
             self.ai_toggle_btn.setChecked(True)
-        self._append_ai_message(label, is_user=True)
+        self._append_ai_message(
+            label,
+            is_user=True,
+            requested_class=requested_class,
+            primary_target=primary_target,
+        )
         self._start_ai_response_message()
         self._set_ai_status("Thinking...", tone="info")
+        self._llm_active_requested_class = str(requested_class or "").strip()
+        self._llm_active_primary_target = primary_target if isinstance(primary_target, Target) else None
         worker = LLMWorker(
             config=self.llm_config,
             prompt=prompt,
@@ -25748,6 +27323,8 @@ class MainWindow(QMainWindow):
             self._llm_worker = None
         if active_tag == "warmup":
             self._llm_warmup_silent = False
+        self._llm_active_requested_class = ""
+        self._llm_active_primary_target = None
         self._llm_active_tag = ""
         self._refresh_ai_warm_indicator()
 
@@ -26451,6 +28028,8 @@ class MainWindow(QMainWindow):
 
     def _finalize_ai_response(self, text: str) -> None:
         self._ai_stream_render_timer.stop()
+        requested_class = str(getattr(self, "_llm_active_requested_class", "") or "").strip()
+        primary_target = getattr(self, "_llm_active_primary_target", None)
         idx = self._ai_stream_message_index
         if idx is not None and 0 <= idx < len(self._ai_messages):
             streamed_text = str(self._ai_messages[idx].get("text", "") or "")
@@ -26461,6 +28040,12 @@ class MainWindow(QMainWindow):
             self._ai_messages[idx]["kind"] = "ai"
             self._ai_messages[idx]["text"] = final_text
             self._ai_messages[idx]["action_targets"] = action_targets
+            if requested_class:
+                self._ai_messages[idx]["requested_class"] = requested_class
+            if isinstance(primary_target, Target):
+                self._ai_messages[idx]["primary_target"] = primary_target
+            if action_targets:
+                self._ai_messages[idx]["suggested_targets"] = list(action_targets)
             self._ai_stream_message_index = None
             self._render_ai_messages()
         else:
@@ -26469,6 +28054,8 @@ class MainWindow(QMainWindow):
                 final_text,
                 is_ai=True,
                 action_targets=self._extract_addable_bhtom_targets_from_ai_text(final_text),
+                requested_class=requested_class,
+                primary_target=primary_target if isinstance(primary_target, Target) else None,
             )
         self._ai_stream_message_index = None
         self._persist_ai_messages_to_storage()
@@ -26497,6 +28084,9 @@ class MainWindow(QMainWindow):
         is_ai: bool = False,
         is_error: bool = False,
         action_targets: Optional[list[Target]] = None,
+        requested_class: str = "",
+        primary_target: Optional[Target] = None,
+        suggested_targets: Optional[list[Target]] = None,
     ) -> int:
         kind = "user" if is_user else "error" if is_error else "ai" if is_ai else "info"
         payload: dict[str, Any] = {
@@ -26506,6 +28096,13 @@ class MainWindow(QMainWindow):
         }
         if action_targets:
             payload["action_targets"] = list(action_targets)
+        requested_class_value = str(requested_class or "").strip()
+        if requested_class_value:
+            payload["requested_class"] = requested_class_value
+        if isinstance(primary_target, Target):
+            payload["primary_target"] = primary_target
+        if suggested_targets:
+            payload["suggested_targets"] = [target for target in suggested_targets if isinstance(target, Target)]
         self._ai_messages.append(payload)
         self._render_ai_messages()
         if not is_ai or self._llm_active_tag in {"", "warmup"}:
