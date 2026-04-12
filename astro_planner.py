@@ -4078,13 +4078,9 @@ class GeneralSettingsDialog(QDialog):
 
         self.weather_default_source_combo = QComboBox(self)
         weather_sources = [
-            ("average", "Average (all live sources)"),
-            ("open_meteo", "Open-Meteo"),
+            ("average", "Average (real measurements)"),
             ("metar", "Nearest METAR"),
             ("custom", "Custom URL"),
-            ("meteoblue", "meteoblue"),
-            ("windy", "Windy"),
-            ("meteo_icm", "Meteo ICM"),
         ]
         for key, label in weather_sources:
             self.weather_default_source_combo.addItem(label, key)
@@ -6431,8 +6427,8 @@ class WeatherLiveWorker(QThread):
             "pressure_hpa": _safe_float(current.get("surface_pressure")),
             "status": "ok",
             "updated_utc": updated_utc,
-            "note": "Public no-key API (forecast + near-real-time conditions).",
-            "categories": ["conditions", "forecast"],
+            "note": "Public no-key API (forecast + near-real-time model output).",
+            "categories": ["forecast", "conditions_model"],
         }
         return {"provider": provider, "series": series}
 
@@ -6537,7 +6533,7 @@ class WeatherLiveWorker(QThread):
             "status": "ok",
             "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "note": "Live point forecast via Windy ECMWF endpoint.",
-            "categories": ["forecast", "conditions"],
+            "categories": ["forecast", "conditions_model"],
         }
         series = {
             "timestamps": ts[:96],
@@ -6600,7 +6596,7 @@ class WeatherLiveWorker(QThread):
             "status": "ok",
             "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "note": "Live mblue model via Windy endpoints.",
-            "categories": ["forecast", "conditions"],
+            "categories": ["forecast", "conditions_model"],
         }
         series = {
             "timestamps": ts[:96],
@@ -6714,7 +6710,7 @@ class WeatherLiveWorker(QThread):
             "status": "ok",
             "updated_utc": updated_utc,
             "note": f"Nearest station: {label} ({dist_km:.1f} km).",
-            "categories": ["conditions"],
+            "categories": ["conditions", "conditions_measured"],
         }
         series = {
             "timestamps": ts,
@@ -6773,7 +6769,7 @@ class WeatherLiveWorker(QThread):
             "status": status,
             "updated_utc": updated_utc,
             "note": note,
-            "categories": ["conditions"],
+            "categories": ["conditions", "conditions_measured"],
         }
 
         series_payload = payload.get("series") if isinstance(payload.get("series"), dict) else {}
@@ -6861,7 +6857,7 @@ class WeatherLiveWorker(QThread):
             "status": status,
             "updated_utc": updated_utc,
             "note": "Weather.com PWS endpoint. cloud_pct is not provided by this feed.",
-            "categories": ["conditions"],
+            "categories": ["conditions", "conditions_measured"],
         }
 
         timestamps: list[int] = []
@@ -6910,7 +6906,7 @@ class WeatherLiveWorker(QThread):
                     "status": "disabled",
                     "updated_utc": "-",
                     "note": "Custom URL is not configured for the current observatory.",
-                    "categories": ["conditions"],
+                    "categories": ["conditions", "conditions_measured"],
                 },
                 "series": {
                     "timestamps": [],
@@ -7199,13 +7195,20 @@ class WeatherLiveWorker(QThread):
         }
 
     @staticmethod
-    def _conditions_source_keys(provider_rows: dict[str, dict[str, object]]) -> list[str]:
+    def _is_measured_conditions_provider(key: str, row: object) -> bool:
+        if not isinstance(row, dict):
+            return False
+        key_txt = str(key or "").strip().lower()
+        if key_txt in {"metar", "custom"}:
+            return True
+        categories = row.get("categories")
+        return isinstance(categories, list) and "conditions_measured" in categories
+
+    @classmethod
+    def _conditions_source_keys(cls, provider_rows: dict[str, dict[str, object]]) -> list[str]:
         out: list[str] = []
         for key, row in provider_rows.items():
-            if not isinstance(row, dict):
-                continue
-            categories = row.get("categories")
-            if isinstance(categories, list) and "conditions" in categories:
+            if cls._is_measured_conditions_provider(str(key), row):
                 out.append(str(key))
         return out
 
@@ -7308,7 +7311,7 @@ class WeatherLiveWorker(QThread):
                 "status": "error",
                 "updated_utc": "-",
                 "note": str(exc),
-                "categories": ["conditions", "forecast"],
+                "categories": ["forecast", "conditions_model"],
             }
             errors.append(f"Open-Meteo: {exc}")
             self._emit_partial(payload)
@@ -7358,7 +7361,7 @@ class WeatherLiveWorker(QThread):
                 "status": "error",
                 "updated_utc": "-",
                 "note": str(exc),
-                "categories": ["forecast", "conditions"],
+                "categories": ["forecast", "conditions_model"],
             }
             errors.append(f"Windy: {exc}")
             self._emit_partial(payload)
@@ -7383,7 +7386,7 @@ class WeatherLiveWorker(QThread):
                 "status": "error",
                 "updated_utc": "-",
                 "note": str(exc),
-                "categories": ["forecast", "conditions"],
+                "categories": ["forecast", "conditions_model"],
             }
             errors.append(f"meteoblue: {exc}")
             self._emit_partial(payload)
@@ -7408,7 +7411,7 @@ class WeatherLiveWorker(QThread):
                 "status": "error",
                 "updated_utc": "-",
                 "note": str(exc),
-                "categories": ["conditions"],
+                "categories": ["conditions", "conditions_measured"],
             }
             errors.append(f"METAR: {exc}")
             self._emit_partial(payload)
@@ -7433,7 +7436,7 @@ class WeatherLiveWorker(QThread):
                 "status": "error",
                 "updated_utc": "-",
                 "note": str(exc),
-                "categories": ["conditions"],
+                "categories": ["conditions", "conditions_measured"],
             }
             errors.append(f"Custom URL: {exc}")
             self._emit_partial(payload)
@@ -7582,7 +7585,7 @@ class WeatherLiveWorker(QThread):
         forecast_err = 0
         conditions_ok = 0
         conditions_err = 0
-        for row in providers.values():
+        for key, row in providers.items():
             if not isinstance(row, dict):
                 continue
             categories = row.get("categories")
@@ -7594,7 +7597,7 @@ class WeatherLiveWorker(QThread):
                     forecast_ok += 1
                 elif status == "error":
                     forecast_err += 1
-            if "conditions" in categories:
+            if self._is_measured_conditions_provider(str(key), row):
                 if status in {"ok", "partial"}:
                     conditions_ok += 1
                 elif status == "error":
@@ -7609,7 +7612,7 @@ class WeatherLiveWorker(QThread):
                 "status": "ok"
                 if conditions_ok > 0 and conditions_err == 0
                 else ("partial" if conditions_ok > 0 else "error"),
-                "message": f"Conditions providers ok: {conditions_ok}, errors: {conditions_err}.",
+                "message": f"Measured conditions providers ok: {conditions_ok}, errors: {conditions_err}.",
             },
             "climatology": {
                 "status": (
@@ -7656,13 +7659,17 @@ class WeatherDialog(QDialog):
         ("meteo_icm", "Meteo ICM"),
     ]
     _CONDITION_SOURCE_CHOICES = [
-        ("average", "Average (all live sources)"),
-        ("open_meteo", "Open-Meteo"),
+        ("average", "Average (real measurements)"),
         ("metar", "Nearest METAR"),
         ("custom", "Custom URL"),
+    ]
+    _METEOGRAM_SOURCE_CHOICES = [
+        ("open_meteo", "Open-Meteo"),
         ("meteoblue", "meteoblue"),
         ("windy", "Windy"),
         ("meteo_icm", "Meteo ICM"),
+        ("metar", "Nearest METAR"),
+        ("custom", "Custom URL"),
     ]
 
     def __init__(self, parent=None):
@@ -8587,9 +8594,7 @@ class WeatherDialog(QDialog):
         self.meteogram_source_combo = QComboBox(row)
         self.meteogram_source_combo.setMinimumWidth(240)
         self.meteogram_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for key, label in self._CONDITION_SOURCE_CHOICES:
-            if key == "average":
-                continue
+        for key, label in self._METEOGRAM_SOURCE_CHOICES:
             self.meteogram_source_combo.addItem(label, key)
         row_l.addWidget(self.meteogram_source_combo, 1)
         row_l.addSpacing(8)
@@ -9226,6 +9231,20 @@ class WeatherDialog(QDialog):
                 return value
         return None
 
+    def _series_for_conditions_source(
+        self,
+        source_key: str,
+        series_map: dict[str, dict[str, object]],
+    ) -> Optional[dict[str, object]]:
+        if source_key != "average":
+            row = series_map.get(source_key)
+            return row if isinstance(row, dict) else None
+        for key in ("custom", "metar"):
+            candidate = series_map.get(key)
+            if self._series_has_points(candidate, min_points=1):
+                return candidate
+        return None
+
     @staticmethod
     def _trim_series_for_recent(series: Optional[dict[str, object]], max_points: int) -> Optional[dict[str, object]]:
         if not isinstance(series, dict):
@@ -9330,17 +9349,16 @@ class WeatherDialog(QDialog):
                 "cloud_pct": _safe_float((averages.get("cloud_pct") or {}).get("value")) if isinstance(averages.get("cloud_pct"), dict) else None,
                 "rh_pct": _safe_float((averages.get("rh_pct") or {}).get("value")) if isinstance(averages.get("rh_pct"), dict) else None,
                 "pressure_hpa": _safe_float((averages.get("pressure_hpa") or {}).get("value")) if isinstance(averages.get("pressure_hpa"), dict) else None,
-                "note": "Average values from available conditions providers.",
+                "note": "Average values from available measured sources.",
                 "updated_utc": "-",
             }
             if all(current_row.get(k) is None for k in ("temp_c", "wind_ms", "cloud_pct", "rh_pct", "pressure_hpa")):
                 # Fallback: compute averages from provider rows when aggregate payload is empty.
                 values_by_metric: dict[str, list[float]] = {k: [] for k in ("temp_c", "wind_ms", "cloud_pct", "rh_pct", "pressure_hpa")}
-                for row in providers.values():
+                for key, row in providers.items():
                     if not isinstance(row, dict):
                         continue
-                    categories = row.get("categories")
-                    if not (isinstance(categories, list) and "conditions" in categories):
+                    if not WeatherLiveWorker._is_measured_conditions_provider(str(key), row):
                         continue
                     status = str(row.get("status") or "").strip().lower()
                     if status not in {"ok", "partial"}:
@@ -9357,7 +9375,7 @@ class WeatherDialog(QDialog):
                         "cloud_pct": _avg_local(values_by_metric["cloud_pct"]),
                         "rh_pct": _avg_local(values_by_metric["rh_pct"]),
                         "pressure_hpa": _avg_local(values_by_metric["pressure_hpa"]),
-                        "note": "Average values from available conditions providers.",
+                        "note": "Average values from available measured sources.",
                     }
                 )
         else:
@@ -9403,8 +9421,7 @@ class WeatherDialog(QDialog):
         conditions_err = 0
         forecast_ok = 0
         forecast_err = 0
-        for key in ("open_meteo", "meteo_icm", "meteoblue", "windy", "metar", "custom"):
-            row = providers.get(key)
+        for key, row in providers.items():
             if not isinstance(row, dict):
                 continue
             categories = row.get("categories") if isinstance(row.get("categories"), list) else []
@@ -9417,7 +9434,7 @@ class WeatherDialog(QDialog):
                 elif status == "error":
                     forecast_err += 1
                 forecast_rows.append(f"{label}: {status}{f' ({note})' if note else ''}")
-            if "conditions" in categories:
+            if WeatherLiveWorker._is_measured_conditions_provider(str(key), row):
                 if status in {"ok", "partial"}:
                     conditions_ok += 1
                 elif status == "error":
@@ -9426,7 +9443,12 @@ class WeatherDialog(QDialog):
             cond_status = sections.get("conditions") if isinstance(sections.get("conditions"), dict) else {}
             cond_msg = str(cond_status.get("message") or "").strip()
             if cond_msg:
-                compact_msg = cond_msg.replace("Conditions providers", "").replace("providers", "").strip(" .:")
+                compact_msg = (
+                    cond_msg.replace("Measured conditions providers", "")
+                    .replace("Conditions providers", "")
+                    .replace("providers", "")
+                    .strip(" .:")
+                )
                 self.conditions_summary_label.setText(compact_msg or cond_msg)
                 self.conditions_summary_label.setToolTip(cond_msg)
             else:
@@ -9458,7 +9480,7 @@ class WeatherDialog(QDialog):
                 self.cloud_annual_label.setText(f"Annual avg {annual:.1f}%")
 
         # Conditions trend chart
-        selected_series = self._series_for_source(source_key if source_key != "average" else "open_meteo", series_map)
+        selected_series = self._series_for_conditions_source(source_key, series_map)
         parent = self.parent()
         dark = bool(getattr(parent, "settings", None).value("general/darkMode", DEFAULT_DARK_MODE, type=bool)) if hasattr(parent, "settings") else DEFAULT_DARK_MODE
 
@@ -9851,8 +9873,10 @@ class WeatherDialog(QDialog):
         if not value:
             return "Idle"
         lowered = value.lower()
+        if "average values from available measured sources" in lowered:
+            return "Avg measurements"
         if "average values from available conditions providers" in lowered:
-            return "Avg of sources"
+            return "Avg measurements"
         if "loading live weather providers" in lowered:
             return "Loading sources…"
         if "refreshing weather providers" in lowered:
@@ -22046,6 +22070,44 @@ class MainWindow(QMainWindow):
         ):
             self._apply_visibility_web_selection_style(sel_names)
 
+    @staticmethod
+    def _build_polar_visible_path(
+        alt_series: object,
+        az_series: object,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        alt_arr = np.array(alt_series, dtype=float).ravel()
+        az_arr = np.array(az_series, dtype=float).ravel()
+        n = min(alt_arr.size, az_arr.size)
+        if n <= 0:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        alt_arr = alt_arr[:n]
+        az_arr = np.mod(az_arr[:n], 360.0)
+        mask = np.isfinite(alt_arr) & np.isfinite(az_arr) & (alt_arr > 0.0)
+        vis_idx = np.where(mask)[0]
+        if vis_idx.size == 0:
+            return np.array([], dtype=float), np.array([], dtype=float)
+
+        theta_segments: list[np.ndarray] = []
+        r_segments: list[np.ndarray] = []
+        runs = np.split(vis_idx, np.where(np.diff(vis_idx) != 1)[0] + 1)
+        for run in runs:
+            if run.size == 0:
+                continue
+            theta_seg = np.deg2rad(az_arr[run])
+            r_seg = 90.0 - alt_arr[run]
+            wrap_pts = np.where(np.abs(np.diff(theta_seg)) > np.pi)[0] + 1
+            for wp in reversed(wrap_pts):
+                theta_seg = np.insert(theta_seg, int(wp), np.nan)
+                r_seg = np.insert(r_seg, int(wp), np.nan)
+            theta_segments.append(theta_seg)
+            r_segments.append(r_seg)
+            theta_segments.append(np.array([np.nan], dtype=float))
+            r_segments.append(np.array([np.nan], dtype=float))
+
+        if not theta_segments:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        return np.concatenate(theta_segments), np.concatenate(r_segments)
+
     @Slot(dict)
     def _update_polar_positions(self, data: dict, dynamic_only: bool = False):
         """Update all markers on the polar plot based on latest alt-az data."""
@@ -22131,15 +22193,8 @@ class MainWindow(QMainWindow):
                 setattr(self, line_attr, None)
 
             if self.show_sun_path and has_sun_path:
-                sun_alt_series = np.array(data["sun_alt"])
-                sun_az_series = np.array(data["sun_az"])
-                mask = sun_alt_series > 0
-                if mask.any():
-                    theta = np.deg2rad(sun_az_series[mask])
-                    r = 90 - sun_alt_series[mask]
-                    wrap_pts = np.where(np.abs(np.diff(theta)) > np.pi)[0] + 1
-                    theta = np.insert(theta, wrap_pts, np.nan)
-                    r = np.insert(r, wrap_pts, np.nan)
+                theta, r = self._build_polar_visible_path(data["sun_alt"], data["sun_az"])
+                if theta.size > 0 and r.size > 0:
                     self.sun_path_line, = self.polar_ax.plot(
                         theta,
                         r,
@@ -22151,15 +22206,8 @@ class MainWindow(QMainWindow):
                     )
 
             if self.show_moon_path and has_moon_path:
-                moon_alt_series = np.array(data["moon_alt"])
-                moon_az_series = np.array(data["moon_az"])
-                mask = moon_alt_series > 0
-                if mask.any():
-                    theta = np.deg2rad(moon_az_series[mask])
-                    r = 90 - moon_alt_series[mask]
-                    wrap_pts = np.where(np.abs(np.diff(theta)) > np.pi)[0] + 1
-                    theta = np.insert(theta, wrap_pts, np.nan)
-                    r = np.insert(r, wrap_pts, np.nan)
+                theta, r = self._build_polar_visible_path(data["moon_alt"], data["moon_az"])
+                if theta.size > 0 and r.size > 0:
                     self.moon_path_line, = self.polar_ax.plot(
                         theta,
                         r,
