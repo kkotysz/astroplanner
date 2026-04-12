@@ -110,19 +110,22 @@ Conditions sources:
 - observatory-level `Custom URL` JSON endpoint.
 - reference portal links in the UI: WeatherCloud / Wunderground / Windy.
 
-Custom conditions URL contract (required keys):
+Custom conditions URL accepts either:
 
-- `temp_c`
-- `wind_ms`
-- `cloud_pct`
-- `rh_pct`
+1. AstroPlanner JSON:
 
-Optional condition keys:
+- any subset of `temp_c`, `wind_ms`, `cloud_pct`, `rh_pct`, `pressure_hpa`
+- missing values are shown in the UI as `N/A`
+- optional metadata:
+  - `updated_utc`
+  - `source_label`
+  - `series` arrays (`timestamps`, `temp_c`, `wind_ms`, `cloud_pct`, `rh_pct`, `pressure_hpa`)
 
-- `pressure_hpa`
-- `updated_utc`
-- `source_label`
-- `series` arrays (`timestamps`, `temp_c`, `wind_ms`, `cloud_pct`, `rh_pct`, `pressure_hpa`)
+2. Weather.com PWS `observations/all/1day` JSON:
+
+- parsed natively by AstroPlanner when used as `Custom URL`
+- currently provides temperature, wind, humidity and pressure
+- cloud cover is not present in this feed, so `cloud_pct` is shown as `N/A`
 
 Cloud calculation in `Cloud Analysis`:
 

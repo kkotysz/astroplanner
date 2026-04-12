@@ -61,11 +61,16 @@ Edit `docker/seestar_alp/config.toml` before first run:
 
 Important: inside Docker, do not rely on broadcast or mDNS discovery. Use a fixed telescope IP.
 
+`[network].ip_address` should stay `0.0.0.0` in Docker. That is the bind address for the ALP service itself, not the telescope IP.
+
 Start the service:
 
 ```bash
 make up-seestar
 ```
+
+If you were previously running the simulator, `make up-seestar` now force-recreates `seestar-alp` with the real-device config so it does not keep using `config.simulator.toml`.
+It does not force a rebuild on every run anymore.
 
 ## 4. Simulator setup
 

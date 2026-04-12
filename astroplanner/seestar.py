@@ -20,6 +20,7 @@ import numpy as np
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
+from astroplanner.i18n import current_language, localize_widget_tree, translate_text
 from astroplanner.qt_helpers import configure_tab_widget
 
 
@@ -2848,6 +2849,7 @@ class SeestarGuidedAdapter(DeviceAdapter):
                     min_width=880,
                     min_height=620,
                 )
+                localize_widget_tree(self, current_language())
 
             def _export_bundle(self) -> None:
                 out_dir = QFileDialog.getExistingDirectory(self, "Select Seestar export directory", str(Path.cwd()))
@@ -3050,7 +3052,9 @@ class SeestarAlpAdapter(DeviceAdapter):
                 schedule_panel_l.addWidget(schedule_title)
                 self._schedule_table = QTableWidget(schedule_panel)
                 self._schedule_table.setColumnCount(3)
-                self._schedule_table.setHorizontalHeaderLabels(["#", "Action", "Detail"])
+                self._schedule_table.setHorizontalHeaderLabels(
+                    [translate_text(label, current_language()) for label in ["#", "Action", "Detail"]]
+                )
                 self._schedule_table.verticalHeader().setVisible(False)
                 self._schedule_table.setAlternatingRowColors(True)
                 self._schedule_table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -3072,7 +3076,7 @@ class SeestarAlpAdapter(DeviceAdapter):
                 self._blocks_table = QTableWidget(blocks_panel)
                 self._blocks_table.setColumnCount(6)
                 self._blocks_table.setHorizontalHeaderLabels(
-                    ["Target", "Start", "End", "Run", "Filter", "Notes"]
+                    [translate_text(label, current_language()) for label in ["Target", "Start", "End", "Run", "Filter", "Notes"]]
                 )
                 self._blocks_table.verticalHeader().setVisible(False)
                 self._blocks_table.setAlternatingRowColors(True)
@@ -3206,6 +3210,7 @@ class SeestarAlpAdapter(DeviceAdapter):
                     min_width=1240,
                     min_height=760,
                 )
+                localize_widget_tree(self, current_language())
 
                 self._refresh_preview_content()
                 QTimer.singleShot(0, self._refresh_status)
@@ -3515,6 +3520,7 @@ class SeestarAlpAdapter(DeviceAdapter):
                             min_width=680,
                             min_height=560,
                         )
+                        localize_widget_tree(self, current_language())
 
                     def _config(self, *, trigger: bool) -> SeestarSmartFlatsConfig:
                         min_exp = min(int(self.min_exp_spin.value()), int(self.max_exp_spin.value()))

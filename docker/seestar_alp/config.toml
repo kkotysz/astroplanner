@@ -55,6 +55,11 @@ num_keep_logs = 10
 log_events_in_info = true
 
 [[seestars]]
-name = "Seestar Alpha"
-ip_address = "seestar.local"
+name = "Ilum S50"
+ip_address = "192.168.1.192"
 device_num = 1
+
+# [[seestars]]
+# name = "Ilum S50"
+# ip_address = "10.0.0.1"
+# device_num = 1

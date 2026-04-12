@@ -170,3 +170,4 @@ docker/seestar_alp/data/alpyca.log*
 # BHTOM observatory presets runtime cache
 config/bhtom_observatory_presets_cache.json
 /astroplanner-venv
+/tmp

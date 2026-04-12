@@ -1,6 +1,7 @@
 .PHONY: help ps llm-install-help llm-pull llm-check llm-models llm-up-docker llm-pull-docker llm-models-docker llm-logs-docker llm-stop-docker up-seestar up-seestar-sim logs-seestar logs-seestar-sim stop-seestar down
 
 COMPOSE := ./scripts/astroplanner_compose.sh
+SEESTAR_REAL_CONFIG := ./docker/seestar_alp/config.toml
 SEESTAR_SIM_CONFIG := ./docker/seestar_alp/config.simulator.toml
 LLM_URL := http://localhost:11434
 LLM_MODEL := gemma4:e4b
@@ -83,7 +84,7 @@ llm-stop-docker:
 	@$(COMPOSE) --profile ollama stop $(OLLAMA_SERVICE)
 
 up-seestar:
-	@$(COMPOSE) up -d --build seestar-alp
+	@SEESTAR_ALP_CONFIG=$(SEESTAR_REAL_CONFIG) $(COMPOSE) up -d --force-recreate seestar-alp
 
 up-seestar-sim:
 	@SEESTAR_ALP_CONFIG=$(SEESTAR_SIM_CONFIG) $(COMPOSE) --profile simulator up -d --build seestar-alp seestar-simulator
