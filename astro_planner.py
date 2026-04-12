@@ -19991,19 +19991,38 @@ class MainWindow(QMainWindow):
         if not self._validate_site_inputs():
             return
         try:
-            site = Site(
-                name=self.obs_combo.currentText(),
-                latitude=self._read_site_float(self.lat_edit),
-                longitude=self._read_site_float(self.lon_edit),
-                elevation=self._read_site_float(self.elev_edit),
-                limiting_magnitude=self._current_limiting_magnitude(),
-            )
+            site = self._build_runtime_site_from_inputs()
         except (ValidationError, ValueError):
             return
         self.table_model.site = site
         self._start_clock_worker()
         self._schedule_plan_autosave()
         self._replot_timer.start()
+
+    def _build_runtime_site_from_inputs(self) -> Site:
+        selected_name = self.obs_combo.currentText() if hasattr(self, "obs_combo") else ""
+        template: Optional[Site] = None
+        if selected_name and hasattr(self, "observatories"):
+            maybe = self.observatories.get(selected_name)
+            if isinstance(maybe, Site):
+                template = maybe
+        if template is None:
+            current_site = getattr(self.table_model, "site", None) if hasattr(self, "table_model") else None
+            if isinstance(current_site, Site):
+                template = current_site
+        return Site(
+            name=selected_name or (template.name if isinstance(template, Site) else "Custom"),
+            latitude=self._read_site_float(self.lat_edit),
+            longitude=self._read_site_float(self.lon_edit),
+            elevation=self._read_site_float(self.elev_edit),
+            limiting_magnitude=self._current_limiting_magnitude(),
+            telescope_diameter_mm=float(getattr(template, "telescope_diameter_mm", 0.0) or 0.0),
+            focal_length_mm=float(getattr(template, "focal_length_mm", 0.0) or 0.0),
+            pixel_size_um=float(getattr(template, "pixel_size_um", 0.0) or 0.0),
+            detector_width_px=int(getattr(template, "detector_width_px", 0) or 0),
+            detector_height_px=int(getattr(template, "detector_height_px", 0) or 0),
+            custom_conditions_url=str(getattr(template, "custom_conditions_url", "") or "").strip(),
+        )
 
     def _cleanup_threads(self):
         """Stop timer and threads cleanly on exit (order matters)."""
@@ -21244,13 +21263,7 @@ class MainWindow(QMainWindow):
         if not self._validate_site_inputs():
             return False
         try:
-            site = Site(
-                name=self.obs_combo.currentText(),
-                latitude=self._read_site_float(self.lat_edit),
-                longitude=self._read_site_float(self.lon_edit),
-                elevation=self._read_site_float(self.elev_edit),
-                limiting_magnitude=self._current_limiting_magnitude(),
-            )
+            site = self._build_runtime_site_from_inputs()
             tz_name = str(payload.get("tz", site.timezone_name) or site.timezone_name)
             observer = Observer(location=site.to_earthlocation(), timezone=tz_name)
             times_num = np.array(payload["times"], dtype=float)
@@ -21326,13 +21339,7 @@ class MainWindow(QMainWindow):
         if not self._validate_site_inputs():
             return
         try:
-            site = Site(
-                name=self.obs_combo.currentText(),
-                latitude=self._read_site_float(self.lat_edit),
-                longitude=self._read_site_float(self.lon_edit),
-                elevation=self._read_site_float(self.elev_edit),
-                limiting_magnitude=self._current_limiting_magnitude(),
-            )
+            site = self._build_runtime_site_from_inputs()
             settings = SessionSettings(
                 date=self.date_edit.date(),
                 site=site,
