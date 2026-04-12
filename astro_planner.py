@@ -12568,18 +12568,56 @@ class AstronomyWorker(QThread):
             ra=np.array(events["moon_ra"]) * u.deg,
             dec=np.array(events["moon_dec"]) * u.deg,
         )
-        for tgt in self.targets:
-            if self.isInterruptionRequested():
-                self.aborted.emit()
-                return
-            fixed = FixedTarget(name=tgt.name, coord=tgt.skycoord)
-            altaz = observer.altaz(times, fixed)
-            moon_sep = tgt.skycoord.separation(moon_coords).deg
-            payload[tgt.name] = {
-                "altitude": altaz.alt.deg,    # type: ignore[arg-type]
-                "azimuth": altaz.az.deg,  # type: ignore[arg-type]
-                "moon_sep": moon_sep,  # type: ignore[arg-type]
-            }
+        target_count = len(self.targets)
+        sample_count = len(times)
+
+        def _normalize_target_time_grid(values: object) -> np.ndarray:
+            arr = np.array(values, dtype=float)
+            if arr.ndim == 1:
+                if target_count == 1 and arr.shape[0] == sample_count:
+                    return arr.reshape(1, sample_count)
+                raise ValueError(f"Unexpected 1D visibility grid shape: {arr.shape}")
+            if arr.shape == (target_count, sample_count):
+                return arr
+            if arr.shape == (sample_count, target_count):
+                return arr.T
+            raise ValueError(f"Unexpected visibility grid shape: {arr.shape}")
+
+        if target_count > 0:
+            try:
+                target_coords = SkyCoord(
+                    ra=np.array([float(t.ra) for t in self.targets], dtype=float) * u.deg,
+                    dec=np.array([float(t.dec) for t in self.targets], dtype=float) * u.deg,
+                )
+                altaz_grid = observer.altaz(times, target_coords, grid_times_targets=True)
+                alt_grid = _normalize_target_time_grid(altaz_grid.alt.deg)
+                az_grid = _normalize_target_time_grid(altaz_grid.az.deg)
+                moon_sep_grid = _normalize_target_time_grid(
+                    target_coords[:, np.newaxis].separation(moon_coords[np.newaxis, :]).deg
+                )
+                for idx, tgt in enumerate(self.targets):
+                    if self.isInterruptionRequested():
+                        self.aborted.emit()
+                        return
+                    payload[tgt.name] = {
+                        "altitude": alt_grid[idx],
+                        "azimuth": az_grid[idx],
+                        "moon_sep": moon_sep_grid[idx],
+                    }
+            except Exception:
+                # Fallback path keeps compatibility across astroplan/astropy variants.
+                for tgt in self.targets:
+                    if self.isInterruptionRequested():
+                        self.aborted.emit()
+                        return
+                    fixed = FixedTarget(name=tgt.name, coord=tgt.skycoord)
+                    altaz = observer.altaz(times, fixed)
+                    moon_sep = tgt.skycoord.separation(moon_coords).deg
+                    payload[tgt.name] = {
+                        "altitude": altaz.alt.deg,    # type: ignore[arg-type]
+                        "azimuth": altaz.az.deg,  # type: ignore[arg-type]
+                        "moon_sep": moon_sep,  # type: ignore[arg-type]
+                    }
         # Tell the GUI which timezone we used
         payload["tz"] = site.timezone_name   
         logger.info("AstronomyWorker finished (%d targets, date %s)",
@@ -13511,17 +13549,17 @@ class MainWindow(QMainWindow):
         self.info_widget.adjustSize()
         content_hint = self.info_widget.minimumSizeHint()
         content_h = max(self.info_widget.sizeHint().height(), content_hint.height())
-        content_w = max(self.info_widget.sizeHint().width(), content_hint.width())
         title_h = self.info_title_label.sizeHint().height() if hasattr(self, "info_title_label") else 20
         card_min_h = max(220, content_h + title_h + 30)
-        card_min_w = max(330, content_w + 26)
+        card_min_w = max(330, int(getattr(self, "_night_details_fixed_min_width", 330)))
         self.info_card.setMinimumHeight(card_min_h)
         self.info_card.setMinimumWidth(card_min_w)
         if hasattr(self, "info_scroll"):
             self.info_scroll.setMinimumHeight(content_h + 6)
-            self.info_scroll.setMinimumWidth(content_w + 8)
+            self.info_scroll.setMinimumWidth(max(260, card_min_w - 18))
         if hasattr(self, "right_dashboard"):
-            self.right_dashboard.setMinimumWidth(max(460, card_min_w + 22))
+            dashboard_base_min = max(460, int(getattr(self, "_right_dashboard_base_min_width", 460)))
+            self.right_dashboard.setMinimumWidth(max(dashboard_base_min, card_min_w + 22))
 
     def _ensure_display_font_loaded(self) -> None:
         global _DISPLAY_FONT_LOADED, _DISPLAY_FONT_QT_FAMILY
@@ -14048,6 +14086,7 @@ class MainWindow(QMainWindow):
         if ok:
             self._visibility_web_has_content = True
             self._set_visibility_loading_state("", visible=False)
+            self._apply_visibility_web_selection_style()
             return
         self._visibility_web_has_content = False
         self._set_visibility_loading_state("Unable to render interactive chart.", visible=True)
@@ -14550,6 +14589,23 @@ class MainWindow(QMainWindow):
                 names.append(self.targets[row].name)
         return names
 
+    def _schedule_selected_cutout_update(self, target: Optional[Target]) -> None:
+        self._pending_selected_cutout_target = target
+        if getattr(self, "_defer_startup_preview_updates", False):
+            return
+        if hasattr(self, "_selected_cutout_update_timer"):
+            self._selected_cutout_update_timer.start()
+            return
+        self._flush_selected_cutout_update()
+
+    @Slot()
+    def _flush_selected_cutout_update(self) -> None:
+        if getattr(self, "_defer_startup_preview_updates", False):
+            return
+        target = self._pending_selected_cutout_target
+        self._pending_selected_cutout_target = None
+        self._update_cutout_preview_for_target(target)
+
     def _refresh_visibility_matplotlib_mode_only(self, data: Optional[dict] = None) -> None:
         payload = data if isinstance(data, dict) else getattr(self, "last_payload", None)
         if not isinstance(payload, dict):
@@ -14637,7 +14693,6 @@ class MainWindow(QMainWindow):
             "date": self.date_edit.date().toString("yyyy-MM-dd") if hasattr(self, "date_edit") else "",
             "sun": bool(self.sun_check.isChecked()) if hasattr(self, "sun_check") else True,
             "moon": bool(self.moon_check.isChecked()) if hasattr(self, "moon_check") else True,
-            "selected": sorted(self._selected_target_names()),
             "targets": target_signature,
             "now": now_key,
         }
@@ -14662,6 +14717,46 @@ class MainWindow(QMainWindow):
     def _flush_visibility_plot_refresh(self) -> None:
         if isinstance(getattr(self, "last_payload", None), dict):
             self._render_visibility_web_plot(self.last_payload)
+
+    def _apply_visibility_web_selection_style(self, selected_names: Optional[set[str]] = None) -> None:
+        if not bool(getattr(self, "_use_visibility_web", False)):
+            return
+        if not bool(getattr(self, "_visibility_web_has_content", False)):
+            return
+        web_view = getattr(self, "visibility_web", None)
+        if web_view is None:
+            return
+        page = web_view.page() if hasattr(web_view, "page") else None
+        if page is None:
+            return
+        if selected_names is None:
+            selected_names = set(self._selected_target_names())
+        selected_list = sorted(str(name) for name in selected_names if str(name).strip())
+        selected_json = json.dumps(selected_list, ensure_ascii=False)
+        script = (
+            "(function(){"
+            f"const selected = new Set({selected_json});"
+            "const gd=document.querySelector('.plotly-graph-div');"
+            "if(!gd||!window.Plotly||!Array.isArray(gd.data)){return 0;}"
+            "const indices=[];const widths=[];const opacities=[];"
+            "for(let i=0;i<gd.data.length;i++){"
+            "const tr=gd.data[i]||{};const meta=tr.meta;"
+            "if(!meta||typeof meta!=='object'||meta.kind!=='target'){continue;}"
+            "const name=String(meta.target||'');if(!name){continue;}"
+            "const seg=String(meta.segment||'');"
+            "const isSelected=selected.has(name);"
+            "if(seg==='base'){indices.push(i);widths.push(1.4);opacities.push(isSelected?0.40:0.28);}"
+            "else if(seg==='high'){indices.push(i);widths.push(isSelected?2.8:1.9);opacities.push(isSelected?1.00:0.92);}"
+            "}"
+            "if(!indices.length){return 0;}"
+            "Plotly.restyle(gd, {'line.width': widths, 'opacity': opacities}, indices);"
+            "return indices.length;"
+            "})();"
+        )
+        try:
+            page.runJavaScript(script)
+        except Exception:
+            return
 
     def _apply_visibility_line_style(self, line: object, *, is_over: bool, is_selected: bool) -> None:
         if line is None:
@@ -14767,7 +14862,6 @@ class MainWindow(QMainWindow):
         row_enabled = list(getattr(self.table_model, "row_enabled", []))
         if len(row_enabled) != len(self.targets):
             row_enabled = [True] * len(self.targets)
-        selected_names = set(self._selected_target_names())
         start_dt, end_dt, event_map = self._visibility_time_window(data, tz)
         grid_css = self._visibility_grid_color(alpha=0.42)
         guide_css = self._visibility_grid_color(alpha=0.24)
@@ -14805,38 +14899,13 @@ class MainWindow(QMainWindow):
                     hoverinfo="skip",
                     line={"color": color, "width": 1.4, "dash": "dash"},
                     opacity=0.28,
+                    meta={"kind": "target", "target": tgt.name, "segment": "base"},
                 )
             )
 
             high_mask = np.isfinite(alt) & (alt >= limit) & obs_sun_mask
             if high_mask.any():
                 high_y = _visible_series(self._plot_y_values(alt), high_mask)
-                is_selected = tgt.name in selected_names
-                if is_selected:
-                    glow_color = QColor(color)
-                    if not glow_color.isValid():
-                        glow_color = self._theme_qcolor("accent_secondary", "#ff4fd8")
-                    for width, alpha in (
-                        (20.0, 0.012),
-                        (17.0, 0.020),
-                        (14.2, 0.032),
-                        (11.6, 0.048),
-                        (9.2, 0.070),
-                        (7.1, 0.102),
-                        (5.4, 0.144),
-                    ):
-                        fig.add_trace(
-                            go.Scatter(
-                                x=times,
-                                y=high_y,
-                                mode="lines",
-                                name=f"{tgt.name} glow",
-                                showlegend=False,
-                                hoverinfo="skip",
-                                line={"color": self._qcolor_rgba_css(glow_color, alpha), "width": width},
-                                opacity=1.0,
-                            )
-                        )
                 fig.add_trace(
                     go.Scatter(
                         x=times,
@@ -14844,9 +14913,10 @@ class MainWindow(QMainWindow):
                         mode="lines",
                         name=tgt.name,
                         showlegend=False,
-                        line={"color": color, "width": 2.8 if is_selected else 1.9},
-                        opacity=1.0 if is_selected else 0.92,
+                        line={"color": color, "width": 1.9},
+                        opacity=0.92,
                         hovertemplate=f"{tgt.name}<br>%{{x|%H:%M}}<br>{y_title}: %{{y:{y_precision}}}<extra></extra>",
+                        meta={"kind": "target", "target": tgt.name, "segment": "high"},
                     )
                 )
 
@@ -17634,6 +17704,15 @@ class MainWindow(QMainWindow):
         self._visibility_plot_refresh_timer.setSingleShot(True)
         self._visibility_plot_refresh_timer.setInterval(0)
         self._visibility_plot_refresh_timer.timeout.connect(self._flush_visibility_plot_refresh)
+        self._selected_cutout_update_timer = QTimer(self)
+        self._selected_cutout_update_timer.setSingleShot(True)
+        self._selected_cutout_update_timer.setInterval(90)
+        self._selected_cutout_update_timer.timeout.connect(self._flush_selected_cutout_update)
+        self._pending_selected_cutout_target: Optional[Target] = None
+        self._last_vis_selected_names: set[str] = set()
+        self._last_polar_selection_signature: tuple[str, ...] = ()
+        # Keep web visibility selection highlight enabled via lightweight Plotly.restyle.
+        self._visibility_web_sync_selection = True
         self._visibility_web_html_cache: dict[str, str] = {}
         self._table_column_width_reset_requested = False
         self._table_column_width_timer = QTimer(self)
@@ -18238,6 +18317,7 @@ class MainWindow(QMainWindow):
         right_info_form.setHorizontalSpacing(6)
         right_info_form.setVerticalSpacing(2)
         right_info_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        right_info_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         right_info_widget.setLayout(right_info_form)
 
         info_layout.addWidget(left_info_widget, 1)
@@ -18268,6 +18348,7 @@ class MainWindow(QMainWindow):
         value_font.setPointSize(10)
         self.info_label_font = label_font
         self.info_value_font = value_font
+        value_line_h = max(16, QFontMetrics(self.info_value_font).lineSpacing())
         self.sun_alt_label = QLabel("-")
         self.moon_alt_label = QLabel("-")
         self.sidereal_label = QLabel("-")
@@ -18278,7 +18359,16 @@ class MainWindow(QMainWindow):
         self.sel_score_label = QLabel("-")
         self.sel_window_label = QLabel("-")
         self.sel_notes_label = QLabel("-")
-        self.sel_notes_label.setWordWrap(True)
+        for dynamic_value_label in (self.sel_name_label, self.sel_type_label, self.sel_notes_label):
+            dynamic_value_label.setWordWrap(True)
+            dynamic_value_label.setMinimumWidth(0)
+            dynamic_value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            dynamic_value_label.setMinimumHeight(value_line_h + 2)
+        # Reserve two text lines for target/type so short values don't collapse the row
+        # and medium-length values don't cause visible "jumping" between selections.
+        reserved_two_lines_h = value_line_h * 2 + 4
+        self.sel_name_label.setMinimumHeight(reserved_two_lines_h)
+        self.sel_type_label.setMinimumHeight(reserved_two_lines_h)
 
         details_row = QWidget()
         details_layout = QVBoxLayout()
@@ -18322,6 +18412,9 @@ class MainWindow(QMainWindow):
         _add_info_row(right_info_form, 4, "sidereal", "Score:", self.sel_score_label)
         _add_info_row(right_info_form, 5, "window", "Best window:", self.sel_window_label)
         _add_info_row(right_info_form, 6, "notes", "Notes:", details_row)
+        self.sel_name_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.sel_type_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.sel_notes_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
         self.info_widget.setContentsMargins(0, 0, 0, 0)
 
@@ -18469,6 +18562,7 @@ class MainWindow(QMainWindow):
         info_card.setLayout(info_l)
         self.info_card = info_card
         info_card.setMinimumHeight(220)
+        self._night_details_fixed_min_width = max(330, self.info_widget.minimumSizeHint().width() + 26)
 
         right_dashboard = QSplitter(Qt.Vertical)
         right_dashboard.addWidget(polar_card)
@@ -18478,6 +18572,7 @@ class MainWindow(QMainWindow):
         right_dashboard.setStretchFactor(1, 2)
         right_dashboard.setSizes([390, 300])
         right_dashboard.setMinimumWidth(460)
+        self._right_dashboard_base_min_width = 460
         right_dashboard.setMaximumWidth(16777215)
         right_dashboard.setChildrenCollapsible(False)
         self.right_dashboard = right_dashboard
@@ -19513,15 +19608,13 @@ class MainWindow(QMainWindow):
             self.edit_object_btn.setEnabled(False)
             if hasattr(self, "ai_describe_act"):
                 self.ai_describe_act.setEnabled(False)
-            if not getattr(self, "_defer_startup_preview_updates", False):
-                self._update_cutout_preview_for_target(None)
-            self._update_night_details_constraints()
+            self._schedule_selected_cutout_update(None)
             self._update_status_bar()
             return
 
         row = rows[0]
         if not (0 <= row < len(self.targets)):
-            self._update_cutout_preview_for_target(None)
+            self._schedule_selected_cutout_update(None)
             return
         tgt = self.targets[row]
         self._ensure_known_target_type(tgt)
@@ -19559,9 +19652,7 @@ class MainWindow(QMainWindow):
         self.edit_object_btn.setEnabled(True)
         if hasattr(self, "ai_describe_act"):
             self.ai_describe_act.setEnabled(True)
-        if not getattr(self, "_defer_startup_preview_updates", False):
-            self._update_cutout_preview_for_target(tgt)
-        self._update_night_details_constraints()
+        self._schedule_selected_cutout_update(tgt)
         self._update_status_bar()
 
     def _edit_notes_for_row(self, row: int):
@@ -21112,6 +21203,54 @@ class MainWindow(QMainWindow):
     def _plan_contains_target(self, target: Target) -> bool:
         return any(_targets_match(existing, target) for existing in self.targets)
 
+    def _try_fast_append_visibility_update(self, target: Target) -> bool:
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            return False
+        payload = getattr(self, "last_payload", None)
+        if not isinstance(payload, dict):
+            return False
+        current_key = self._current_visibility_context_key()
+        payload_key = str(payload.get("site_key", "") or "")
+        if not current_key or not payload_key or payload_key != current_key:
+            return False
+        if target.name in payload:
+            return True
+        if "times" not in payload or "moon_ra" not in payload or "moon_dec" not in payload:
+            return False
+        if not self._validate_site_inputs():
+            return False
+        try:
+            site = Site(
+                name=self.obs_combo.currentText(),
+                latitude=self._read_site_float(self.lat_edit),
+                longitude=self._read_site_float(self.lon_edit),
+                elevation=self._read_site_float(self.elev_edit),
+                limiting_magnitude=self._current_limiting_magnitude(),
+            )
+            tz_name = str(payload.get("tz", site.timezone_name) or site.timezone_name)
+            observer = Observer(location=site.to_earthlocation(), timezone=tz_name)
+            times_num = np.array(payload["times"], dtype=float)
+            times = Time(mdates.num2date(times_num))
+            fixed = FixedTarget(name=target.name, coord=target.skycoord)
+            altaz = observer.altaz(times, fixed)
+            moon_ra = np.array(payload.get("moon_ra", []), dtype=float)
+            moon_dec = np.array(payload.get("moon_dec", []), dtype=float)
+            if moon_ra.size != times_num.size or moon_dec.size != times_num.size:
+                return False
+            moon_coords = SkyCoord(ra=moon_ra * u.deg, dec=moon_dec * u.deg)
+            moon_sep = target.skycoord.separation(moon_coords).deg
+            merged = dict(payload)
+            merged[target.name] = {
+                "altitude": np.array(altaz.alt.deg, dtype=float),  # type: ignore[arg-type]
+                "azimuth": np.array(altaz.az.deg, dtype=float),  # type: ignore[arg-type]
+                "moon_sep": np.array(moon_sep, dtype=float),
+            }
+            self._update_plot(merged)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Fast append visibility update failed for %s: %s", target.name, exc)
+            return False
+
     def _append_target_to_plan(
         self,
         target: Target,
@@ -21133,7 +21272,8 @@ class MainWindow(QMainWindow):
             self._refresh_target_color_map()
             self._emit_table_data_changed()
             self._fetch_missing_magnitudes_async()
-            self._replot_timer.start()
+            if not self._try_fast_append_visibility_update(target_copy):
+                self._replot_timer.start()
 
             for row_idx, existing in enumerate(self.targets):
                 if existing is target_copy or _targets_match(existing, target_copy):
@@ -21465,17 +21605,34 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------------------
         # Compute and cache current alt, az, sep for each target for the table
 
-        current_alts = []
-        current_azs = []
-        current_seps = []
-        for tgt in self.targets:
-            # alt/az via astroplan
-            fixed = FixedTarget(name=tgt.name, coord=tgt.skycoord)
-            altaz_now = observer_now.altaz(Time(now_dt), fixed)
-            current_alts.append(float(altaz_now.alt.deg))                                       # type: ignore[arg-type]
-            current_azs.append(float(altaz_now.az.deg))                                         # type: ignore[arg-type]
-            # sep via PyEphem
-            current_seps.append(float(tgt.skycoord.separation(moon_coord).deg))                 # type: ignore[arg-type]
+        current_alts: list[float] = []
+        current_azs: list[float] = []
+        current_seps: list[float] = []
+        if self.targets:
+            try:
+                coords_now = SkyCoord(
+                    ra=np.array([float(t.ra) for t in self.targets], dtype=float) * u.deg,
+                    dec=np.array([float(t.dec) for t in self.targets], dtype=float) * u.deg,
+                )
+                altaz_now_all = observer_now.altaz(Time(now_dt), coords_now)
+                alt_vals = np.array(altaz_now_all.alt.deg, dtype=float)  # type: ignore[arg-type]
+                az_vals = np.array(altaz_now_all.az.deg, dtype=float)  # type: ignore[arg-type]
+                sep_vals = np.array(coords_now.separation(moon_coord).deg, dtype=float)
+                current_alts = [float(value) for value in np.ravel(alt_vals)]
+                current_azs = [float(value) for value in np.ravel(az_vals)]
+                current_seps = [float(value) for value in np.ravel(sep_vals)]
+                if len(current_alts) != len(self.targets):
+                    raise ValueError("Unexpected alt/az vector size.")
+            except Exception:
+                current_alts = []
+                current_azs = []
+                current_seps = []
+                for tgt in self.targets:
+                    fixed = FixedTarget(name=tgt.name, coord=tgt.skycoord)
+                    altaz_now = observer_now.altaz(Time(now_dt), fixed)
+                    current_alts.append(float(altaz_now.alt.deg))  # type: ignore[arg-type]
+                    current_azs.append(float(altaz_now.az.deg))  # type: ignore[arg-type]
+                    current_seps.append(float(tgt.skycoord.separation(moon_coord).deg))  # type: ignore[arg-type]
 
         # Assign to model and refresh table
         self.table_model.current_alts = current_alts
@@ -21656,6 +21813,10 @@ class MainWindow(QMainWindow):
         self.plot_canvas.draw_idle()
         self._render_visibility_web_plot(data)
         self._update_polar_positions(data)
+        # Force one selected-path refresh after a full recompute.
+        # Selection signatures are debounced in live selection updates.
+        self._last_polar_selection_signature = ()
+        self._update_polar_selection(None, None)
         if self._queued_plan_run:
             self._queued_plan_run = False
             QTimer.singleShot(0, self._run_plan)
@@ -21744,19 +21905,27 @@ class MainWindow(QMainWindow):
     def _update_polar_selection(self, selected, deselected):
         """Update highlight for selected targets on polar plot."""
         # Gather selected rows
-        sel_rows = [idx.row() for idx in self.table_view.selectionModel().selectedRows()]
+        sel_rows = sorted(idx.row() for idx in self.table_view.selectionModel().selectedRows())
+        selection_signature = tuple(
+            self.targets[row].name
+            for row in sel_rows
+            if 0 <= row < len(self.targets)
+        )
+        if selection_signature == getattr(self, "_last_polar_selection_signature", ()):
+            return
+        self._last_polar_selection_signature = selection_signature
         # Prepare coordinates for selected targets
         sel_coords = []
-        for i, tgt in enumerate(self.targets):
-            if i in sel_rows:
-                if i < len(self.table_model.row_enabled) and not self.table_model.row_enabled[i]:
-                    continue
-                alt = self.table_model.current_alts[i] if i < len(self.table_model.current_alts) else None
-                az = self.table_model.current_azs[i] if i < len(self.table_model.current_azs) else None
-                if alt is not None and az is not None and alt > 0:
-                    theta = np.deg2rad(az)
-                    r = 90 - alt
-                    sel_coords.append((theta, r))
+        for row in sel_rows:
+            if row < len(self.table_model.row_enabled) and not self.table_model.row_enabled[row]:
+                continue
+            alt = self.table_model.current_alts[row] if row < len(self.table_model.current_alts) else None
+            az = self.table_model.current_azs[row] if row < len(self.table_model.current_azs) else None
+            if alt is None or az is None or alt <= 0:
+                continue
+            theta = np.deg2rad(az)
+            r = 90 - alt
+            sel_coords.append((theta, r))
         if sel_coords:
             arr = np.array(sel_coords)
             self.selected_scatter.set_offsets(arr)
@@ -21853,14 +22022,29 @@ class MainWindow(QMainWindow):
     def _update_vis_selection(self, selected, deselected):
         """Adjust visibility plot alpha and width based on table selection."""
         sel_rows = [idx.row() for idx in self.table_view.selectionModel().selectedRows()]
-        sel_names = [self.targets[i].name for i in sel_rows]
+        sel_names = {
+            self.targets[i].name
+            for i in sel_rows
+            if 0 <= i < len(self.targets)
+        }
+        previous_sel_names = set(getattr(self, "_last_vis_selected_names", set()))
+        if sel_names == previous_sel_names:
+            return
+        changed_names = sel_names.symmetric_difference(previous_sel_names)
+        self._last_vis_selected_names = set(sel_names)
+
         for name, line, is_over in self.vis_lines:
+            if name not in changed_names:
+                continue
             self._apply_visibility_line_style(line, is_over=is_over, is_selected=(name in sel_names))
         plot_canvas = getattr(self, "plot_canvas", None)
         if plot_canvas is not None:
             plot_canvas.draw_idle()
-        if isinstance(getattr(self, "last_payload", None), dict):
-            self._render_visibility_web_plot(self.last_payload)
+        if (
+            bool(getattr(self, "_visibility_web_sync_selection", False))
+            and isinstance(getattr(self, "last_payload", None), dict)
+        ):
+            self._apply_visibility_web_selection_style(sel_names)
 
     @Slot(dict)
     def _update_polar_positions(self, data: dict, dynamic_only: bool = False):
