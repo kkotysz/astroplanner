@@ -238,7 +238,7 @@ class AIPanelCoordinator(QObject):
 
         planner._ai_output_placeholder_text = (
             "AI responses will appear here.\n"
-            "Configure Ollama or another local LLM in Settings -> General Settings."
+            "Configure Jan or another OpenAI-compatible local LLM in Settings -> General Settings."
         )
         planner.ai_output = QScrollArea(panel)
         planner.ai_output.setWidgetResizable(True)

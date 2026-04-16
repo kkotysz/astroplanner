@@ -1947,14 +1947,14 @@ _SOURCE_TRANSLATIONS: dict[str, dict[str, str]] = {
         "it": "Cancella",
         "pt": "Limpar",
     },
-    "AI responses will appear here.\nConfigure Ollama or another local LLM in Settings -> General Settings.": {
-        "pl": "Odpowiedzi AI pojawią się tutaj.\nSkonfiguruj Ollama lub inny lokalny LLM w Ustawieniach -> Ustawienia ogólne.",
-        "cs": "Odpovědi AI se zobrazí zde.\nNakonfigurujte Ollama nebo jiný lokální LLM v Nastavení -> Obecná nastavení.",
-        "fr": "Les réponses de l'IA apparaîtront ici.\nConfigurez Ollama ou un autre LLM local dans Paramètres -> Paramètres généraux.",
-        "de": "KI-Antworten erscheinen hier.\nKonfigurieren Sie Ollama oder ein anderes lokales LLM unter Einstellungen -> Allgemeine Einstellungen.",
-        "es": "Las respuestas de IA aparecerán aquí.\nConfigure Ollama u otro LLM local en Configuración -> Configuración general.",
-        "it": "Le risposte IA appariranno qui.\nConfigura Ollama o un altro LLM locale in Impostazioni -> Impostazioni generali.",
-        "pt": "As respostas da IA aparecerão aqui.\nConfigure o Ollama ou outro LLM local em Configurações -> Configurações gerais.",
+    "AI responses will appear here.\nConfigure Jan or another OpenAI-compatible local LLM in Settings -> General Settings.": {
+        "pl": "Odpowiedzi AI pojawią się tutaj.\nSkonfiguruj Jan lub inny lokalny LLM zgodny z OpenAI w Ustawieniach -> Ustawienia ogólne.",
+        "cs": "Odpovědi AI se zobrazí zde.\nNakonfigurujte Jan nebo jiný lokální LLM kompatibilní s OpenAI v Nastavení -> Obecná nastavení.",
+        "fr": "Les réponses de l'IA apparaîtront ici.\nConfigurez Jan ou un autre LLM local compatible OpenAI dans Paramètres -> Paramètres généraux.",
+        "de": "KI-Antworten erscheinen hier.\nKonfigurieren Sie Jan oder ein anderes OpenAI-kompatibles lokales LLM unter Einstellungen -> Allgemeine Einstellungen.",
+        "es": "Las respuestas de IA aparecerán aquí.\nConfigure Jan u otro LLM local compatible con OpenAI en Configuración -> Configuración general.",
+        "it": "Le risposte IA appariranno qui.\nConfigura Jan o un altro LLM locale compatibile con OpenAI in Impostazioni -> Impostazioni generali.",
+        "pt": "As respostas da IA aparecerão aqui.\nConfigure o Jan ou outro LLM local compatível com OpenAI em Configurações -> Configurações gerais.",
     },
     "Ask about tonight or the selected object...": {
         "pl": "Zapytaj o dzisiejszą noc lub wybrany obiekt...",

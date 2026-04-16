@@ -956,6 +956,7 @@ class GeneralSettingsDialog(QDialog):
         llm_model_row_l.addWidget(self.llm_models_status, 1)
         ai_layout.addRow("", llm_model_row)
         llm_endpoint_hint = QLabel(
+            "Recommended: Jan local API; use Jan's server URL and active/default model.\n"
             "Ollama: URL http://localhost:11434, model gemma4:e4b\n"
             "Docker Model Runner: URL http://localhost:12434/engines, model docker.io/ai/gemma4:E4B",
             self,

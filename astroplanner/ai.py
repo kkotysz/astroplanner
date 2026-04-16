@@ -563,6 +563,17 @@ def _llm_model_endpoints(base_url: str) -> list[tuple[str, str]]:
     return candidates
 
 
+def _llm_chat_completions_endpoint(base_url: str) -> str:
+    normalized = str(base_url or "").strip().rstrip("/")
+    if not normalized:
+        return ""
+    if normalized.endswith("/v1/chat/completions") or normalized.endswith("/chat/completions"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return f"{normalized}/chat/completions"
+    return f"{normalized}/v1/chat/completions"
+
+
 def _fetch_llm_models(base_url: str, *, timeout_s: int = 6) -> tuple[list[str], str, str]:
     for endpoint, backend in _llm_model_endpoints(base_url):
         try:
@@ -828,7 +839,7 @@ class LLMWorker(QThread):
             }
         ).encode("utf-8")
         request = Request(
-            f"{self.config.url}/v1/chat/completions",
+            _llm_chat_completions_endpoint(self.config.url),
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -862,7 +873,8 @@ class LLMWorker(QThread):
             reason = getattr(exc, "reason", str(exc))
             self.errorOccurred.emit(
                 f"Cannot reach LLM server at {self.config.url}: {reason}\n"
-                "Start Ollama, or run the optional Docker profile (`make llm-up-docker`), and verify URL/model in Settings -> General Settings."
+                "Start Jan, Ollama, Docker Model Runner, or another OpenAI-compatible backend, "
+                "then verify URL/model in Settings -> General Settings."
             )
         except Exception as exc:
             self.errorOccurred.emit(f"LLM request failed ({type(exc).__name__}): {exc}")
@@ -885,6 +897,7 @@ __all__ = [
     "_fetch_llm_models",
     "_format_knowledge_note_snippet",
     "_knowledge_note_family",
+    "_llm_chat_completions_endpoint",
     "_llm_model_endpoints",
     "_llm_models_from_ollama_payload",
     "_llm_models_from_openai_payload",

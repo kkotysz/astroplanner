@@ -11,12 +11,12 @@ help:
 	@printf '%s\n' \
 		'Available targets:' \
 		'  make ps                Show AstroPlanner stack status' \
-		'  make llm-install-help  Show how to install Ollama before using the AI panel' \
-		'  make llm-pull          Pull the default Gemma 4 model into Ollama' \
-		'  make llm-check         Check Ollama OpenAI-compatible endpoint and default model' \
+		'  make llm-install-help  Show optional Ollama helper setup for the AI panel' \
+		'  make llm-pull          Pull the example Gemma model into Ollama' \
+		'  make llm-check         Check optional Ollama endpoint and example model' \
 		'  make llm-models        List locally available Ollama models' \
 		'  make llm-up-docker     Start optional Ollama Docker profile (Linux / CPU tests)' \
-		'  make llm-pull-docker   Pull the default Gemma 4 model inside the Docker profile' \
+		'  make llm-pull-docker   Pull the example Gemma model inside the Docker profile' \
 		'  make llm-models-docker List models inside the Dockerized Ollama profile' \
 		'  make llm-logs-docker   Follow Dockerized Ollama logs' \
 		'  make llm-stop-docker   Stop the Dockerized Ollama profile' \
@@ -32,22 +32,23 @@ ps:
 
 llm-install-help:
 	@printf '%s\n' \
-		'Ollama is required for the local AI panel.' \
+		'The AI panel works with Jan or any OpenAI-compatible backend.' \
+		'These targets are optional helpers for an Ollama setup.' \
 		'' \
 		'macOS:' \
 		'  1. Download Ollama: https://ollama.com/download/mac' \
 		'  2. Move Ollama.app to /Applications and launch it once' \
 		'  3. Verify the CLI is available: ollama --version' \
-		'  4. Pull the default model: make llm-pull' \
+		'  4. Pull the example model: make llm-pull' \
 		'' \
 		'Linux:' \
 		'  1. Host install: curl -fsSL https://ollama.com/install.sh | sh' \
 		'  2. Start the server if needed: ollama serve' \
-		'  3. Pull the default model: make llm-pull' \
+		'  3. Pull the example model: make llm-pull' \
 		'' \
 		'Optional Linux Docker profile:' \
 		'  1. Start Dockerized Ollama: make llm-up-docker' \
-		'  2. Pull the default model in the container: make llm-pull-docker' \
+		'  2. Pull the example model in the container: make llm-pull-docker' \
 		'  3. Verify the endpoint: make llm-check'
 
 llm-pull:
@@ -60,7 +61,7 @@ llm-check:
 	@curl -fsS $(LLM_URL)/v1/models | python3 -c 'import json,sys; data=json.load(sys.stdin); models=[item.get("id","") for item in data.get("data",[]) if isinstance(item,dict)]; target="$(LLM_MODEL)";\
 print(f"Ollama endpoint OK: $(LLM_URL)");\
 print("Available models:", ", ".join(models) if models else "<none>");\
-raise SystemExit(0 if target in models else (print(f"Default model missing: {target}. Run: ollama pull {target} or make llm-pull-docker") or 1))' || { echo 'Cannot query Ollama at $(LLM_URL). Start Ollama or run make llm-up-docker.'; exit 1; }
+raise SystemExit(0 if target in models else (print(f"Example model missing: {target}. Run: ollama pull {target} or make llm-pull-docker") or 1))' || { echo 'Cannot query Ollama at $(LLM_URL). Start Ollama or run make llm-up-docker.'; exit 1; }
 
 llm-models:
 	@command -v ollama >/dev/null 2>&1 || { echo 'ollama is not installed.'; echo 'Run: make llm-install-help'; exit 1; }

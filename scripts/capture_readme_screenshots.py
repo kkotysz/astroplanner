@@ -271,7 +271,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--plan",
-        default="plan_targets.json",
+        default="examples/plan_targets.json",
         help="JSON plan used to seed dashboard state.",
     )
     parser.add_argument(

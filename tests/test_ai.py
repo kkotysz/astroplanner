@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from astroplanner.ai import (
+    _llm_chat_completions_endpoint,
     _llm_model_endpoints,
     _llm_models_from_ollama_payload,
     _llm_models_from_openai_payload,
@@ -70,3 +71,9 @@ def test_llm_payload_and_endpoint_helpers_cover_openai_and_ollama_shapes() -> No
         ("http://localhost:11434/api/tags", "Ollama"),
         ("http://localhost:11434/v1/models", "OpenAI-compatible"),
     ]
+    assert _llm_chat_completions_endpoint("http://localhost:11434") == (
+        "http://localhost:11434/v1/chat/completions"
+    )
+    assert _llm_chat_completions_endpoint("http://localhost:1337/v1") == (
+        "http://localhost:1337/v1/chat/completions"
+    )

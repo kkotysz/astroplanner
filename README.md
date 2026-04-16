@@ -249,9 +249,9 @@ make ps
 
 What they do:
 
-- `make llm-install-help`: shows how to install Ollama before using the AI panel
-- `make llm-pull`: pulls the default local Gemma 4 model into Ollama
-- `make llm-check`: verifies the local Ollama OpenAI-compatible endpoint on `http://localhost:11434`
+- `make llm-install-help`: shows optional Ollama setup hints for the AI panel
+- `make llm-pull`: pulls the repo's example Gemma model into Ollama
+- `make llm-check`: verifies the optional Ollama OpenAI-compatible endpoint on `http://localhost:11434`
 - `make llm-up-docker`: starts optional Dockerized Ollama on the same endpoint (`http://localhost:11434`) for Linux / CPU tests
 - `make up-seestar-sim`: starts `seestar_alp` plus the local simulator, with API on `http://localhost:5555` and web UI on `http://localhost:5432`
 - `make ps`: shows the current AstroPlanner Docker stack status
@@ -259,12 +259,12 @@ What they do:
 Typical local workflow:
 
 1. Install Python dependencies and run `python astro_planner.py`.
-2. If you want the AI panel, install Ollama first with `make llm-install-help`.
-3. Pull the default model with `make llm-pull`.
-4. Verify the local LLM endpoint with `make llm-check`.
+2. If you want the AI panel, start Jan or another OpenAI-compatible local backend.
+3. In AstroPlanner, set `LLM server URL`, click `Detect models`, and pick the backend's active model.
+4. If you prefer Ollama, the `make llm-*` targets provide optional setup/check helpers.
 5. If you want Seestar integration without hardware, run `make up-seestar-sim`.
 6. Preview `seestar_alp` in a browser at `http://localhost:5432`.
-7. In AstroPlanner, point the AI panel to `http://localhost:11434` and Seestar ALP to `http://localhost:5555`.
+7. In AstroPlanner, point Seestar ALP to `http://localhost:5555`.
 
 Optional Linux / CPU test path:
 
@@ -281,7 +281,7 @@ python astro_planner.py
 Load a plan at startup:
 
 ```bash
-python astro_planner.py --plan plan_targets.json
+python astro_planner.py --plan examples/plan_targets.json
 ```
 
 On macOS:
@@ -292,36 +292,48 @@ On macOS:
 
 ## AI Assistant
 
-The AI panel supports a local OpenAI-compatible endpoint. The default setup uses host-managed Ollama with `gemma4:e4b`.
+The AI panel supports local or desktop OpenAI-compatible chat backends. The
+recommended path is Jan: start Jan's local API, use Jan's default/active downloaded
+model, then configure AstroPlanner from `Settings -> General Settings -> AI`.
 
-Optional: the repo also provides a Docker Compose `ollama` profile for Linux / CPU tests. On macOS, Ollama's own guidance is to run the standalone app outside Docker.
+AstroPlanner expects a backend compatible with `POST /v1/chat/completions`.
+`Detect models` also works with `GET /v1/models` or Ollama-compatible model lists,
+but model discovery is optional: you can type the model name manually.
 
-Recommended app settings by backend:
+Recommended setup:
 
+1. Start Jan.
+2. Enable Jan's local OpenAI-compatible API server.
+3. Copy Jan's server URL into `LLM server URL`.
+4. Click `Detect models`.
+5. Select Jan's active/default downloaded model.
+6. Leave `Enable model thinking / reasoning` off unless your chosen model/backend supports it.
+
+Use the exact host and port shown by Jan. AstroPlanner accepts either a plain
+server base URL, such as `http://localhost:1337`, or an OpenAI-style base URL
+ending in `/v1`.
+
+Other supported backends include Ollama, Docker Model Runner, LM Studio, llama.cpp
+server, vLLM, or any service exposing an OpenAI-compatible chat-completions API.
+
+Example backend settings:
+
+- Jan:
+  - `LLM server URL`: copy from Jan's local API settings
+  - `LLM model`: Jan's active/default downloaded model
 - Ollama:
   - `LLM server URL`: `http://localhost:11434`
-  - `LLM model`: `gemma4:e4b`
+  - `LLM model`: for example `gemma4:e4b`
 - Docker Model Runner:
   - `LLM server URL`: `http://localhost:12434/engines`
-  - `LLM model`: `docker.io/ai/gemma4:E4B`
+  - `LLM model`: for example `docker.io/ai/gemma4:E4B`
 
-Prepare the local LLM:
-
-```bash
-make llm-install-help
-make llm-pull
-make llm-check
-```
-
-Then configure in the app:
-
-- `Settings -> General Settings`
-- `LLM server URL`: `http://localhost:11434`
-- `LLM model`: `gemma4:e4b`
+The `make llm-*` commands are optional Ollama helpers. They are useful for quick
+local tests, but AstroPlanner does not require Ollama specifically.
 
 Full setup guide:
 
-- [README_LLM_SETUP.md](README_LLM_SETUP.md)
+- [docs/llm_setup.md](docs/llm_setup.md)
 
 ## Seestar ALP
 
