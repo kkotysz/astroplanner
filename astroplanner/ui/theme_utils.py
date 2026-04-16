@@ -176,6 +176,24 @@ def _build_button_icon_pixmap(kind: str, fg: QColor, accent: QColor, accent_seco
         line(s * 0.52, s * 0.52, s * 0.74, s * 0.74)
         line(s * 0.40, s * 0.28, s * 0.40, s * 0.52)
         line(s * 0.28, s * 0.40, s * 0.52, s * 0.40)
+    elif kind in {"describe", "info"}:
+        ellipse(s * 0.20, s * 0.18, s * 0.60, s * 0.64)
+        line(s * 0.50, s * 0.42, s * 0.50, s * 0.66)
+        dot(s * 0.50, s * 0.31, 1.5)
+    elif kind in {"send"}:
+        line(m, s * 0.54, s - m, m)
+        line(s - m, m, s * 0.62, s - m)
+        line(s * 0.62, s - m, s * 0.50, s * 0.56)
+        line(s * 0.50, s * 0.56, m, s * 0.54)
+    elif kind in {"save"}:
+        painter.drawRoundedRect(int(round(m)), int(round(m)), int(round(s - 2 * m)), int(round(s - 2 * m)), 3, 3)
+        line(s * 0.32, m + 1, s * 0.32, s * 0.45)
+        line(s * 0.32, s * 0.45, s * 0.68, s * 0.45)
+        line(s * 0.28, s * 0.67, s * 0.72, s * 0.67)
+    elif kind in {"edit"}:
+        line(s * 0.28, s * 0.70, s * 0.70, s * 0.28)
+        line(s * 0.64, s * 0.22, s * 0.78, s * 0.36)
+        line(s * 0.24, s * 0.74, s * 0.36, s * 0.70)
     elif kind in {"refresh"}:
         painter.drawArc(int(round(m)), int(round(m)), int(round(s - 2 * m)), int(round(s - 2 * m)), int(25 * 16), int(280 * 16))
         line(s * 0.72, s * 0.18, s * 0.82, s * 0.18)

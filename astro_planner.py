@@ -120,6 +120,7 @@ from astroplanner.ai import (
     _type_label_class_family,
     _type_matches_requested_class,
 )
+from astroplanner.ai_panel_coordinator import AIPanelCoordinator
 from astroplanner.exporters import export_metrics_csv, export_observation_ics
 from astroplanner.bhtom import (
     BHTOM_API_BASE_URL,
@@ -229,6 +230,7 @@ from astroplanner.i18n import (
 )
 from astroplanner.storage import AppStorage, SettingsAdapter
 from astroplanner.targets_coordinator import TargetTableCoordinator
+from astroplanner.visibility_coordinator import VisibilityCoordinator
 from astroplanner.ui.common import (
     SkeletonShimmerWidget,
     TargetTableView,
@@ -3117,34 +3119,14 @@ class MainWindow(QMainWindow):
             pass
 
     def _selected_target_names(self) -> list[str]:
-        if not hasattr(self, "table_view"):
-            return []
-        selection_model = self.table_view.selectionModel()
-        if selection_model is None:
-            return []
-        names: list[str] = []
-        for index in selection_model.selectedRows():
-            row = index.row()
-            if 0 <= row < len(self.targets):
-                names.append(self.targets[row].name)
-        return names
+        return self._visibility_coordinator.selected_target_names()
 
     def _schedule_selected_cutout_update(self, target: Optional[Target]) -> None:
-        self._pending_selected_cutout_target = target
-        if getattr(self, "_defer_startup_preview_updates", False):
-            return
-        if hasattr(self, "_selected_cutout_update_timer"):
-            self._selected_cutout_update_timer.start()
-            return
-        self._flush_selected_cutout_update()
+        self._visibility_coordinator.schedule_selected_cutout_update(target)
 
     @Slot()
     def _flush_selected_cutout_update(self) -> None:
-        if getattr(self, "_defer_startup_preview_updates", False):
-            return
-        target = self._pending_selected_cutout_target
-        self._pending_selected_cutout_target = None
-        self._update_cutout_preview_for_target(target)
+        self._visibility_coordinator.flush_selected_cutout_update()
 
     def _refresh_visibility_matplotlib_mode_only(self, data: Optional[dict] = None) -> None:
         payload = data if isinstance(data, dict) else getattr(self, "last_payload", None)
@@ -3247,56 +3229,14 @@ class MainWindow(QMainWindow):
         self._visibility_web_html_cache = cache
 
     def _schedule_visibility_plot_refresh(self, *, delay_ms: int = 0) -> None:
-        if not isinstance(getattr(self, "last_payload", None), dict):
-            return
-        if getattr(self, "_use_visibility_web", False):
-            self._ensure_visibility_plot_widgets()
-        self._visibility_plot_refresh_timer.start(max(0, int(delay_ms)))
+        self._visibility_coordinator.schedule_visibility_plot_refresh(delay_ms=delay_ms)
 
     @Slot()
     def _flush_visibility_plot_refresh(self) -> None:
-        if isinstance(getattr(self, "last_payload", None), dict):
-            self._render_visibility_web_plot(self.last_payload)
+        self._visibility_coordinator.flush_visibility_plot_refresh()
 
     def _apply_visibility_web_selection_style(self, selected_names: Optional[set[str]] = None) -> None:
-        if not bool(getattr(self, "_use_visibility_web", False)):
-            return
-        if not bool(getattr(self, "_visibility_web_has_content", False)):
-            return
-        web_view = getattr(self, "visibility_web", None)
-        if web_view is None:
-            return
-        page = web_view.page() if hasattr(web_view, "page") else None
-        if page is None:
-            return
-        if selected_names is None:
-            selected_names = set(self._selected_target_names())
-        selected_list = sorted(str(name) for name in selected_names if str(name).strip())
-        selected_json = json.dumps(selected_list, ensure_ascii=False)
-        script = (
-            "(function(){"
-            f"const selected = new Set({selected_json});"
-            "const gd=document.querySelector('.plotly-graph-div');"
-            "if(!gd||!window.Plotly||!Array.isArray(gd.data)){return 0;}"
-            "const indices=[];const widths=[];const opacities=[];"
-            "for(let i=0;i<gd.data.length;i++){"
-            "const tr=gd.data[i]||{};const meta=tr.meta;"
-            "if(!meta||typeof meta!=='object'||meta.kind!=='target'){continue;}"
-            "const name=String(meta.target||'');if(!name){continue;}"
-            "const seg=String(meta.segment||'');"
-            "const isSelected=selected.has(name);"
-            "if(seg==='base'){indices.push(i);widths.push(1.4);opacities.push(isSelected?0.40:0.28);}"
-            "else if(seg==='high'){indices.push(i);widths.push(isSelected?2.8:1.9);opacities.push(isSelected?1.00:0.92);}"
-            "}"
-            "if(!indices.length){return 0;}"
-            "Plotly.restyle(gd, {'line.width': widths, 'opacity': opacities}, indices);"
-            "return indices.length;"
-            "})();"
-        )
-        try:
-            page.runJavaScript(script)
-        except Exception:
-            return
+        self._visibility_coordinator.apply_visibility_web_selection_style(selected_names)
 
     def _apply_visibility_line_style(self, line: object, *, is_over: bool, is_selected: bool) -> None:
         if line is None:
@@ -6175,6 +6115,7 @@ class MainWindow(QMainWindow):
         self._ai_status_clear_timer = QTimer(self)
         self._ai_status_clear_timer.setSingleShot(True)
         self._ai_status_clear_timer.timeout.connect(self._clear_ai_runtime_status)
+        self._ai_panel_coordinator = AIPanelCoordinator(self)
         self._cutout_manager = QNetworkAccessManager(self)
         self._cutout_manager.finished.connect(self._on_cutout_reply)
         self._cutout_request_id = 0
@@ -6240,20 +6181,8 @@ class MainWindow(QMainWindow):
         self._cutout_resize_timer.setInterval(260)
         self._cutout_resize_timer.timeout.connect(self._on_cutout_resize_timeout)
         self._cutout_last_resize_signature: Optional[tuple] = None
-        self._visibility_plot_refresh_timer = QTimer(self)
-        self._visibility_plot_refresh_timer.setSingleShot(True)
-        self._visibility_plot_refresh_timer.setInterval(0)
-        self._visibility_plot_refresh_timer.timeout.connect(self._flush_visibility_plot_refresh)
-        self._selected_cutout_update_timer = QTimer(self)
-        self._selected_cutout_update_timer.setSingleShot(True)
-        self._selected_cutout_update_timer.setInterval(90)
-        self._selected_cutout_update_timer.timeout.connect(self._flush_selected_cutout_update)
-        self._pending_selected_cutout_target: Optional[Target] = None
-        self._last_vis_selected_names: set[str] = set()
-        self._last_polar_selection_signature: tuple[str, ...] = ()
-        # Keep web visibility selection highlight enabled via lightweight Plotly.restyle.
-        self._visibility_web_sync_selection = True
-        self._visibility_web_html_cache: dict[str, str] = {}
+        self._visibility_coordinator = VisibilityCoordinator(self)
+        self._visibility_coordinator.bind()
 
         # UI ------------------------------------------------
         self.table_model = TargetTableModel(self.targets, site=None, parent=self)
@@ -7715,76 +7644,17 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _open_ai_settings(self) -> None:
-        self.open_general_settings(initial_tab="AI")
+        self._ai_panel_coordinator.open_settings()
 
     def _refresh_ai_context_hint(self) -> None:
-        memory_enabled = bool(getattr(self.llm_config, "enable_chat_memory", False))
-        if memory_enabled:
-            hint_text = (
-                "Short chat memory enabled.\n"
-                "Last 1-2 turns may be reused."
-            )
-            hint_tooltip = (
-                "Examples: 'Którą z tych SN najlepiej dziś obserwować?' or "
-                "'How should I observe 8C0716_714 tonight?'\n\n"
-                "Short chat memory can help follow-up questions, but requests may be slower."
-            )
-            input_tooltip = (
-                "The AI chat is saved per active plan/workspace. "
-                "Prompts may reuse the last 1-2 user/LLM turns for follow-up questions. "
-                "Use complete questions when the context could be ambiguous."
-            )
-        else:
-            hint_text = (
-                "No chat memory.\n"
-                "Ask complete questions with the object or class name."
-            )
-            hint_tooltip = (
-                "Examples: 'Którą SN z BHTOM najlepiej dziś obserwować?' or "
-                "'How should I observe 8C0716_714 tonight?'"
-            )
-            input_tooltip = (
-                "The AI chat is saved per active plan/workspace. "
-                "Prompts do not reuse previous turns, so use complete questions with the object or class name, "
-                "e.g. 'Która SN z BHTOM jest dziś najlepsza?'"
-            )
-
-        if hasattr(self, "ai_context_hint"):
-            set_translated_text(self.ai_context_hint, hint_text, current_language())
-            set_translated_tooltip(self.ai_context_hint, hint_tooltip, current_language())
-        if hasattr(self, "ai_input"):
-            set_translated_tooltip(self.ai_input, input_tooltip, current_language())
+        self._ai_panel_coordinator.refresh_context_hint()
 
     def _refresh_ai_knowledge_hint(self, titles: Optional[list[str]] = None) -> None:
-        if titles is not None:
-            self._ai_last_knowledge_titles = [str(title).strip() for title in titles if str(title).strip()]
-        current_titles = list(getattr(self, "_ai_last_knowledge_titles", []) or [])
-        if current_titles:
-            if len(current_titles) > 3:
-                visible = ", ".join(current_titles[:3]) + f" (+{len(current_titles) - 3} more)"
-            else:
-                visible = ", ".join(current_titles)
-            text = f"Using local knowledge: {visible}"
-            tooltip = "Local knowledge notes used for the most recent AI prompt:\n- " + "\n- ".join(current_titles)
-        else:
-            text = "Using local knowledge: none"
-            tooltip = "No local knowledge notes were added to the most recent AI prompt."
-        if hasattr(self, "ai_knowledge_hint"):
-            set_translated_text(self.ai_knowledge_hint, text, current_language())
-            set_translated_tooltip(self.ai_knowledge_hint, tooltip, current_language())
+        self._ai_panel_coordinator.refresh_knowledge_hint(titles)
 
     @Slot()
     def _focus_ai_input(self) -> None:
-        ai_window = self._ensure_ai_window()
-        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
-            self.ai_toggle_btn.setChecked(True)
-        if isinstance(ai_window, QDialog):
-            ai_window.show()
-            ai_window.raise_()
-            ai_window.activateWindow()
-        if hasattr(self, "ai_input"):
-            self.ai_input.setFocus(Qt.OtherFocusReason)
-            self.ai_input.selectAll()
+        self._ai_panel_coordinator.focus_input()
 
     def _sun_alt_limit(self) -> float:
         if not hasattr(self, "sun_alt_limit_spin"):
@@ -10128,32 +9998,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _toggle_visibility(self):
-        """Show or hide sun and moon lines without recalculation."""
-        if hasattr(self, 'sun_line') and self.sun_line:
-            self.sun_line.set_visible(self.sun_check.isChecked())
-        if hasattr(self, 'moon_line') and self.moon_line:
-            self.moon_line.set_visible(self.moon_check.isChecked())
-        plot_canvas = getattr(self, "plot_canvas", None)
-        if plot_canvas is not None:
-            plot_canvas.draw_idle()
-        if isinstance(getattr(self, "last_payload", None), dict):
-            self._render_visibility_web_plot(self.last_payload)
+        self._visibility_coordinator.toggle_visibility()
 
     @Slot(bool)
     def _on_plot_mode_switch_changed(self, checked: bool):
-        if self._plot_airmass == checked:
-            self._refresh_plot_mode_switch()
-            return
-        self._plot_airmass = checked
-        self._refresh_plot_mode_switch()
-        self._animate_plot_mode_switch()
-        self.settings.setValue("general/plotAirmass", self._plot_airmass)
-        if isinstance(self.last_payload, dict):
-            if getattr(self, "_use_visibility_web", False):
-                self._schedule_visibility_plot_refresh()
-            else:
-                self._refresh_visibility_matplotlib_mode_only(self.last_payload)
-
+        self._visibility_coordinator.on_plot_mode_switch_changed(checked)
 
     @Slot()
     def _update_clock(self):
@@ -10208,354 +10057,26 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _update_polar_selection(self, selected, deselected):
-        """Update highlight for selected targets on polar plot."""
-        # Gather selected rows
-        sel_rows = sorted(idx.row() for idx in self.table_view.selectionModel().selectedRows())
-        selection_signature = tuple(
-            self.targets[row].name
-            for row in sel_rows
-            if 0 <= row < len(self.targets)
-        )
-        if selection_signature == getattr(self, "_last_polar_selection_signature", ()):
-            return
-        self._last_polar_selection_signature = selection_signature
-        # Prepare coordinates for selected targets
-        sel_coords = []
-        for row in sel_rows:
-            if row < len(self.table_model.row_enabled) and not self.table_model.row_enabled[row]:
-                continue
-            alt = self.table_model.current_alts[row] if row < len(self.table_model.current_alts) else None
-            az = self.table_model.current_azs[row] if row < len(self.table_model.current_azs) else None
-            if alt is None or az is None or alt <= 0:
-                continue
-            theta = np.deg2rad(az)
-            r = 90 - alt
-            sel_coords.append((theta, r))
-        if sel_coords:
-            arr = np.array(sel_coords)
-            self.selected_scatter.set_offsets(arr)
-        else:
-            self.selected_scatter.set_offsets(np.empty((0, 2)))
-        # Skip drawing trace if user turned object paths off
-        if not self.show_obj_path:
-            if self.selected_trace_line:
-                try:
-                    self.selected_trace_line.remove()
-                except Exception:
-                    pass
-                self.selected_trace_line = None
-            self.polar_canvas.draw_idle()
-            return
-        # Plot the full sky path of the selected target from rise to set
-        if self.selected_trace_line:
-            try:
-                self.selected_trace_line.remove()
-            except Exception:
-                pass
-        self.selected_trace_line = None
-
-        if sel_rows:
-            idx0 = sel_rows[0]
-            name = self.targets[idx0].name
-            if not hasattr(self, "full_payload") or not isinstance(self.full_payload, dict) or name not in self.full_payload:
-                self.selected_trace_line = None
-                self.polar_canvas.draw_idle()
-                return
-            alt_arr = np.array(self.full_payload[name]["altitude"])
-            az_arr  = np.array(self.full_payload[name]["azimuth"])
-            # Only points above horizon
-            mask = alt_arr > 0
-            vis_idx = np.where(mask)[0]
-            if vis_idx.size == 0:
-                self.selected_trace_line = None
-                self.polar_canvas.draw_idle()
-                return
-            # Build full theta/r arrays by handling each visible segment separately
-            theta_full = np.array([], dtype=float)
-            r_full = np.array([], dtype=float)
-            # Split into contiguous runs of indices (rise/set segmentation)
-            runs = np.split(vis_idx, np.where(np.diff(vis_idx) != 1)[0] + 1)
-            for run in runs:
-                theta_seg = np.deg2rad(az_arr[run])
-                r_seg = 90 - alt_arr[run]
-                # Break at azimuth wrap discontinuities
-                dtheta = np.abs(np.diff(theta_seg))
-                wrap_pts = np.where(dtheta > np.pi)[0] + 1
-                for wp in reversed(wrap_pts):
-                    theta_seg = np.insert(theta_seg, wp, np.nan)
-                    r_seg = np.insert(r_seg, wp, np.nan)
-                # Append segment, then a NaN to separate from next
-                theta_full = np.concatenate([theta_full, theta_seg, [np.nan]])
-                r_full = np.concatenate([r_full, r_seg, [np.nan]])
-            trace, = self.polar_ax.plot(
-                theta_full, r_full,
-                color=self._theme_color("polar_selected_path", "#8cff84"),
-                linewidth=0.8,
-                linestyle=':',
-                alpha=0.7,
-                zorder=1,
-            )
-            self.selected_trace_line = trace
-        # Redraw the polar canvas to reflect changes
-        self.polar_canvas.draw_idle()
+        self._visibility_coordinator.update_polar_selection(selected, deselected)
 
     @Slot(object)
     def _on_polar_pick(self, event):
-        """Select table row when a polar scatter point is clicked."""
-        if event.artist is not self.polar_scatter:
-            return
-        inds = event.ind
-        if not len(inds):
-            return
-        ptr = inds[0]
-        # Map to the actual target index
-        i = self.polar_indices[ptr]
-        # Clear previous selection and select the clicked row
-        sel_model = self.table_view.selectionModel()
-        sel_model.clearSelection()
-        idx = self.table_model.index(i, 0)
-        sel_model.select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
-        # Update selected scatter marker
-        alt = self.table_model.current_alts[i]
-        az = self.table_model.current_azs[i]
-        theta = np.deg2rad(az)
-        r = 90 - alt
-        self.selected_scatter.set_offsets(np.array([[theta, r]]))
-        self.polar_canvas.draw_idle()
+        self._visibility_coordinator.on_polar_pick(event)
 
     @Slot(object, object)
     def _update_vis_selection(self, selected, deselected):
-        """Adjust visibility plot alpha and width based on table selection."""
-        sel_rows = [idx.row() for idx in self.table_view.selectionModel().selectedRows()]
-        sel_names = {
-            self.targets[i].name
-            for i in sel_rows
-            if 0 <= i < len(self.targets)
-        }
-        previous_sel_names = set(getattr(self, "_last_vis_selected_names", set()))
-        if sel_names == previous_sel_names:
-            return
-        changed_names = sel_names.symmetric_difference(previous_sel_names)
-        self._last_vis_selected_names = set(sel_names)
-
-        for name, line, is_over in self.vis_lines:
-            if name not in changed_names:
-                continue
-            self._apply_visibility_line_style(line, is_over=is_over, is_selected=(name in sel_names))
-        plot_canvas = getattr(self, "plot_canvas", None)
-        if plot_canvas is not None:
-            plot_canvas.draw_idle()
-        if (
-            bool(getattr(self, "_visibility_web_sync_selection", False))
-            and isinstance(getattr(self, "last_payload", None), dict)
-        ):
-            self._apply_visibility_web_selection_style(sel_names)
+        self._visibility_coordinator.update_vis_selection(selected, deselected)
 
     @staticmethod
     def _build_polar_visible_path(
         alt_series: object,
         az_series: object,
     ) -> tuple[np.ndarray, np.ndarray]:
-        alt_arr = np.array(alt_series, dtype=float).ravel()
-        az_arr = np.array(az_series, dtype=float).ravel()
-        n = min(alt_arr.size, az_arr.size)
-        if n <= 0:
-            return np.array([], dtype=float), np.array([], dtype=float)
-        alt_arr = alt_arr[:n]
-        az_arr = np.mod(az_arr[:n], 360.0)
-        mask = np.isfinite(alt_arr) & np.isfinite(az_arr) & (alt_arr > 0.0)
-        vis_idx = np.where(mask)[0]
-        if vis_idx.size == 0:
-            return np.array([], dtype=float), np.array([], dtype=float)
-
-        theta_segments: list[np.ndarray] = []
-        r_segments: list[np.ndarray] = []
-        runs = np.split(vis_idx, np.where(np.diff(vis_idx) != 1)[0] + 1)
-        for run in runs:
-            if run.size == 0:
-                continue
-            theta_seg = np.deg2rad(az_arr[run])
-            r_seg = 90.0 - alt_arr[run]
-            wrap_pts = np.where(np.abs(np.diff(theta_seg)) > np.pi)[0] + 1
-            for wp in reversed(wrap_pts):
-                theta_seg = np.insert(theta_seg, int(wp), np.nan)
-                r_seg = np.insert(r_seg, int(wp), np.nan)
-            theta_segments.append(theta_seg)
-            r_segments.append(r_seg)
-            theta_segments.append(np.array([np.nan], dtype=float))
-            r_segments.append(np.array([np.nan], dtype=float))
-
-        if not theta_segments:
-            return np.array([], dtype=float), np.array([], dtype=float)
-        return np.concatenate(theta_segments), np.concatenate(r_segments)
+        return VisibilityCoordinator.build_polar_visible_path(alt_series, az_series)
 
     @Slot(dict)
     def _update_polar_positions(self, data: dict, dynamic_only: bool = False):
-        """Update all markers on the polar plot based on latest alt-az data."""
-        has_sun_path = "sun_alt" in data and "sun_az" in data
-        has_moon_path = "moon_alt" in data and "moon_az" in data
-        full_refresh = not dynamic_only and (has_sun_path or has_moon_path)
-
-        if "alts" in data and "azs" in data:
-            alt_list = data["alts"]
-            az_list = data["azs"]
-        else:
-            alt_list = self.table_model.current_alts
-            az_list = self.table_model.current_azs
-
-        tgt_coords = []
-        self.polar_indices = []
-        for i in range(len(self.targets)):
-            if i >= len(alt_list) or i >= len(az_list):
-                continue
-            if i < len(self.table_model.row_enabled) and not self.table_model.row_enabled[i]:
-                continue
-            alt = alt_list[i]
-            az = az_list[i]
-            if alt is None or alt <= 0:
-                continue
-            tgt_coords.append((np.deg2rad(az), 90 - alt))
-            self.polar_indices.append(i)
-        self._radar_target_coords = np.array(tgt_coords, dtype=float) if tgt_coords else np.empty((0, 2), dtype=float)
-        self.polar_scatter.set_offsets(self._radar_target_coords if tgt_coords else np.empty((0, 2)))
-
-        sel_coords = []
-        for row in self._selected_rows():
-            if row >= len(alt_list) or row >= len(az_list):
-                continue
-            alt = alt_list[row]
-            az = az_list[row]
-            if alt is None or alt <= 0:
-                continue
-            sel_coords.append((np.deg2rad(az), 90 - alt))
-        self.selected_scatter.set_offsets(np.array(sel_coords) if sel_coords else np.empty((0, 2)))
-
-        site = self.table_model.site
-        if site is None:
-            self.sun_marker.set_offsets(np.empty((0, 2)))
-            self.moon_marker.set_offsets(np.empty((0, 2)))
-            self._refresh_radar_sweep_artists(redraw=False)
-            self.polar_canvas.draw_idle()
-            return
-
-        now_local = data.get("now_local")
-        if now_local is not None:
-            eph_obs = ephem.Observer()
-            eph_obs.lat = str(site.latitude)
-            eph_obs.lon = str(site.longitude)
-            eph_obs.elevation = site.elevation
-            eph_obs.date = now_local
-
-            sun = ephem.Sun(eph_obs)
-            sun_alt = sun.alt * 180.0 / math.pi  # type: ignore[arg-type]
-            sun_az = sun.az * 180.0 / math.pi  # type: ignore[arg-type]
-            if sun_alt > 0:
-                self.sun_marker.set_offsets(np.array([[np.deg2rad(sun_az), 90 - sun_alt]]))
-            else:
-                self.sun_marker.set_offsets(np.empty((0, 2)))
-
-            moon = ephem.Moon(eph_obs)
-            moon_alt = moon.alt * 180.0 / math.pi  # type: ignore[arg-type]
-            moon_az = moon.az * 180.0 / math.pi  # type: ignore[arg-type]
-            if moon_alt > 0:
-                self.moon_marker.set_offsets(np.array([[np.deg2rad(moon_az), 90 - moon_alt]]))
-            else:
-                self.moon_marker.set_offsets(np.empty((0, 2)))
-
-        if full_refresh:
-            for line_attr in ("sun_path_line", "moon_path_line"):
-                line = getattr(self, line_attr, None)
-                if line is None:
-                    continue
-                try:
-                    line.remove()
-                except Exception:
-                    pass
-                setattr(self, line_attr, None)
-
-            if self.show_sun_path and has_sun_path:
-                theta, r = self._build_polar_visible_path(data["sun_alt"], data["sun_az"])
-                if theta.size > 0 and r.size > 0:
-                    self.sun_path_line, = self.polar_ax.plot(
-                        theta,
-                        r,
-                        color=self._theme_color("polar_sun", "gold"),
-                        linewidth=0.9,
-                        linestyle="--",
-                        alpha=0.7,
-                        zorder=1,
-                    )
-
-            if self.show_moon_path and has_moon_path:
-                theta, r = self._build_polar_visible_path(data["moon_alt"], data["moon_az"])
-                if theta.size > 0 and r.size > 0:
-                    self.moon_path_line, = self.polar_ax.plot(
-                        theta,
-                        r,
-                        color=self._theme_color("polar_moon", "silver"),
-                        linewidth=0.9,
-                        linestyle="--",
-                        alpha=0.7,
-                        zorder=1,
-                    )
-
-            signature = (round(site.latitude, 6), int(self.limit_spin.value()))
-            if getattr(self, "_polar_static_signature", None) != signature:
-                if self.pole_marker:
-                    try:
-                        if isinstance(self.pole_marker, (list, tuple)):
-                            for art in self.pole_marker:
-                                art.remove()
-                        else:
-                            self.pole_marker.remove()
-                    except Exception:
-                        pass
-                pole_alt = site.latitude if site.latitude >= 0 else -site.latitude
-                pole_az = 0.0 if site.latitude >= 0 else 180.0
-                r_pol = 90 - pole_alt
-                theta_pol = np.deg2rad(pole_az)
-                circle = self.polar_ax.scatter(
-                    [theta_pol], [r_pol],
-                    facecolors='none',
-                    edgecolors=self._theme_color("polar_pole", "purple"),
-                    marker='o',
-                    s=80,
-                    linewidths=1.5,
-                    zorder=3,
-                    alpha=0.3,
-                )
-                dot = self.polar_ax.scatter(
-                    [theta_pol],
-                    [r_pol],
-                    c=self._theme_color("polar_pole", "purple"),
-                    marker='.',
-                    s=30,
-                    zorder=4,
-                    alpha=0.3,
-                )
-                self.pole_marker = (circle, dot)
-
-                if self.limit_circle:
-                    try:
-                        self.limit_circle.remove()
-                    except Exception:
-                        pass
-                lim = self.limit_spin.value()
-                theta_full = np.linspace(0, 2 * math.pi, 200)
-                r_full = np.full_like(theta_full, 90 - lim)
-                self.limit_circle, = self.polar_ax.plot(
-                    theta_full,
-                    r_full,
-                    color=self._theme_color("polar_limit", "#ff5d8f"),
-                    linestyle='-',
-                    linewidth=0.5,
-                    alpha=0.4,
-                )
-                self._polar_static_signature = signature
-
-        self._clock_polar_tick += 1
-        self._refresh_radar_sweep_artists(redraw=False)
-        self.polar_canvas.draw_idle()
+        self._visibility_coordinator.update_polar_positions(data, dynamic_only=dynamic_only)
 
     @Slot()
     def _toggle_dark(self):
@@ -11398,244 +10919,27 @@ class MainWindow(QMainWindow):
         raise ValueError(f"Unable to resolve '{query}' using {source_label}: {last_error}") from last_error
 
     def _build_ai_panel(self, parent: Optional[QWidget] = None) -> QWidget:
-        host = parent if parent is not None else self
-        panel = QFrame(host)
-        panel.setObjectName("AIAssistantPanel")
-        _set_dynamic_property(panel, "accented", True)
-
-        layout = QHBoxLayout(panel)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(8)
-
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(6)
-
-        describe_btn = QPushButton("Describe Object")
-        describe_btn.clicked.connect(self._ai_describe_target)
-        btn_col.addWidget(describe_btn)
-        _set_button_variant(describe_btn, "secondary")
-        _set_button_icon_kind(describe_btn, "describe")
-        describe_btn.ensurePolished()
-
-        describe_hint = QLabel("Uses local metadata only.\nNo LLM request.", panel)
-        describe_hint.setObjectName("SectionHint")
-        describe_hint.setWordWrap(True)
-        btn_col.addWidget(describe_hint)
-
-        self.ai_copy_last_btn = QPushButton("Copy Last Reply")
-        self.ai_copy_last_btn.clicked.connect(self._copy_last_ai_response)
-        _set_button_variant(self.ai_copy_last_btn, "ghost")
-        _set_button_icon_kind(self.ai_copy_last_btn, "describe")
-        btn_col.addWidget(self.ai_copy_last_btn)
-
-        self.ai_export_chat_btn = QPushButton("Export Chat")
-        self.ai_export_chat_btn.clicked.connect(self._export_ai_chat)
-        _set_button_variant(self.ai_export_chat_btn, "ghost")
-        _set_button_icon_kind(self.ai_export_chat_btn, "save")
-        btn_col.addWidget(self.ai_export_chat_btn)
-
-        self.ai_reset_appearance_btn = QPushButton("Reset Appearance")
-        self.ai_reset_appearance_btn.clicked.connect(self._reset_ai_chat_appearance)
-        _set_button_variant(self.ai_reset_appearance_btn, "ghost")
-        _set_button_icon_kind(self.ai_reset_appearance_btn, "refresh")
-        btn_col.addWidget(self.ai_reset_appearance_btn)
-
-        self.ai_settings_btn = QPushButton("AI Settings")
-        self.ai_settings_btn.clicked.connect(self._open_ai_settings)
-        _set_button_variant(self.ai_settings_btn, "ghost")
-        _set_button_icon_kind(self.ai_settings_btn, "edit")
-        btn_col.addWidget(self.ai_settings_btn)
-
-        self.ai_context_hint = QLabel("", panel)
-        self.ai_context_hint.setObjectName("SectionHint")
-        self.ai_context_hint.setWordWrap(True)
-        btn_col.addWidget(self.ai_context_hint)
-
-        self.ai_knowledge_hint = QLabel("Using local knowledge: none", panel)
-        self.ai_knowledge_hint.setObjectName("SectionHint")
-        self.ai_knowledge_hint.setWordWrap(True)
-        self.ai_knowledge_hint.setToolTip(
-            "Shows which local knowledge notes were added to the most recent AI prompt."
-        )
-        btn_col.addWidget(self.ai_knowledge_hint)
-
-        warmup_btn = QPushButton("Warm Up LLM", panel)
-        warmup_btn.clicked.connect(self._warmup_llm_manual)
-        _set_button_variant(warmup_btn, "ghost")
-        _set_button_icon_kind(warmup_btn, "refresh")
-        warmup_btn.setToolTip("Send a lightweight request to warm the current LLM model.")
-        btn_col.addWidget(warmup_btn)
-
-        clear_btn = QPushButton("Clear", panel)
-        clear_btn.clicked.connect(self._clear_ai_messages)
-        _set_button_variant(clear_btn, "ghost")
-        _set_button_icon_kind(clear_btn, "clear")
-        btn_col.addWidget(clear_btn)
-
-        status_row = QWidget(panel)
-        status_row_l = QHBoxLayout(status_row)
-        status_row_l.setContentsMargins(0, 0, 0, 0)
-        status_row_l.setSpacing(0)
-
-        self.ai_warm_badge_label = QLabel(f"● cold {self.llm_config.model}", status_row)
-        self.ai_warm_badge_label.setObjectName("SectionHint")
-        self.ai_warm_badge_label.setToolTip(self.llm_config.model)
-        status_row_l.addWidget(self.ai_warm_badge_label, 1)
-        _set_label_tone(self.ai_warm_badge_label, "muted")
-        btn_col.addWidget(status_row)
-
-        btn_col.addStretch(1)
-        btn_widget = QWidget(panel)
-        btn_widget.setLayout(btn_col)
-        describe_width = max(
-            210,
-            describe_btn.sizeHint().width() + 24,
-            self.ai_copy_last_btn.sizeHint().width() + 24,
-            self.ai_export_chat_btn.sizeHint().width() + 24,
-            self.ai_reset_appearance_btn.sizeHint().width() + 24,
-            self.ai_settings_btn.sizeHint().width() + 24,
-            warmup_btn.sizeHint().width() + 24,
-            clear_btn.sizeHint().width() + 24,
-            244,
-        )
-        describe_btn.setMinimumWidth(describe_width - 12)
-        describe_hint.setFixedWidth(describe_width - 12)
-        self.ai_copy_last_btn.setMinimumWidth(describe_width - 12)
-        self.ai_export_chat_btn.setMinimumWidth(describe_width - 12)
-        self.ai_reset_appearance_btn.setMinimumWidth(describe_width - 12)
-        self.ai_settings_btn.setMinimumWidth(describe_width - 12)
-        self.ai_context_hint.setFixedWidth(describe_width - 12)
-        self.ai_knowledge_hint.setFixedWidth(describe_width - 12)
-        warmup_btn.setMinimumWidth(describe_width - 12)
-        clear_btn.setMinimumWidth(describe_width - 12)
-        btn_widget.setFixedWidth(describe_width)
-        layout.addWidget(btn_widget)
-
-        self._ai_output_placeholder_text = (
-            "AI responses will appear here.\n"
-            "Configure Ollama or another local LLM in Settings -> General Settings."
-        )
-        self.ai_output = QScrollArea(panel)
-        self.ai_output.setWidgetResizable(True)
-        self.ai_output.setFrameShape(QFrame.NoFrame)
-        self.ai_output.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.ai_output.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.ai_output.setObjectName("AIChatScroll")
-        self.ai_output.installEventFilter(self)
-        self._ai_output_last_viewport_width = 0
-        self.ai_output_content = QWidget(self.ai_output)
-        self.ai_output_content.setObjectName("AIChatContent")
-        self.ai_output_layout = QVBoxLayout(self.ai_output_content)
-        self.ai_output_layout.setContentsMargins(12, 12, 12, 12)
-        self.ai_output_layout.setSpacing(0)
-        self.ai_output.setWidget(self.ai_output_content)
-        self._apply_ai_chat_font()
-        center_widget = QWidget(panel)
-        center_col = QVBoxLayout(center_widget)
-        center_col.setContentsMargins(0, 0, 0, 0)
-        center_col.setSpacing(8)
-        center_col.addWidget(self.ai_output, 1)
-
-        composer_row = QHBoxLayout()
-        composer_row.setContentsMargins(0, 0, 0, 0)
-        composer_row.setSpacing(8)
-
-        self.ai_input = QLineEdit(center_widget)
-        self.ai_input.setPlaceholderText("Ask about tonight or the selected object...")
-        self.ai_input.returnPressed.connect(self._send_ai_query)
-        composer_row.addWidget(self.ai_input, 1)
-
-        send_btn = QPushButton("Send", center_widget)
-        send_btn.clicked.connect(self._send_ai_query)
-        _set_button_variant(send_btn, "primary")
-        _set_button_icon_kind(send_btn, "send")
-        send_btn.setToolTip(
-            "Send the current question to the local LLM. Object-specific questions are auto-routed to a lighter selected-target prompt."
-        )
-        send_btn.setMinimumWidth(max(132, send_btn.sizeHint().width() + 16))
-        composer_row.addWidget(send_btn)
-        center_col.addLayout(composer_row)
-        layout.addWidget(center_widget, 1)
-        self._refresh_ai_context_hint()
-        self._refresh_ai_knowledge_hint()
-        self._refresh_ai_panel_action_buttons()
-        self._refresh_ai_warm_indicator()
-
-        return panel
+        return self._ai_panel_coordinator.build_panel(parent)
 
     def _build_ai_window(self) -> QDialog:
-        window = QDialog(self)
-        window.setObjectName("AIAssistantWindow")
-        window.setWindowTitle("AI Assistant")
-        window.setModal(False)
-        _fit_dialog_to_screen(
-            window,
-            preferred_width=1180,
-            preferred_height=620,
-            min_width=860,
-            min_height=360,
-        )
-
-        window_l = QVBoxLayout(window)
-        window_l.setContentsMargins(8, 8, 8, 8)
-        window_l.setSpacing(6)
-        panel = self._build_ai_panel(window)
-        window_l.addWidget(panel, 1)
-        window.finished.connect(self._on_ai_window_finished)
-        localize_widget_tree(window, current_language())
-        return window
+        return self._ai_panel_coordinator.build_window()
 
     def _ensure_ai_window(self) -> QDialog:
-        ai_window = getattr(self, "ai_window", None)
-        if isinstance(ai_window, QDialog):
-            return ai_window
-        ai_window = self._build_ai_window()
-        ai_window.setStyleSheet(self.styleSheet())
-        self.ai_window = ai_window
-        if getattr(self, "_ai_messages", None):
-            self._render_ai_messages()
-        self._refresh_ai_panel_action_buttons()
-        self._refresh_ai_context_hint()
-        self._refresh_ai_knowledge_hint()
-        self._refresh_ai_warm_indicator()
-        return ai_window
+        return self._ai_panel_coordinator.ensure_window()
 
     @Slot(bool)
     def _toggle_ai_panel(self, checked: bool) -> None:
-        ai_window = self._ensure_ai_window() if checked else getattr(self, "ai_window", None)
-        if isinstance(ai_window, QDialog):
-            if checked:
-                ai_window.show()
-                ai_window.raise_()
-                ai_window.activateWindow()
-                self._warmup_llm_if_needed()
-            else:
-                ai_window.hide()
-        if hasattr(self, "ai_toggle_btn"):
-            set_translated_text(self.ai_toggle_btn, "Hide AI" if checked else "AI", current_language())
+        self._ai_panel_coordinator.toggle_panel(checked)
 
     @Slot(int)
     def _on_ai_window_finished(self, _result: int) -> None:
-        if not hasattr(self, "ai_toggle_btn"):
-            return
-        if not self.ai_toggle_btn.isChecked():
-            return
-        blocker = QSignalBlocker(self.ai_toggle_btn)
-        self.ai_toggle_btn.setChecked(False)
-        del blocker
-        set_translated_text(self.ai_toggle_btn, "AI", current_language())
+        self._ai_panel_coordinator.on_window_finished(_result)
 
     def _llm_warmup_cache_key(self) -> tuple[str, str]:
-        return (
-            str(getattr(self.llm_config, "url", "") or "").strip().rstrip("/"),
-            str(getattr(self.llm_config, "model", "") or "").strip(),
-        )
+        return self._ai_panel_coordinator.warmup_cache_key()
 
     def _llm_is_warm(self) -> bool:
-        cache_key = self._llm_warmup_cache_key()
-        if self._llm_last_warmup_key != cache_key:
-            return False
-        return (perf_counter() - float(self._llm_last_warmup_at)) < 600.0
+        return self._ai_panel_coordinator.is_warm()
 
     def _start_llm_warmup(
         self,
@@ -11644,127 +10948,37 @@ class MainWindow(QMainWindow):
         user_initiated: bool = False,
         silent: bool = False,
     ) -> bool:
-        worker = self._llm_worker
-        if worker is not None and worker.isRunning():
-            if user_initiated:
-                self._set_ai_status("AI assistant is busy.", tone="warning")
-            return False
-        if not force and self._llm_is_warm():
-            if not silent:
-                self._set_ai_status("Ready", tone="info")
-            return False
-        self._llm_warmup_silent = bool(silent)
-        self._llm_active_requested_class = ""
-        self._llm_active_primary_target = None
-        if not silent:
-            self._set_ai_status("Warming up LLM...", tone="info")
-        worker = LLMWorker(
-            config=self.llm_config,
-            prompt="Reply with OK.",
-            system_prompt="Reply with exactly OK.",
-            tag="warmup",
-            parent=self,
+        return self._ai_panel_coordinator.start_warmup(
+            force=force,
+            user_initiated=user_initiated,
+            silent=silent,
         )
-        worker.responseChunk.connect(self._on_ai_chunk)
-        worker.responseReady.connect(self._on_ai_response)
-        worker.errorOccurred.connect(self._on_ai_error)
-        worker.finished.connect(self._on_ai_worker_finished)
-        self._llm_worker = worker
-        self._llm_active_tag = "warmup"
-        self._refresh_ai_warm_indicator()
-        worker.start()
-        return True
 
     @Slot()
     def _warmup_llm_if_needed(self) -> None:
-        self._start_llm_warmup(force=False, user_initiated=False, silent=False)
+        self._ai_panel_coordinator.warmup_if_needed()
 
     @Slot()
     def _warmup_llm_manual(self) -> None:
-        self._start_llm_warmup(force=True, user_initiated=True, silent=False)
+        self._ai_panel_coordinator.warmup_manual()
 
     @Slot()
     def _warmup_llm_on_startup(self) -> None:
-        if self._llm_startup_warmup_attempted or getattr(self, "_shutting_down", False):
-            return
-        self._llm_startup_warmup_attempted = True
-        self._start_llm_warmup(force=False, user_initiated=False, silent=True)
+        self._ai_panel_coordinator.warmup_on_startup()
 
     def _refresh_ai_warm_indicator(self) -> None:
-        configured_model = str(getattr(self.llm_config, "model", "") or "").strip() or LLMConfig.DEFAULT_MODEL
-        is_warm = self._llm_is_warm()
-        active_tag = str(getattr(self, "_llm_active_tag", "") or "").strip().lower()
-        runtime_status = str(getattr(self, "_ai_runtime_status", "") or "").strip().lower()
-        model_text = configured_model
-        if is_warm and self._llm_last_warmup_key[1]:
-            model_text = self._llm_last_warmup_key[1]
-
-        badge_text = f"● cold {model_text}"
-        badge_tone = "muted"
-        badge_glow_color = self._theme_qcolor("section_hint", "#8fa3b8")
-
-        if runtime_status == "warm-up failed":
-            badge_text = f"! warm-up failed {model_text}"
-            badge_tone = "warning"
-            badge_glow_color = self._theme_qcolor("state_warning", "#ffcc66")
-        elif active_tag == "warmup":
-            badge_text = f"◌ warming {model_text}"
-            badge_tone = "info"
-            badge_glow_color = self._theme_qcolor("state_info", "#59f3ff")
-        elif active_tag and runtime_status.startswith("stream"):
-            badge_text = f"✦ streaming {model_text}"
-            badge_tone = "info"
-            badge_glow_color = self._theme_qcolor("state_info", "#59f3ff")
-        elif active_tag:
-            badge_text = f"✦ thinking {model_text}"
-            badge_tone = "info"
-            badge_glow_color = self._theme_qcolor("state_info", "#59f3ff")
-        elif is_warm:
-            badge_text = f"● warm {model_text}"
-            badge_tone = "success"
-            badge_glow_color = self._theme_qcolor("state_success", "#67ff9a")
-
-        if hasattr(self, "ai_warm_badge_label"):
-            set_translated_text(self.ai_warm_badge_label, badge_text, current_language())
-            set_translated_tooltip(self.ai_warm_badge_label, badge_text, current_language())
-            _set_label_tone(self.ai_warm_badge_label, badge_tone)
-            self._apply_label_glow_effect(self.ai_warm_badge_label, badge_glow_color, blur_radius=22.0)
+        self._ai_panel_coordinator.refresh_warm_indicator()
 
     def _set_ai_status(self, text: str, *, tone: str = "info") -> None:
-        self._ai_runtime_status = str(text)
-        self._ai_runtime_status_tone = str(tone)
-        if tone in {"warning", "error"} and self._ai_status_error_clear_s > 0:
-            self._ai_status_clear_timer.start(int(self._ai_status_error_clear_s * 1000))
-        else:
-            self._ai_status_clear_timer.stop()
-        self._refresh_ai_warm_indicator()
+        self._ai_panel_coordinator.set_status(text, tone=tone)
 
     @Slot()
     def _clear_ai_runtime_status(self) -> None:
-        if str(getattr(self, "_llm_active_tag", "") or "").strip():
-            return
-        self._ai_runtime_status = ""
-        self._ai_runtime_status_tone = "info"
-        self._refresh_ai_warm_indicator()
+        self._ai_panel_coordinator.clear_runtime_status()
 
     @staticmethod
     def _apply_label_glow_effect(label: Optional[QLabel], color: QColor, *, blur_radius: float) -> None:
-        if label is None:
-            return
-        current = label.graphicsEffect()
-        if not isinstance(current, QGraphicsDropShadowEffect):
-            effect = QGraphicsDropShadowEffect(label)
-            effect.setOffset(0.0, 0.0)
-            label.setGraphicsEffect(effect)
-        else:
-            effect = current
-        glow_color = QColor(color)
-        if not glow_color.isValid():
-            glow_color = QColor("#59f3ff")
-        if glow_color.alpha() < 210:
-            glow_color.setAlpha(210)
-        effect.setBlurRadius(float(blur_radius))
-        effect.setColor(glow_color)
+        AIPanelCoordinator.apply_label_glow_effect(label, color, blur_radius=blur_radius)
 
     def _current_site_for_weather(self) -> Optional[Site]:
         site = getattr(self.table_model, "site", None) if hasattr(self, "table_model") else None
@@ -15451,94 +14665,29 @@ class MainWindow(QMainWindow):
         requested_class: str = "",
         primary_target: Optional[Target] = None,
     ) -> None:
-        worker = self._llm_worker
-        if worker is not None and worker.isRunning():
-            self._append_ai_message(
-                "The AI assistant is still processing the previous request.",
-                is_error=True,
-            )
-            return
-        if hasattr(self, "ai_toggle_btn") and not self.ai_toggle_btn.isChecked():
-            self.ai_toggle_btn.setChecked(True)
-        self._append_ai_message(
+        self._ai_panel_coordinator.dispatch_llm(
+            prompt,
+            tag,
             label,
-            is_user=True,
             requested_class=requested_class,
             primary_target=primary_target,
         )
-        self._start_ai_response_message()
-        self._set_ai_status("Thinking...", tone="info")
-        self._llm_active_requested_class = str(requested_class or "").strip()
-        self._llm_active_primary_target = primary_target if isinstance(primary_target, Target) else None
-        worker = LLMWorker(
-            config=self.llm_config,
-            prompt=prompt,
-            system_prompt=self._SYSTEM_PROMPT,
-            tag=tag,
-            parent=self,
-        )
-        worker.responseChunk.connect(self._on_ai_chunk)
-        worker.responseReady.connect(self._on_ai_response)
-        worker.errorOccurred.connect(self._on_ai_error)
-        worker.finished.connect(self._on_ai_worker_finished)
-        self._llm_worker = worker
-        self._llm_active_tag = tag
-        self._refresh_ai_warm_indicator()
-        worker.start()
 
     @Slot(str, str)
     def _on_ai_chunk(self, tag: str, text: str) -> None:
-        if not text:
-            return
-        if tag == "warmup":
-            return
-        self._set_ai_status("Streaming...", tone="info")
-        self._append_ai_stream_chunk(text)
+        self._ai_panel_coordinator.on_chunk(tag, text)
 
     @Slot(str, str)
     def _on_ai_response(self, tag: str, text: str) -> None:
-        if tag == "warmup":
-            self._llm_last_warmup_key = self._llm_warmup_cache_key()
-            self._llm_last_warmup_at = perf_counter()
-            self._set_ai_status("Ready", tone="info")
-            return
-        logger.info("LLM response received (tag=%s, length=%d)", tag, len(text))
-        self._finalize_ai_response(text)
+        self._ai_panel_coordinator.on_response(tag, text)
 
     @Slot(str)
     def _on_ai_error(self, message: str) -> None:
-        if self._llm_active_tag == "warmup":
-            logger.warning("LLM warm-up error: %s", message)
-            if self._llm_warmup_silent:
-                self._ai_runtime_status = ""
-                self._refresh_ai_warm_indicator()
-            else:
-                self._set_ai_status("Warm-up failed", tone="warning")
-            return
-        logger.warning("LLM error: %s", message)
-        self._fail_ai_response(message)
+        self._ai_panel_coordinator.on_error(message)
 
     @Slot()
     def _on_ai_worker_finished(self) -> None:
-        active_tag = self._llm_active_tag
-        if active_tag != "warmup":
-            self._set_ai_status("Ready", tone="info")
-        idx = self._ai_stream_message_index
-        if idx is not None and 0 <= idx < len(self._ai_messages):
-            if not self._ai_messages[idx].get("text", "").strip():
-                self._ai_messages.pop(idx)
-                self._render_ai_messages()
-                self._persist_ai_messages_to_storage()
-        self._ai_stream_message_index = None
-        sender = self.sender()
-        if sender is self._llm_worker:
-            self._llm_worker = None
-        if active_tag == "warmup":
-            self._llm_warmup_silent = False
-        self._llm_active_requested_class = ""
-        self._llm_active_primary_target = None
-        self._llm_active_tag = ""
-        self._refresh_ai_warm_indicator()
+        self._ai_panel_coordinator.on_worker_finished()
 
     def _clear_ai_messages(self) -> None:
         self._ai_stream_render_timer.stop()
