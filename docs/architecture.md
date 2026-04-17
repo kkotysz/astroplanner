@@ -48,6 +48,9 @@ and coordinator modules. The dependency direction is intentionally one-way:
 - `astroplanner/visibility_plotly.py`
   Pure Plotly HTML builder and airmass-axis constants for the interactive
   visibility chart.
+- `astroplanner/visibility_matplotlib.py`
+  Matplotlib visibility rendering, target line coloring, altitude/airmass axis
+  switching, current-night plot refresh, and radar/polar plot helpers.
 - `astroplanner/ai.py`
   Knowledge-note parsing, deterministic AI intent helpers, OpenAI-compatible model
   discovery, LLM config, and LLM request workers.
@@ -101,7 +104,8 @@ The current coordinator layer extracts orchestration that is tightly coupled to
 - `astroplanner/visibility_coordinator.py`
   Visibility plot refresh scheduling, selected-target/cutout synchronization,
   Plotly web rendering/cache, Plotly selection styling, polar selection, and
-  show/hide orchestration.
+  show/hide orchestration. The heavier Matplotlib redraw path lives in
+  `astroplanner/visibility_matplotlib.py`.
 - `astroplanner/observatory_coordinator.py`
   Observatory persistence, default config loading, coordinate lookup, and combo
   refresh glue.
@@ -165,9 +169,10 @@ The main file is smaller but still contains substantial legacy surface area. The
 largest remaining candidates are:
 
 - high-level `MainWindow` orchestration and startup/shutdown lifecycle;
-- visibility/cutout/finder rendering internals that are still sensitive to refresh
-  timing, especially Matplotlib, cutout, and finder preview paths;
-- Aladin integration and preview cache glue;
+- remaining visibility/cutout/finder rendering internals that are still sensitive
+  to refresh timing, especially the shell-level refresh triggers around
+  visibility, cutout, and finder preview paths;
+- Aladin integration call sites and preview cache glue;
 - remaining menu/action wiring and app-wide settings application;
 - cross-feature workflows that still span table state, selected target state,
   weather, Seestar, and AI.
