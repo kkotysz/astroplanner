@@ -6,15 +6,18 @@ plan.
 
 ## Runtime Shape
 
-AstroPlanner is still launched from `astro_planner.py`. That file owns the
-application entry point, `MainWindow`, top-level widget composition, the highest
-risk refresh paths, and compatibility glue for older code that has not been moved
-yet.
+AstroPlanner is still launched from `astro_planner.py`, but that file is now a
+compatibility launcher and re-export shim. The `MainWindow` shell lives in
+`astroplanner/main_window.py`, which owns top-level widget composition, the
+highest-risk refresh paths, and compatibility glue for older code that has not
+been moved yet.
 
 The `astroplanner/` package now contains the extracted domain, UI, storage, worker,
 and coordinator modules. The dependency direction is intentionally one-way:
 
-- `astro_planner.py` imports and composes modules from `astroplanner/`.
+- `astro_planner.py` imports and re-exports the package entry point from
+  `astroplanner/main_window.py`.
+- `astroplanner/main_window.py` imports and composes modules from `astroplanner/`.
 - Feature modules do not import `astro_planner.py` at runtime.
 - Coordinator modules may reference `MainWindow` only behind `TYPE_CHECKING` for
   type hints.
@@ -30,6 +33,10 @@ and coordinator modules. The dependency direction is intentionally one-way:
 - `astroplanner/app_config.py`
   App settings directory resolution, SQLite settings factory, and obsolete-key
   cleanup.
+- `astroplanner/main_window.py`
+  The desktop shell class, compatibility `main()` entry point, top-level widget
+  assembly, and remaining feature glue that has not yet been delegated to a
+  focused coordinator.
 - `astroplanner/scoring.py`
   Deterministic per-target night scoring and `TargetNightMetrics`.
 - `astroplanner/astronomy.py`
@@ -151,7 +158,7 @@ state is independent yet.
 
 ## MainWindow Responsibilities
 
-`MainWindow` is currently still responsible for:
+`astroplanner/main_window.py` is currently still responsible for:
 
 - composing the main desktop UI shell;
 - owning global app state, settings, storage, timers, and worker lifecycles;
@@ -179,7 +186,7 @@ rewrite.
 The main file is smaller but still contains substantial legacy surface area. The
 largest remaining candidates are:
 
-- high-level `MainWindow` orchestration and startup/shutdown lifecycle;
+- high-level `MainWindow` orchestration and shutdown lifecycle;
 - remaining visibility/cutout/finder rendering internals that are still sensitive
   to refresh timing, especially the shell-level refresh triggers around
   visibility, cutout, and finder preview paths;

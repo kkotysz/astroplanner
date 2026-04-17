@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import astro_planner
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 
 def test_same_runtime_site_matches_same_coordinates_and_timezone() -> None:
@@ -76,7 +76,7 @@ def test_distribute_extra_table_width_keeps_widths_when_space_is_tight() -> None
 
 
 def test_target_table_model_hover_row_emits_row_refresh() -> None:
-    app = QCoreApplication.instance() or QCoreApplication([])
+    app = QApplication.instance() or QApplication([])
     assert app is not None
 
     model = astro_planner.TargetTableModel(

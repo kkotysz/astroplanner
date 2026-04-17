@@ -15,6 +15,7 @@ from astroplanner.i18n import (
 ROOT = Path(__file__).resolve().parents[1]
 UI_SOURCE_FILES = (
     ROOT / "astro_planner.py",
+    ROOT / "astroplanner" / "main_window.py",
     ROOT / "astroplanner" / "seestar.py",
 )
 UI_CALL_NAMES = {
