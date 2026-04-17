@@ -126,6 +126,9 @@ The current coordinator layer extracts orchestration that is tightly coupled to
 - `astroplanner/plan_coordinator.py`
   Plan snapshots, workspace autosave, named-plan load/save, JSON plan import,
   per-plan AI chat persistence, and observation-log writes.
+- `astroplanner/main_window_coordinator.py`
+  Shell-level menu/action wiring, status bar setup and refresh, general settings
+  application, table settings migration, and startup preload/timer glue.
 
 These coordinators deliberately accept a `MainWindow` instance because their job is
 to reduce the size of `astro_planner.py` without pretending that the underlying
@@ -183,7 +186,7 @@ largest remaining candidates are:
 - Aladin integration call sites and preview cache glue;
 - remaining AI rendering helpers and compatibility wrappers around the extracted
   AI context and panel coordinators;
-- remaining menu/action wiring and app-wide settings application;
+- remaining app-wide shell wiring that still spans multiple feature coordinators;
 - cross-feature workflows that still span table state, selected target state,
   weather, Seestar, and AI.
 
