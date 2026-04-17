@@ -68,6 +68,170 @@ class ObservatoryLookupWorker(QThread):
             self.completed.emit(0.0, 0.0, None, "", str(exc))
 
 
+class AddObservatoryValidationError(ValueError):
+    """Validation error with the dialog title/message to show to the user."""
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(message)
+        self.title = title
+        self.message = message
+
+
+class AddObservatoryDialog(QDialog):
+    """Small dialog for adding a single custom observatory."""
+
+    def __init__(
+        self,
+        *,
+        existing_names: set[str],
+        template_site: Optional[Site],
+        default_limiting_magnitude: float,
+        lookup_resolver: Optional[Callable[[str], tuple[float, float, Optional[float], str]]] = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("AddObservatoryDialog")
+        self.setWindowTitle("Add Observatory")
+        self._existing_names = {str(name) for name in existing_names}
+        self._template_site = template_site
+        self._lookup_resolver = lookup_resolver
+        self._site: Optional[Site] = None
+
+        layout = QFormLayout(self)
+
+        self.name_edit = QLineEdit(self)
+        self.name_edit.setPlaceholderText("Name")
+        self.lookup_btn = QPushButton("Lookup", self)
+        self.lookup_btn.setToolTip("Find coordinates from place name")
+        _set_button_variant(self.lookup_btn, "secondary")
+        _set_button_icon_kind(self.lookup_btn, "lookup")
+        name_row = QWidget(self)
+        name_row_l = QHBoxLayout(name_row)
+        name_row_l.setContentsMargins(0, 0, 0, 0)
+        name_row_l.setSpacing(6)
+        name_row_l.addWidget(self.name_edit, 1)
+        name_row_l.addWidget(self.lookup_btn)
+
+        self.lat_edit = QLineEdit(self)
+        self.lat_edit.setPlaceholderText("Latitude")
+        self.lat_edit.setValidator(QDoubleValidator(-90.0, 90.0, 6, self))
+        self.lon_edit = QLineEdit(self)
+        self.lon_edit.setPlaceholderText("Longitude")
+        self.lon_edit.setValidator(QDoubleValidator(-180.0, 180.0, 6, self))
+        self.elev_edit = QLineEdit(self)
+        self.elev_edit.setPlaceholderText("Elevation (m)")
+        self.elev_edit.setValidator(QDoubleValidator(-1000.0, 20000.0, 2, self))
+        self.limiting_mag_spin = QDoubleSpinBox(self)
+        self.limiting_mag_spin.setRange(-5.0, 30.0)
+        self.limiting_mag_spin.setDecimals(1)
+        self.limiting_mag_spin.setSingleStep(0.1)
+        self.limiting_mag_spin.setValue(float(default_limiting_magnitude))
+        self.limiting_mag_spin.setToolTip(
+            "Telescope limiting magnitude used as red-warning threshold in suggested targets."
+        )
+        self.custom_conditions_url_edit = QLineEdit(self)
+        self.custom_conditions_url_edit.setPlaceholderText("https://example.com/station.json")
+        self.lookup_info = QLabel("", self)
+        self.lookup_info.setWordWrap(True)
+        _set_label_tone(self.lookup_info, "info")
+
+        layout.addRow("Name:", name_row)
+        layout.addRow("Lat:", self.lat_edit)
+        layout.addRow("Lon:", self.lon_edit)
+        layout.addRow("Elev:", self.elev_edit)
+        layout.addRow("Lim. Mag:", self.limiting_mag_spin)
+        layout.addRow("Custom conditions URL:", self.custom_conditions_url_edit)
+        layout.addRow("", self.lookup_info)
+
+        self.lookup_btn.clicked.connect(self._lookup_coords)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self._accept_dialog)
+        buttons.rejected.connect(self.reject)
+        _style_dialog_button_box(buttons)
+        layout.addWidget(buttons)
+        _fit_dialog_to_screen(
+            self,
+            preferred_width=720,
+            preferred_height=520,
+            min_width=520,
+            min_height=420,
+        )
+
+    def site(self) -> Optional[Site]:
+        return self._site
+
+    def build_site(self) -> Site:
+        name = self.name_edit.text().strip()
+        if not name:
+            raise AddObservatoryValidationError("Invalid Observatory", "Name cannot be empty.")
+        if name in self._existing_names:
+            raise AddObservatoryValidationError(
+                "Invalid Observatory",
+                f"Observatory '{name}' already exists.",
+            )
+        try:
+            template_site = self._template_site
+            return Site(
+                name=name,
+                latitude=float(self.lat_edit.text()),
+                longitude=float(self.lon_edit.text()),
+                elevation=float(self.elev_edit.text()),
+                limiting_magnitude=float(self.limiting_mag_spin.value()),
+                custom_conditions_url=self.custom_conditions_url_edit.text().strip(),
+                telescope_diameter_mm=float(getattr(template_site, "telescope_diameter_mm", 0.0) or 0.0),
+                focal_length_mm=float(getattr(template_site, "focal_length_mm", 0.0) or 0.0),
+                pixel_size_um=float(getattr(template_site, "pixel_size_um", 0.0) or 0.0),
+                detector_width_px=int(getattr(template_site, "detector_width_px", 0) or 0),
+                detector_height_px=int(getattr(template_site, "detector_height_px", 0) or 0),
+            )
+        except AddObservatoryValidationError:
+            raise
+        except Exception as exc:
+            raise AddObservatoryValidationError(
+                "Invalid Coordinates",
+                "Please enter valid latitude, longitude, elevation and limiting magnitude.",
+            ) from exc
+
+    @Slot()
+    def _lookup_coords(self) -> None:
+        query = self.name_edit.text().strip()
+        if not query:
+            QMessageBox.warning(self, "Missing Name", "Enter observatory name/place first.")
+            return
+        if not callable(self._lookup_resolver):
+            QMessageBox.warning(self, "Lookup Unavailable", "Coordinate lookup is unavailable in this context.")
+            return
+        self.lookup_btn.setEnabled(False)
+        old_txt = self.lookup_btn.text()
+        self.lookup_btn.setText("...")
+        try:
+            lat, lon, elev, display = self._lookup_resolver(query)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Lookup Failed", str(exc))
+            return
+        finally:
+            self.lookup_btn.setText(old_txt)
+            self.lookup_btn.setEnabled(True)
+
+        self.lat_edit.setText(f"{lat:.6f}")
+        self.lon_edit.setText(f"{lon:.6f}")
+        if elev is not None:
+            self.elev_edit.setText(f"{elev:.1f}")
+        elif not self.elev_edit.text().strip():
+            self.elev_edit.setText("0")
+        self.lookup_info.setText(str(display))
+
+    @Slot()
+    def _accept_dialog(self) -> None:
+        try:
+            self._site = self.build_site()
+        except AddObservatoryValidationError as exc:
+            QMessageBox.warning(self, exc.title, exc.message)
+            return
+        self.accept()
+
+
 class ObservatoryManagerDialog(QDialog):
     """Manage observatories with search and inline configuration editing."""
 
@@ -959,6 +1123,8 @@ class ObservatoryManagerDialog(QDialog):
 
 
 __all__ = [
+    "AddObservatoryDialog",
+    "AddObservatoryValidationError",
     "ObservatoryLookupWorker",
     "ObservatoryManagerDialog",
 ]

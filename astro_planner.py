@@ -228,6 +228,7 @@ from astroplanner.i18n import (
     set_translated_tooltip,
     translate_text,
 )
+from astroplanner.plan_coordinator import PlanCoordinator
 from astroplanner.storage import AppStorage, SettingsAdapter
 from astroplanner.targets_coordinator import TargetTableCoordinator
 from astroplanner.visibility_coordinator import VisibilityCoordinator
@@ -238,35 +239,28 @@ from astroplanner.ui.common import (
     _fit_dialog_to_screen,
 )
 from astroplanner.ui.add_target import AddTargetDialog, FinderChartWorker, MetadataLookupWorker
-from astroplanner.ui.observatory import ObservatoryLookupWorker, ObservatoryManagerDialog
+from astroplanner.ui.observatory import AddObservatoryDialog, ObservatoryLookupWorker, ObservatoryManagerDialog
 from astroplanner.ui.settings import GeneralSettingsDialog, TableSettingsDialog
 from astroplanner.ui.seestar import SeestarSessionPlanDialog
 from astroplanner.ui.suggestions import SuggestedTargetsDialog
 from astroplanner.ui.targets import TargetTableModel
 from astroplanner.weather import WeatherLiveWorker
 from astroplanner.ui.weather import WeatherDialog
+from astroplanner.visibility_plotly import (
+    HAS_PLOTLY as _HAS_PLOTLY,
+    PLOTLY_JS_BASE_DIR as _PLOTLY_JS_BASE_DIR,
+    VISIBILITY_AIRMASS_Y_MAX,
+    VISIBILITY_AIRMASS_Y_MIN,
+    VISIBILITY_AIRMASS_Y_TICKS,
+    VisibilityPlotlyRequest,
+    build_visibility_plotly_html,
+)
 
 try:
     from PIL import Image, ImageDraw
 except Exception:  # pragma: no cover - optional runtime dependency
     Image = None  # type: ignore[assignment]
     ImageDraw = None  # type: ignore[assignment]
-
-try:
-    import plotly
-    from plotly.io import to_html as plotly_to_html
-    from plotly.subplots import make_subplots as plotly_make_subplots
-    import plotly.graph_objects as go
-
-    _plotly_base_dir = Path(plotly.__file__).resolve().parent / "package_data"
-    _PLOTLY_JS_BASE_DIR = str(_plotly_base_dir) if (_plotly_base_dir / "plotly.min.js").exists() else ""
-    _HAS_PLOTLY = True
-except Exception:  # pragma: no cover - optional runtime dependency
-    plotly_to_html = None  # type: ignore[assignment]
-    plotly_make_subplots = None  # type: ignore[assignment]
-    go = None  # type: ignore[assignment]
-    _PLOTLY_JS_BASE_DIR = ""
-    _HAS_PLOTLY = False
 
 # ── Logging configuration ─────────────────────────────────────────────
 logging.basicConfig(
@@ -340,9 +334,6 @@ SIMBAD_COMPACT_NEGATIVE_CACHE_TTL_S = 6 * 60 * 60
 QUICK_TARGETS_DEFAULT_COUNT = 10
 QUICK_TARGETS_MIN_COUNT = 1
 QUICK_TARGETS_MAX_COUNT = 50
-VISIBILITY_AIRMASS_Y_MIN = 0.9
-VISIBILITY_AIRMASS_Y_MAX = 2.1
-VISIBILITY_AIRMASS_Y_TICKS = [0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.7, 1.9, 2.1]
 
 
 def _decode_simbad_value(value: object) -> str:
@@ -767,7 +758,6 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
-    QInputDialog,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -783,12 +773,8 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QSizePolicy,
     QTableView,
-    QTableWidget,
-    QTableWidgetItem,
     QTabWidget,
     QToolButton,
-    QListWidget,
-    QListWidgetItem,
     QVBoxLayout,
     QWidget,
     QColorDialog,
@@ -3193,40 +3179,13 @@ class MainWindow(QMainWindow):
         *,
         now_override: Optional[datetime] = None,
     ) -> str:
-        current_now = now_override if isinstance(now_override, datetime) else data.get("now_local")
-        now_key = (
-            current_now.strftime("%Y-%m-%d %H:%M")
-            if isinstance(current_now, datetime)
-            else ""
+        return self._visibility_coordinator.visibility_web_render_signature(
+            data,
+            now_override=now_override,
         )
-        target_signature = [
-            (
-                str(tgt.name),
-                _normalized_css_color(getattr(tgt, "plot_color", "")),
-                bool(self.table_model.row_enabled[idx]) if idx < len(self.table_model.row_enabled) else True,
-            )
-            for idx, tgt in enumerate(self.targets)
-        ]
-        signature_payload = {
-            "context": str(data.get("site_key", "") or self._current_visibility_context_key()),
-            "mode": "airmass" if self._plot_airmass else "altitude",
-            "theme": str(getattr(self, "_theme_name", DEFAULT_UI_THEME)),
-            "dark": bool(getattr(self, "_dark_enabled", False)),
-            "date": self.date_edit.date().toString("yyyy-MM-dd") if hasattr(self, "date_edit") else "",
-            "sun": bool(self.sun_check.isChecked()) if hasattr(self, "sun_check") else True,
-            "moon": bool(self.moon_check.isChecked()) if hasattr(self, "moon_check") else True,
-            "targets": target_signature,
-            "now": now_key,
-        }
-        serialized = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
 
     def _store_visibility_web_html_cache(self, cache_key: str, html: str) -> None:
-        cache = getattr(self, "_visibility_web_html_cache", {})
-        cache[str(cache_key)] = str(html)
-        while len(cache) > 8:
-            cache.pop(next(iter(cache)))
-        self._visibility_web_html_cache = cache
+        self._visibility_coordinator.store_visibility_web_html_cache(cache_key, html)
 
     def _schedule_visibility_plot_refresh(self, *, delay_ms: int = 0) -> None:
         self._visibility_coordinator.schedule_visibility_plot_refresh(delay_ms=delay_ms)
@@ -3294,8 +3253,6 @@ class MainWindow(QMainWindow):
         *,
         now_override: Optional[datetime] = None,
     ) -> Optional[str]:
-        if not (_HAS_PLOTLY and plotly_to_html is not None and go is not None):
-            return None
         try:
             tz = pytz.timezone(str(data.get("tz", "UTC") or "UTC"))
         except Exception:
@@ -3315,25 +3272,6 @@ class MainWindow(QMainWindow):
                 dark_enabled=bool(getattr(self, "_dark_enabled", False)),
             ),
         )
-        dark = bool(getattr(self, "_dark_enabled", False))
-        plot_bg = str(use_tokens.get("plot_bg", "#121b29"))
-        plot_panel_bg = str(use_tokens.get("plot_panel_bg", plot_bg))
-        plot_text = str(use_tokens.get("plot_text", "#d7e4f0" if dark else "#253347"))
-        plot_grid = str(use_tokens.get("plot_grid", "#2f4666" if dark else "#d6deea"))
-        plot_guide = str(use_tokens.get("plot_guide", plot_grid))
-        plot_limit = str(use_tokens.get("plot_limit", "#ff5d8f"))
-        plot_now = str(use_tokens.get("plot_now", "#ff3df0"))
-        plot_sun = str(use_tokens.get("plot_sun", "#ffb224"))
-        plot_moon = str(use_tokens.get("plot_moon", "#d7e2ff"))
-        civil_col = str(use_tokens.get("plot_twilight_civil", "#ffd166"))
-        naut_col = str(use_tokens.get("plot_twilight_naut", "#5ab6ff"))
-        astro_col = str(use_tokens.get("plot_twilight_astro", "#8094c8"))
-        plot_font = _plot_font_css_stack(use_tokens)
-
-        limit = float(self.limit_spin.value())
-        sun_alt_limit = self._sun_alt_limit()
-        sun_alt_series = np.array(data.get("sun_alt", np.full(len(times), np.nan)), dtype=float)
-        obs_sun_mask = np.isfinite(sun_alt_series) & (sun_alt_series <= sun_alt_limit)
         line_palette = self._line_palette()
         target_colors = [
             self._target_plot_color_css(tgt, idx, line_palette)
@@ -3343,221 +3281,43 @@ class MainWindow(QMainWindow):
         if len(row_enabled) != len(self.targets):
             row_enabled = [True] * len(self.targets)
         start_dt, end_dt, event_map = self._visibility_time_window(data, tz)
-        grid_css = self._visibility_grid_color(alpha=0.42)
-        guide_css = self._visibility_grid_color(alpha=0.24)
-
-        fig = go.Figure()
-        y_title = "Airmass" if self._plot_airmass else "Altitude (°)"
-        y_precision = ".2f" if self._plot_airmass else ".1f"
-
-        def _visible_series(values: np.ndarray, mask: np.ndarray) -> list[float]:
-            series = np.array(values, copy=True, dtype=float)
-            series[~mask] = np.nan
-            return [float(v) if np.isfinite(v) else np.nan for v in series]
-
-        for idx, tgt in enumerate(self.targets):
-            if idx >= len(row_enabled) or not row_enabled[idx]:
-                continue
-            row = data.get(tgt.name)
-            if not isinstance(row, dict):
-                continue
-            alt = np.array(row.get("altitude", np.full(len(times), np.nan)), dtype=float)
-            if alt.shape[0] != len(times):
-                continue
-            color = target_colors[idx] if idx < len(target_colors) else self._target_plot_color_css(tgt, idx, line_palette)
-            vis_mask = np.isfinite(alt) & (alt > 0.0)
-            if not vis_mask.any():
-                continue
-            base_y = _visible_series(self._plot_y_values(alt), vis_mask)
-            fig.add_trace(
-                go.Scatter(
-                    x=times,
-                    y=base_y,
-                    mode="lines",
-                    name=tgt.name,
-                    showlegend=False,
-                    hoverinfo="skip",
-                    line={"color": color, "width": 1.4, "dash": "dash"},
-                    opacity=0.28,
-                    meta={"kind": "target", "target": tgt.name, "segment": "base"},
-                )
-            )
-
-            high_mask = np.isfinite(alt) & (alt >= limit) & obs_sun_mask
-            if high_mask.any():
-                high_y = _visible_series(self._plot_y_values(alt), high_mask)
-                fig.add_trace(
-                    go.Scatter(
-                        x=times,
-                        y=high_y,
-                        mode="lines",
-                        name=tgt.name,
-                        showlegend=False,
-                        line={"color": color, "width": 1.9},
-                        opacity=0.92,
-                        hovertemplate=f"{tgt.name}<br>%{{x|%H:%M}}<br>{y_title}: %{{y:{y_precision}}}<extra></extra>",
-                        meta={"kind": "target", "target": tgt.name, "segment": "high"},
-                    )
-                )
-
-        for start_key, end_key, color in (
-            ("sunset", "dusk_civ", civil_col),
-            ("dusk_civ", "dusk_naut", naut_col),
-            ("dusk_naut", "dusk", astro_col),
-            ("dawn", "dawn_naut", astro_col),
-            ("dawn_naut", "dawn_civ", naut_col),
-            ("dawn_civ", "sunrise", civil_col),
-        ):
-            start_evt = event_map.get(start_key)
-            end_evt = event_map.get(end_key)
-            if start_evt is None or end_evt is None or start_evt >= end_evt:
-                continue
-            x0 = max(start_evt, start_dt)
-            x1 = min(end_evt, end_dt)
-            if x0 >= x1:
-                continue
-            fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.22, line_width=0, layer="below")
-
-        for _key, evt in event_map.items():
-            if start_dt <= evt <= end_dt:
-                fig.add_vline(x=evt, line={"color": guide_css, "width": 1, "dash": "dash"}, opacity=1.0)
-
-        limit_value = self._plot_limit_value()
-        fig.add_hline(y=limit_value, line={"color": plot_limit, "width": 1.0}, opacity=0.55)
-
-        if self.sun_check.isChecked() and "sun_alt" in data:
-            sun_y = [float(v) if np.isfinite(v) else np.nan for v in self._plot_y_values(data["sun_alt"])]
-            fig.add_trace(
-                go.Scatter(
-                    x=times,
-                    y=sun_y,
-                    mode="lines",
-                    name="Sun",
-                    showlegend=False,
-                    line={"color": plot_sun, "width": 1.2},
-                    opacity=0.82,
-                    hovertemplate=f"Sun<br>%{{x|%H:%M}}<br>{y_title}: %{{y:{y_precision}}}<extra></extra>",
-                )
-            )
-        if self.moon_check.isChecked() and "moon_alt" in data:
-            moon_y = [float(v) if np.isfinite(v) else np.nan for v in self._plot_y_values(data["moon_alt"])]
-            fig.add_trace(
-                go.Scatter(
-                    x=times,
-                    y=moon_y,
-                    mode="lines",
-                    name="Moon",
-                    showlegend=False,
-                    line={"color": plot_moon, "width": 1.2},
-                    opacity=0.84,
-                    hovertemplate=f"Moon<br>%{{x|%H:%M}}<br>{y_title}: %{{y:{y_precision}}}<extra></extra>",
-                )
-            )
-
-        now_dt = now_override
-        if not isinstance(now_dt, datetime):
-            payload_now = data.get("now_local")
-            now_dt = payload_now if isinstance(payload_now, datetime) else datetime.now(tz)
-        if now_dt.tzinfo is None:
-            now_dt = tz.localize(now_dt)
+        fallback_label_dt = now_override if isinstance(now_override, datetime) else data.get("now_local")
+        if not isinstance(fallback_label_dt, datetime):
+            fallback_label_dt = datetime.now(tz)
+        if fallback_label_dt.tzinfo is None:
+            fallback_label_dt = tz.localize(fallback_label_dt)
         else:
-            now_dt = now_dt.astimezone(tz)
-        fig.add_vline(x=now_dt, line={"color": plot_now, "width": 1.4, "dash": "dot"})
-
-        date_label = self.date_edit.date().toString("yyyy-MM-dd") if hasattr(self, "date_edit") else now_dt.strftime("%Y-%m-%d")
-        fig.update_layout(
-            template="plotly_dark" if dark else "plotly_white",
-            title={"text": f"Date: {date_label}", "x": 0.5, "xanchor": "center"},
-            margin={"l": 56, "r": 20, "t": 48, "b": 52},
-            hovermode="x unified",
-            paper_bgcolor=plot_bg,
-            plot_bgcolor=plot_panel_bg,
-            font={"color": plot_text, "family": plot_font},
-            showlegend=False,
-            dragmode="pan",
+            fallback_label_dt = fallback_label_dt.astimezone(tz)
+        date_label = (
+            self.date_edit.date().toString("yyyy-MM-dd")
+            if hasattr(self, "date_edit")
+            else fallback_label_dt.strftime("%Y-%m-%d")
         )
-        fig.update_xaxes(
-            range=[start_dt, end_dt],
-            showgrid=True,
-            gridcolor=grid_css,
-            zerolinecolor=grid_css,
-            color=plot_text,
-            tickformat="%H:%M",
-            title_text="Time (local)",
+        request = VisibilityPlotlyRequest(
+            data=data,
+            targets=list(self.targets),
+            row_enabled=row_enabled,
+            target_colors=target_colors,
+            limit_altitude=float(self.limit_spin.value()),
+            sun_alt_limit=self._sun_alt_limit(),
+            plot_airmass=bool(self._plot_airmass),
+            show_sun=bool(self.sun_check.isChecked()),
+            show_moon=bool(self.moon_check.isChecked()),
+            date_label=date_label,
+            theme_tokens=use_tokens,
+            dark_enabled=bool(getattr(self, "_dark_enabled", False)),
+            start_dt=start_dt,
+            end_dt=end_dt,
+            event_map=event_map,
+            grid_css=self._visibility_grid_color(alpha=0.42),
+            guide_css=self._visibility_grid_color(alpha=0.24),
+            plot_font=_plot_font_css_stack(use_tokens),
+            font_face_css=_embedded_display_font_css(),
+            use_local_plotly_js=bool(_PLOTLY_JS_BASE_DIR),
         )
-        if not self._plot_airmass:
-            fig.update_yaxes(
-                title_text="Altitude (°)",
-                range=[0, 90],
-                tickvals=[0, 15, 30, 45, 60, 75, 90],
-                showgrid=True,
-                gridcolor=grid_css,
-                zerolinecolor=grid_css,
-                color=plot_text,
-            )
-        else:
-            fig.update_yaxes(
-                title_text="Airmass",
-                range=[VISIBILITY_AIRMASS_Y_MAX, VISIBILITY_AIRMASS_Y_MIN],
-                tickvals=VISIBILITY_AIRMASS_Y_TICKS,
-                ticktext=[f"{tick:.1f}" for tick in VISIBILITY_AIRMASS_Y_TICKS],
-                showgrid=True,
-                gridcolor=grid_css,
-                zerolinecolor=grid_css,
-                color=plot_text,
-            )
-
-        html_fragment = plotly_to_html(
-            fig,
-            include_plotlyjs=False,
-            full_html=False,
-            config={
-                "displaylogo": False,
-                "responsive": True,
-                "scrollZoom": True,
-                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-            },
-        )
-        html_fragment = html_fragment.replace("<div>", "<div id='plot-host' style='width:100%;height:100%;min-height:100%;'>", 1)
-        graph_id_match = re.search(r'<div id="([^"]+)" class="plotly-graph-div"', html_fragment)
-        graph_id = graph_id_match.group(1) if graph_id_match else ""
-        resize_script = ""
-        if graph_id:
-            resize_script = (
-                "<script>"
-                "(function(){"
-                f"const gd=document.getElementById('{graph_id}');"
-                "if(!gd||!window.Plotly){return;}"
-                "const resize=()=>{"
-                "gd.style.width='100%';"
-                "gd.style.height='100%';"
-                "if(window.Plotly&&Plotly.Plots){Plotly.Plots.resize(gd);}"
-                "};"
-                "window.addEventListener('resize', resize);"
-                "if(window.ResizeObserver){new ResizeObserver(resize).observe(document.body);}"
-                "setTimeout(resize,0);"
-                "setTimeout(resize,120);"
-                "})();"
-                "</script>"
-            )
-        font_face_css = _embedded_display_font_css()
-        html_head = (
-            "<!doctype html><html><head><meta charset='utf-8'>"
-            "<style>"
-            f"{font_face_css}"
-            f"html,body,#plot-host{{margin:0;width:100%;height:100%;overflow:hidden;background:{plot_bg};}}"
-            f"html,body,#plot-host,.plotly-graph-div{{font-family:{plot_font};}}"
-            ".plotly-graph-div{width:100%!important;height:100%!important;}"
-            "</style>"
-        )
-        if _PLOTLY_JS_BASE_DIR:
-            return (
-                f"{html_head}<script src='plotly.min.js'></script></head><body>"
-                f"{html_fragment}{resize_script}</body></html>"
-            )
-        return (
-            f"{html_head}<script src='https://cdn.plot.ly/plotly-3.4.0.min.js'></script></head><body>"
-            f"{html_fragment}{resize_script}</body></html>"
+        return build_visibility_plotly_html(
+            request,
+            now_override=now_override,
         )
 
     def _render_visibility_web_plot(
@@ -3566,30 +3326,10 @@ class MainWindow(QMainWindow):
         *,
         now_override: Optional[datetime] = None,
     ) -> None:
-        payload = data if isinstance(data, dict) else getattr(self, "last_payload", None)
-        if not isinstance(payload, dict):
-            return
-        if getattr(self, "_use_visibility_web", False):
-            self._ensure_visibility_plot_widgets()
-        web_view = getattr(self, "visibility_web", None)
-        if web_view is None:
-            return
-        cache_key = self._visibility_web_render_signature(payload, now_override=now_override)
-        html = self._visibility_web_html_cache.get(cache_key)
-        if not html:
-            html = self._build_visibility_plotly_html(payload, now_override=now_override)
-            if html:
-                self._store_visibility_web_html_cache(cache_key, html)
-        if not html:
-            self._visibility_web_has_content = False
-            self._set_visibility_loading_state("Unable to render interactive chart.", visible=True)
-            return
-        if not self._visibility_web_has_content:
-            self._set_visibility_loading_state("Rendering interactive chart…", visible=True)
-        if _PLOTLY_JS_BASE_DIR:
-            web_view.setHtml(html, QUrl.fromLocalFile(str(_PLOTLY_JS_BASE_DIR) + "/"))
-            return
-        web_view.setHtml(html)
+        self._visibility_coordinator.render_visibility_web_plot(
+            data,
+            now_override=now_override,
+        )
 
     def _refresh_target_color_map(self, palette: Optional[list[str]] = None):
         use_palette = palette if palette is not None else self._line_palette()
@@ -5841,130 +5581,27 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _open_add_observatory_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Add Observatory")
-        dlg.setObjectName("AddObservatoryDialog")
-        layout = QFormLayout(dlg)
-
-        name_edit = QLineEdit(dlg)
-        name_edit.setPlaceholderText("Name")
-        lookup_btn = QPushButton("Lookup", dlg)
-        lookup_btn.setToolTip("Find coordinates from place name")
-        _set_button_variant(lookup_btn, "secondary")
-        _set_button_icon_kind(lookup_btn, "lookup")
-        name_row = QWidget(dlg)
-        name_row_l = QHBoxLayout(name_row)
-        name_row_l.setContentsMargins(0, 0, 0, 0)
-        name_row_l.setSpacing(6)
-        name_row_l.addWidget(name_edit, 1)
-        name_row_l.addWidget(lookup_btn)
-        lat_edit = QLineEdit(dlg)
-        lat_edit.setPlaceholderText("Latitude")
-        lat_edit.setValidator(QDoubleValidator(-90.0, 90.0, 6, dlg))
-        lon_edit = QLineEdit(dlg)
-        lon_edit.setPlaceholderText("Longitude")
-        lon_edit.setValidator(QDoubleValidator(-180.0, 180.0, 6, dlg))
-        elev_edit = QLineEdit(dlg)
-        elev_edit.setPlaceholderText("Elevation (m)")
-        elev_edit.setValidator(QDoubleValidator(-1000.0, 20000.0, 2, dlg))
-        limiting_mag_spin = QDoubleSpinBox(dlg)
-        limiting_mag_spin.setRange(-5.0, 30.0)
-        limiting_mag_spin.setDecimals(1)
-        limiting_mag_spin.setSingleStep(0.1)
-        limiting_mag_spin.setValue(self._current_limiting_magnitude())
-        limiting_mag_spin.setToolTip("Telescope limiting magnitude used as red-warning threshold in suggested targets.")
-        custom_conditions_url_edit = QLineEdit(dlg)
-        custom_conditions_url_edit.setPlaceholderText("https://example.com/station.json")
-        lookup_info = QLabel("", dlg)
-        lookup_info.setWordWrap(True)
-        _set_label_tone(lookup_info, "info")
-
-        layout.addRow("Name:", name_row)
-        layout.addRow("Lat:", lat_edit)
-        layout.addRow("Lon:", lon_edit)
-        layout.addRow("Elev:", elev_edit)
-        layout.addRow("Lim. Mag:", limiting_mag_spin)
-        layout.addRow("Custom conditions URL:", custom_conditions_url_edit)
-        layout.addRow("", lookup_info)
-
-        def _lookup_coords():
-            query = name_edit.text().strip()
-            if not query:
-                QMessageBox.warning(dlg, "Missing Name", "Enter observatory name/place first.")
-                return
-            lookup_btn.setEnabled(False)
-            old_txt = lookup_btn.text()
-            lookup_btn.setText("...")
-            try:
-                lat, lon, elev, display = self._lookup_observatory_coordinates(query)
-            except Exception as exc:
-                QMessageBox.warning(dlg, "Lookup Failed", str(exc))
-                return
-            finally:
-                lookup_btn.setText(old_txt)
-                lookup_btn.setEnabled(True)
-
-            lat_edit.setText(f"{lat:.6f}")
-            lon_edit.setText(f"{lon:.6f}")
-            if elev is not None:
-                elev_edit.setText(f"{elev:.1f}")
-            elif not elev_edit.text().strip():
-                elev_edit.setText("0")
-            lookup_info.setText(display)
-
-        lookup_btn.clicked.connect(_lookup_coords)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        _style_dialog_button_box(buttons)
-        layout.addWidget(buttons)
-        _fit_dialog_to_screen(
-            dlg,
-            preferred_width=720,
-            preferred_height=520,
-            min_width=520,
-            min_height=420,
+        template_site = self.observatories.get(self.obs_combo.currentText())
+        dlg = AddObservatoryDialog(
+            existing_names=set(self.observatories.keys()),
+            template_site=template_site,
+            default_limiting_magnitude=self._current_limiting_magnitude(),
+            lookup_resolver=self._lookup_observatory_coordinates,
+            parent=self,
         )
-
-        while dlg.exec() == QDialog.Accepted:
-            name = name_edit.text().strip()
-            if not name:
-                QMessageBox.warning(self, "Invalid Observatory", "Name cannot be empty.")
-                continue
-            if name in self.observatories:
-                QMessageBox.warning(self, "Invalid Observatory", f"Observatory '{name}' already exists.")
-                continue
-            try:
-                template_site = self.observatories.get(self.obs_combo.currentText())
-                site = Site(
-                    name=name,
-                    latitude=float(lat_edit.text()),
-                    longitude=float(lon_edit.text()),
-                    elevation=float(elev_edit.text()),
-                    limiting_magnitude=float(limiting_mag_spin.value()),
-                    custom_conditions_url=custom_conditions_url_edit.text().strip(),
-                    telescope_diameter_mm=float(getattr(template_site, "telescope_diameter_mm", 0.0) or 0.0),
-                    focal_length_mm=float(getattr(template_site, "focal_length_mm", 0.0) or 0.0),
-                    pixel_size_um=float(getattr(template_site, "pixel_size_um", 0.0) or 0.0),
-                    detector_width_px=int(getattr(template_site, "detector_width_px", 0) or 0),
-                    detector_height_px=int(getattr(template_site, "detector_height_px", 0) or 0),
-                )
-            except Exception:
-                QMessageBox.warning(
-                    self,
-                    "Invalid Coordinates",
-                    "Please enter valid latitude, longitude, elevation and limiting magnitude.",
-                )
-                continue
-
-            self.observatories[name] = site
-            self._observatory_preset_keys[name] = "custom"
-            self._save_custom_observatories()
-            self._refresh_observatory_combo(selected_name=name)
-            self.settings.setValue("general/defaultSite", name)
-            self._on_obs_change(name)
+        if dlg.exec() != QDialog.Accepted:
             return
+        site = dlg.site()
+        if site is None:
+            return
+        name = site.name
+        self.observatories[name] = site
+        self._observatory_preset_keys[name] = "custom"
+        self._save_custom_observatories()
+        self._refresh_observatory_combo(selected_name=name)
+        self.settings.setValue("general/defaultSite", name)
+        self._on_obs_change(name)
+
     def __init__(self):
         super().__init__()
         self.setObjectName(self.__class__.__name__)
@@ -6005,6 +5642,7 @@ class MainWindow(QMainWindow):
         self._plan_autosave_timer.setSingleShot(True)
         self._plan_autosave_timer.timeout.connect(self._flush_plan_autosave)
         self._suspend_plan_autosave = False
+        self._plan_coordinator = PlanCoordinator(self)
         self._defer_startup_preview_updates = False
         self._startup_restore_pending = True
         self._obs_change_finalize_pending = False
@@ -8369,164 +8007,35 @@ class MainWindow(QMainWindow):
         self._apply_default_sort()
 
     def _plan_target_key(self, target: Target) -> str:
-        source_catalog = str(target.source_catalog or "").strip().lower()
-        source_object_id = str(target.source_object_id or "").strip().lower()
-        if source_catalog and source_object_id:
-            return f"{source_catalog}:{source_object_id}"
-        return _normalize_catalog_token(target.name) or f"{target.ra:.6f}:{target.dec:.6f}"
+        return self._plan_coordinator.plan_target_key(target)
 
     def _active_plan_storage_id(self) -> str:
-        return str(self._active_plan_id or self._workspace_plan_id or "")
+        return self._plan_coordinator.active_plan_storage_id()
 
     def _serialize_current_targets(self) -> list[dict[str, object]]:
-        return [target.model_dump(mode="json") for target in self.targets]
+        return self._plan_coordinator.serialize_current_targets()
 
     def _current_site_snapshot(self) -> dict[str, object]:
-        site = getattr(self.table_model, "site", None)
-        if isinstance(site, Site):
-            return site.model_dump(mode="json")
-        if hasattr(self, "obs_combo"):
-            name = self.obs_combo.currentText().strip()
-            obs = self.observatories.get(name) if hasattr(self, "observatories") else None
-            if isinstance(obs, Site):
-                return obs.model_dump(mode="json")
-            try:
-                fallback = Site(
-                    name=name or "Custom",
-                    latitude=self._read_site_float(self.lat_edit),
-                    longitude=self._read_site_float(self.lon_edit),
-                    elevation=self._read_site_float(self.elev_edit),
-                    limiting_magnitude=self._current_limiting_magnitude(),
-                )
-            except Exception:
-                return {}
-            return fallback.model_dump(mode="json")
-        return {}
+        return self._plan_coordinator.current_site_snapshot()
 
     def _current_plan_snapshot(self) -> dict[str, object]:
-        header = self.table_view.horizontalHeader() if hasattr(self, "table_view") else None
-        selected = self._selected_target_or_none()
-        default_sort_column = TargetTableModel.COL_SCORE
-        if header is not None:
-            default_sort_column = int(header.sortIndicatorSection())
-        return {
-            "date": self.date_edit.date().toString(Qt.ISODate) if hasattr(self, "date_edit") else "",
-            "site_name": self.obs_combo.currentText().strip() if hasattr(self, "obs_combo") else "",
-            "site_snapshot": self._current_site_snapshot(),
-            "limit_altitude": float(self.limit_spin.value()) if hasattr(self, "limit_spin") else 30.0,
-            "sun_alt_limit": float(self._sun_alt_limit()),
-            "min_moon_sep": float(self.min_moon_sep_spin.value()) if hasattr(self, "min_moon_sep_spin") else 0.0,
-            "min_score": float(self.min_score_spin.value()) if hasattr(self, "min_score_spin") else 0.0,
-            "hide_observed": bool(self.hide_observed_chk.isChecked()) if hasattr(self, "hide_observed_chk") else False,
-            "selected_target_name": str(selected.name if isinstance(selected, Target) else ""),
-            "view_preset": "observation" if self._table_matches_observation_preset() else "full",
-            "default_sort_column": int(default_sort_column),
-        }
+        return self._plan_coordinator.current_plan_snapshot()
 
     def _set_plan_context(self, *, plan_id: str, plan_kind: str, plan_name: str) -> None:
-        self._active_plan_id = str(plan_id or "")
-        self._active_plan_kind = str(plan_kind or "workspace")
-        self._active_plan_name = str(plan_name or "Workspace")
-        if self._active_plan_kind == "workspace":
-            self._workspace_plan_id = self._active_plan_id
-        self._load_ai_messages_for_active_plan()
+        self._plan_coordinator.set_plan_context(
+            plan_id=plan_id,
+            plan_kind=plan_kind,
+            plan_name=plan_name,
+        )
 
     def _serialize_ai_messages_for_storage(self) -> list[dict[str, object]]:
-        serialized: list[dict[str, object]] = []
-        for idx, message in enumerate(self._ai_messages):
-            payload: dict[str, object] = {
-                "kind": str(message.get("kind", "info") or "info"),
-                "text": str(message.get("text", "") or ""),
-                "created_at": float(message.get("created_at", datetime.now(timezone.utc).timestamp()) or datetime.now(timezone.utc).timestamp()),
-                "sort_order": idx,
-            }
-            action_targets = message.get("action_targets")
-            if isinstance(action_targets, list):
-                payload["action_targets"] = [
-                    target.model_dump(mode="json")
-                    for target in action_targets
-                    if isinstance(target, Target)
-                ]
-            requested_class = str(message.get("requested_class", "") or "").strip()
-            if requested_class:
-                payload["requested_class"] = requested_class
-            primary_target = message.get("primary_target")
-            if isinstance(primary_target, Target):
-                payload["primary_target"] = primary_target.model_dump(mode="json")
-            suggested_targets = message.get("suggested_targets")
-            if isinstance(suggested_targets, list):
-                payload["suggested_targets"] = [
-                    target.model_dump(mode="json")
-                    for target in suggested_targets
-                    if isinstance(target, Target)
-                ]
-            serialized.append(payload)
-        return serialized
+        return self._plan_coordinator.serialize_ai_messages_for_storage()
 
     def _deserialize_ai_messages_from_storage(self, rows: list[dict[str, object]]) -> list[dict[str, Any]]:
-        restored: list[dict[str, Any]] = []
-        for row in rows:
-            message: dict[str, Any] = {
-                "kind": str(row.get("kind", "info") or "info"),
-                "text": str(row.get("text", "") or ""),
-                "created_at": float(row.get("created_at", 0.0) or 0.0),
-            }
-            action_targets_payload = row.get("action_targets")
-            if isinstance(action_targets_payload, list):
-                action_targets: list[Target] = []
-                for target_payload in action_targets_payload:
-                    if not isinstance(target_payload, dict):
-                        continue
-                    try:
-                        action_targets.append(Target(**target_payload))
-                    except Exception:
-                        continue
-                if action_targets:
-                    message["action_targets"] = action_targets
-            requested_class = str(row.get("requested_class", "") or "").strip()
-            if requested_class:
-                message["requested_class"] = requested_class
-            primary_target_payload = row.get("primary_target")
-            if isinstance(primary_target_payload, dict):
-                try:
-                    message["primary_target"] = Target(**primary_target_payload)
-                except Exception:
-                    pass
-            suggested_targets_payload = row.get("suggested_targets")
-            if isinstance(suggested_targets_payload, list):
-                suggested_targets: list[Target] = []
-                for target_payload in suggested_targets_payload:
-                    if not isinstance(target_payload, dict):
-                        continue
-                    try:
-                        suggested_targets.append(Target(**target_payload))
-                    except Exception:
-                        continue
-                if suggested_targets:
-                    message["suggested_targets"] = suggested_targets
-            restored.append(message)
-        return restored
+        return self._plan_coordinator.deserialize_ai_messages_from_storage(rows)
 
     def _load_ai_messages_for_active_plan(self) -> None:
-        storage = getattr(self, "app_storage", None)
-        plan_id = self._active_plan_storage_id()
-        if storage is None or not plan_id:
-            self._ai_messages = []
-            self._ai_message_widget_refs = []
-            if hasattr(self, "ai_output_layout"):
-                self._render_ai_messages()
-            self._refresh_ai_panel_action_buttons()
-            return
-        try:
-            rows = storage.chat_history.list_messages(plan_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to load AI history for %s: %s", plan_id, exc)
-            rows = []
-        self._ai_messages = self._deserialize_ai_messages_from_storage(rows)
-        self._ai_message_widget_refs = []
-        if hasattr(self, "ai_output_layout"):
-            self._render_ai_messages()
-        self._refresh_ai_panel_action_buttons()
+        self._plan_coordinator.load_ai_messages_for_active_plan()
 
     def _preload_cached_runtime_state_on_startup(self) -> None:
         self._prefetch_bhtom_observatory_presets_on_startup()
@@ -8775,82 +8284,22 @@ class MainWindow(QMainWindow):
             self._startup_weather_worker = None
 
     def _persist_ai_messages_to_storage(self, *, allow_empty_clear: bool = False) -> None:
-        storage = getattr(self, "app_storage", None)
-        plan_id = self._active_plan_storage_id()
-        if storage is None or not plan_id:
-            return
-        try:
-            serialized = self._serialize_ai_messages_for_storage()
-            if serialized:
-                storage.chat_history.replace_messages(plan_id, serialized)
-            elif allow_empty_clear:
-                storage.chat_history.clear(plan_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to persist AI history for %s: %s", plan_id, exc)
+        self._plan_coordinator.persist_ai_messages_to_storage(allow_empty_clear=allow_empty_clear)
 
     def _persist_workspace_now(self) -> None:
-        storage = getattr(self, "app_storage", None)
-        if storage is None or self._suspend_plan_autosave:
-            return
-        try:
-            record = storage.plans.save_workspace(self._current_plan_snapshot(), self._serialize_current_targets())
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to persist workspace: %s", exc)
-            return
-        workspace_id = str(record.get("id", "") or "")
-        if workspace_id:
-            self._workspace_plan_id = workspace_id
-            if self._active_plan_kind == "workspace" or not self._active_plan_id:
-                self._active_plan_id = workspace_id
-                self._active_plan_kind = "workspace"
-                self._active_plan_name = str(record.get("name", "Workspace") or "Workspace")
+        self._plan_coordinator.persist_workspace_now()
 
     def _persist_active_plan_now(self) -> None:
-        if self._suspend_plan_autosave:
-            return
-        self._persist_workspace_now()
-        storage = getattr(self, "app_storage", None)
-        if storage is None or self._active_plan_kind != "saved" or not self._active_plan_id:
-            self._persist_ai_messages_to_storage()
-            return
-        try:
-            record = storage.plans.save_named(
-                self._active_plan_name,
-                self._current_plan_snapshot(),
-                self._serialize_current_targets(),
-                plan_id=self._active_plan_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to autosave active plan '%s': %s", self._active_plan_name, exc)
-        else:
-            self._active_plan_id = str(record.get("id", self._active_plan_id) or self._active_plan_id)
-            self._active_plan_name = str(record.get("name", self._active_plan_name) or self._active_plan_name)
-        self._persist_ai_messages_to_storage()
+        self._plan_coordinator.persist_active_plan_now()
 
     def _schedule_plan_autosave(self) -> None:
-        if self._suspend_plan_autosave or getattr(self, "app_storage", None) is None:
-            return
-        self._plan_autosave_timer.start(500)
+        self._plan_coordinator.schedule_plan_autosave()
 
     def _flush_plan_autosave(self) -> None:
-        self._persist_active_plan_now()
+        self._plan_coordinator.flush_plan_autosave()
 
     def _ensure_named_site_available(self, site_snapshot: dict[str, object], *, preferred_name: str) -> None:
-        if not site_snapshot:
-            return
-        site_name = str(preferred_name or site_snapshot.get("name") or "Custom").strip() or "Custom"
-        site_snapshot = dict(site_snapshot)
-        site_snapshot["name"] = site_name
-        try:
-            site = Site(**site_snapshot)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Skipping invalid stored site snapshot for '%s': %s", site_name, exc)
-            return
-        if site_name not in self.observatories:
-            self.observatories[site_name] = site
-            self._observatory_preset_keys[site_name] = "custom"
-            self._save_custom_observatories()
-            self._refresh_observatory_combo(selected_name=site_name)
+        self._plan_coordinator.ensure_named_site_available(site_snapshot, preferred_name=preferred_name)
 
     def _apply_plan_payload(
         self,
@@ -8863,88 +8312,15 @@ class MainWindow(QMainWindow):
         defer_visual_refresh: bool = False,
         apply_snapshot_date: bool = True,
     ) -> None:
-        loaded_targets: list[Target] = []
-        for payload in target_payloads:
-            try:
-                loaded_targets.append(Target(**payload))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Skipping invalid stored target payload: %s", exc)
-        site_snapshot = snapshot.get("site_snapshot")
-        site_name = str(snapshot.get("site_name", "") or "")
-        if isinstance(site_snapshot, dict):
-            self._ensure_named_site_available(site_snapshot, preferred_name=site_name)
-
-        selected_target_name = str(snapshot.get("selected_target_name", "") or "")
-        current_site_name = self.obs_combo.currentText().strip() if hasattr(self, "obs_combo") else ""
-        current_site = self.table_model.site if isinstance(getattr(self.table_model, "site", None), Site) else None
-        target_site = self.observatories.get(site_name) if site_name else None
-        self.obs_combo.blockSignals(True)
-        try:
-            if site_name and site_name in self.observatories:
-                self.obs_combo.setCurrentText(site_name)
-        finally:
-            self.obs_combo.blockSignals(False)
-        if _should_apply_observatory_change(current_site_name, current_site, site_name, target_site):
-            self._on_obs_change(site_name, defer_replot=defer_visual_refresh)
-        elif isinstance(site_snapshot, dict):
-            try:
-                restored_site = Site(**site_snapshot)
-            except Exception:
-                restored_site = None
-            if isinstance(restored_site, Site):
-                self.lat_edit.setText(f"{restored_site.latitude}")
-                self.lon_edit.setText(f"{restored_site.longitude}")
-                self.elev_edit.setText(f"{restored_site.elevation}")
-                self.table_model.site = restored_site
-
-        if apply_snapshot_date:
-            iso_date = str(snapshot.get("date", "") or "").strip()
-            if iso_date:
-                qdate = QDate.fromString(iso_date, Qt.ISODate)
-                if qdate.isValid():
-                    self.date_edit.setDate(qdate)
-        else:
-            self.date_edit.setDate(QDate.currentDate())
-        if "limit_altitude" in snapshot:
-            self.limit_spin.setValue(int(round(float(snapshot.get("limit_altitude", self.limit_spin.value()) or self.limit_spin.value()))))
-        if "sun_alt_limit" in snapshot:
-            self.sun_alt_limit_spin.setValue(int(round(float(snapshot.get("sun_alt_limit", self.sun_alt_limit_spin.value()) or self.sun_alt_limit_spin.value()))))
-        if "min_moon_sep" in snapshot:
-            self.min_moon_sep_spin.setValue(int(round(float(snapshot.get("min_moon_sep", self.min_moon_sep_spin.value()) or self.min_moon_sep_spin.value()))))
-        if "min_score" in snapshot:
-            self.min_score_spin.setValue(int(round(float(snapshot.get("min_score", self.min_score_spin.value()) or self.min_score_spin.value()))))
-        if "hide_observed" in snapshot:
-            self.hide_observed_chk.setChecked(bool(snapshot.get("hide_observed")))
-
-        self.target_metrics.clear()
-        self.target_windows.clear()
-        self.table_model.reset_targets(loaded_targets)
-        self._recompute_recommended_order_cache()
-        self._apply_table_settings()
-        default_preset = str(self.settings.value("table/viewPreset", "full", type=str) or "full")
-        preset = str(snapshot.get("view_preset", default_preset) or default_preset)
-        self._apply_column_preset(preset, save=False)
-        sort_col_raw = snapshot.get("default_sort_column", TargetTableModel.COL_SCORE)
-        try:
-            sort_col = int(sort_col_raw)
-        except Exception:
-            sort_col = TargetTableModel.COL_SCORE
-        if 0 <= sort_col < self.table_model.columnCount():
-            self.table_view.sortByColumn(sort_col, Qt.AscendingOrder)
-        else:
-            self._apply_default_sort()
-        self._fetch_missing_magnitudes_async()
-        self._set_plan_context(plan_id=plan_id, plan_kind=plan_kind, plan_name=plan_name)
-        if selected_target_name:
-            for row_idx, target in enumerate(self.targets):
-                if _normalize_catalog_token(target.name) == _normalize_catalog_token(selected_target_name):
-                    self.table_view.selectRow(row_idx)
-                    break
-        if not defer_visual_refresh:
-            self._update_selected_details()
-        self._refresh_target_color_map()
-        self._emit_table_data_changed()
-        self._run_plan()
+        self._plan_coordinator.apply_plan_payload(
+            snapshot,
+            target_payloads,
+            plan_id=plan_id,
+            plan_kind=plan_kind,
+            plan_name=plan_name,
+            defer_visual_refresh=defer_visual_refresh,
+            apply_snapshot_date=apply_snapshot_date,
+        )
 
     def _restore_plan_record(
         self,
@@ -8953,382 +8329,40 @@ class MainWindow(QMainWindow):
         defer_visual_refresh: bool = False,
         apply_snapshot_date: bool = False,
     ) -> None:
-        snapshot = dict(record.get("snapshot") or {})
-        target_payloads = [
-            dict(payload)
-            for payload in record.get("targets", [])
-            if isinstance(payload, dict)
-        ]
-        self._suspend_plan_autosave = True
-        try:
-            self._apply_plan_payload(
-                snapshot,
-                target_payloads,
-                plan_id=str(record.get("id", "") or ""),
-                plan_kind=str(record.get("plan_kind", "workspace") or "workspace"),
-                plan_name=str(record.get("name", "Workspace") or "Workspace"),
-                defer_visual_refresh=defer_visual_refresh,
-                apply_snapshot_date=apply_snapshot_date,
-            )
-        finally:
-            self._suspend_plan_autosave = False
-        self._persist_workspace_now()
+        self._plan_coordinator.restore_plan_record(
+            record,
+            defer_visual_refresh=defer_visual_refresh,
+            apply_snapshot_date=apply_snapshot_date,
+        )
 
     def _restore_workspace_on_startup(self, *, defer_visual_refresh: bool = False) -> bool:
-        storage = getattr(self, "app_storage", None)
-        if storage is None:
-            return False
-        try:
-            workspace = storage.plans.load_workspace()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to restore workspace from storage: %s", exc)
-            workspace = None
-        if workspace:
-            self._restore_plan_record(
-                workspace,
-                defer_visual_refresh=defer_visual_refresh,
-                apply_snapshot_date=False,
-            )
-            if str(workspace.get("id", "")).strip():
-                self._workspace_plan_id = str(workspace.get("id"))
-            return True
-        self._persist_workspace_now()
-        self._load_ai_messages_for_active_plan()
-        return False
+        return self._plan_coordinator.restore_workspace_on_startup(defer_visual_refresh=defer_visual_refresh)
 
     def _load_plan_from_json_path(self, file_path: str, *, persist_workspace: bool = True) -> None:
-        try:
-            with open(file_path, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
-            target_payloads = [dict(entry) for entry in data if isinstance(entry, dict)]
-        except Exception as e:
-            QMessageBox.critical(self, "Load plan error", str(e))
-            return
-        self._suspend_plan_autosave = True
-        try:
-            self._apply_plan_payload(
-                {},
-                target_payloads,
-                plan_id=str(self._workspace_plan_id or ""),
-                plan_kind="workspace",
-                plan_name="Workspace",
-            )
-        finally:
-            self._suspend_plan_autosave = False
-        if persist_workspace:
-            self._persist_workspace_now()
-            self._set_plan_context(
-                plan_id=str(self._workspace_plan_id or self._active_plan_id),
-                plan_kind="workspace",
-                plan_name="Workspace",
-            )
-            self._persist_ai_messages_to_storage()
+        self._plan_coordinator.load_plan_from_json_path(file_path, persist_workspace=persist_workspace)
 
     @Slot()
     def _import_plan_json(self):
-        fn, _ = QFileDialog.getOpenFileName(
-            self, "Import plan JSON", str(Path.cwd()), "JSON files (*.json)"
-        )
-        if not fn:
-            return
-        self._load_plan_from_json_path(fn, persist_workspace=True)
+        self._plan_coordinator.import_plan_json()
 
     @Slot()
     def _load_plan(self):
-        self._open_saved_plan()
+        self._plan_coordinator.load_plan()
 
     @Slot()
     def _save_plan_as(self) -> None:
-        storage = getattr(self, "app_storage", None)
-        if storage is None:
-            QMessageBox.information(self, "Save Plan", "SQLite storage is not available.")
-            return
-        default_name = self._active_plan_name if self._active_plan_kind == "saved" else ""
-        name, ok = QInputDialog.getText(self, "Save Plan As", "Plan name:", text=default_name)
-        if not ok:
-            return
-        normalized_name = str(name or "").strip()
-        if not normalized_name:
-            QMessageBox.information(self, "Save Plan", "Plan name cannot be empty.")
-            return
-        try:
-            record = storage.plans.save_named(
-                normalized_name,
-                self._current_plan_snapshot(),
-                self._serialize_current_targets(),
-            )
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Save Plan", f"Could not save the plan:\n{exc}")
-            return
-        self._persist_workspace_now()
-        self._set_plan_context(
-            plan_id=str(record.get("id", "") or ""),
-            plan_kind="saved",
-            plan_name=str(record.get("name", normalized_name) or normalized_name),
-        )
-        self._persist_ai_messages_to_storage()
-        self.statusBar().showMessage(f"Saved plan '{self._active_plan_name}'.", 4000)
+        self._plan_coordinator.save_plan_as()
 
     @Slot()
     def _open_saved_plan(self) -> None:
-        storage = getattr(self, "app_storage", None)
-        if storage is None:
-            QMessageBox.information(self, "Open Saved Plan", "SQLite storage is not available.")
-            return
-        try:
-            plans = storage.plans.list_saved()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Open Saved Plan", f"Could not read saved plans:\n{exc}")
-            return
-        if not plans:
-            QMessageBox.information(self, "Open Saved Plan", "No saved plans were found.")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Open Saved Plan")
-        dlg.resize(520, 420)
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-        search_edit = QLineEdit(dlg)
-        search_edit.setPlaceholderText("Filter saved plans...")
-        plan_list = QListWidget(dlg)
-        info_label = QLabel(dlg)
-        info_label.setObjectName("SectionHint")
-        delete_btn = QPushButton("Delete", dlg)
-        _set_button_variant(delete_btn, "neutral")
-        buttons = QDialogButtonBox(QDialogButtonBox.Open | QDialogButtonBox.Cancel, parent=dlg)
-        open_btn = buttons.button(QDialogButtonBox.Open)
-
-        current_plan_map: dict[str, dict[str, object]] = {}
-
-        def refresh_items() -> None:
-            current_plan_map.clear()
-            plan_list.clear()
-            query = str(search_edit.text() or "").strip().lower()
-            for item in plans:
-                plan_name = str(item.get("name", "") or "")
-                if query and query not in plan_name.lower():
-                    continue
-                label = f"{plan_name} ({int(item.get('target_count', 0) or 0)} targets)"
-                widget_item = QListWidgetItem(label, plan_list)
-                plan_id = str(item.get("id", "") or "")
-                widget_item.setData(Qt.UserRole, plan_id)
-                current_plan_map[plan_id] = item
-            has_selection = plan_list.count() > 0
-            if has_selection:
-                plan_list.setCurrentRow(0)
-            open_btn.setEnabled(has_selection)
-            delete_btn.setEnabled(has_selection)
-
-        def update_info() -> None:
-            current_item = plan_list.currentItem()
-            if current_item is None:
-                info_label.setText("No saved plan selected.")
-                return
-            plan_id = str(current_item.data(Qt.UserRole) or "")
-            plan = current_plan_map.get(plan_id, {})
-            updated_at = float(plan.get("updated_at", 0.0) or 0.0)
-            if updated_at > 0:
-                stamp = datetime.fromtimestamp(updated_at, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
-            else:
-                stamp = "unknown"
-            info_label.setText(
-                f"Targets: {int(plan.get('target_count', 0) or 0)} | Last update: {stamp}"
-            )
-
-        def delete_selected() -> None:
-            current_item = plan_list.currentItem()
-            if current_item is None:
-                return
-            plan_id = str(current_item.data(Qt.UserRole) or "")
-            plan = current_plan_map.get(plan_id, {})
-            plan_name = str(plan.get("name", "this plan") or "this plan")
-            answer = QMessageBox.question(
-                dlg,
-                "Delete Saved Plan",
-                f"Delete '{plan_name}' from SQLite storage?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
-            try:
-                deleted = storage.plans.delete_plan(plan_id)
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.warning(dlg, "Delete Saved Plan", f"Could not delete the plan:\n{exc}")
-                return
-            if not deleted:
-                QMessageBox.information(dlg, "Delete Saved Plan", "The selected plan no longer exists.")
-                return
-            nonlocal plans
-            plans = [item for item in plans if str(item.get("id", "")) != plan_id]
-            refresh_items()
-            update_info()
-
-        search_edit.textChanged.connect(lambda _text: (refresh_items(), update_info()))
-        plan_list.currentItemChanged.connect(lambda *_args: update_info())
-        plan_list.itemDoubleClicked.connect(lambda *_args: dlg.accept())
-        delete_btn.clicked.connect(delete_selected)
-
-        layout.addWidget(search_edit)
-        layout.addWidget(plan_list, 1)
-        layout.addWidget(info_label)
-        controls_row = QHBoxLayout()
-        controls_row.addWidget(delete_btn)
-        controls_row.addStretch(1)
-        layout.addLayout(controls_row)
-        layout.addWidget(buttons)
-
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        refresh_items()
-        update_info()
-        if dlg.exec() != QDialog.Accepted:
-            return
-        current_item = plan_list.currentItem()
-        if current_item is None:
-            return
-        plan_id = str(current_item.data(Qt.UserRole) or "")
-        try:
-            record = storage.plans.load_plan(plan_id)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Open Saved Plan", f"Could not load the plan:\n{exc}")
-            return
-        if not record:
-            QMessageBox.information(self, "Open Saved Plan", "The selected plan is no longer available.")
-            return
-        self._restore_plan_record(record)
-        self.statusBar().showMessage(f"Opened '{record.get('name', 'saved plan')}'.", 4000)
+        self._plan_coordinator.open_saved_plan()
 
     @Slot()
     def _show_observation_history(self) -> None:
-        storage = getattr(self, "app_storage", None)
-        if storage is None:
-            QMessageBox.information(self, "Observation History", "SQLite storage is not available.")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Observation History")
-        dlg.resize(880, 460)
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-        search_edit = QLineEdit(dlg)
-        search_edit.setPlaceholderText("Search by target or site...")
-        table = QTableWidget(dlg)
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["Observed At", "Target", "Site", "Source", "Notes"])
-        table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectRows)
-        table.setSelectionMode(QTableWidget.SingleSelection)
-        table.verticalHeader().setVisible(False)
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
-        export_btn = QPushButton("Export CSV", dlg)
-        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dlg)
-        current_rows: list[dict[str, object]] = []
-
-        def load_rows() -> list[dict[str, object]]:
-            try:
-                return storage.observation_log.list_entries(search=search_edit.text())
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.warning(dlg, "Observation History", f"Could not load history:\n{exc}")
-                return []
-
-        def refresh_table() -> None:
-            rows = load_rows()
-            current_rows[:] = rows
-            table.setRowCount(len(rows))
-            for row_idx, row in enumerate(rows):
-                observed_at = float(row.get("observed_at", 0.0) or 0.0)
-                if observed_at > 0:
-                    stamp = datetime.fromtimestamp(observed_at, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
-                else:
-                    stamp = "-"
-                values = [
-                    stamp,
-                    str(row.get("target_name", "") or ""),
-                    str(row.get("site_name", "") or ""),
-                    str(row.get("source", "") or ""),
-                    str(row.get("notes", "") or ""),
-                ]
-                for col_idx, value in enumerate(values):
-                    table.setItem(row_idx, col_idx, QTableWidgetItem(value))
-            table.resizeRowsToContents()
-
-        def export_csv() -> None:
-            if not current_rows:
-                QMessageBox.information(dlg, "Observation History", "No observation entries to export.")
-                return
-            default_name = f"astroplanner-observation-history-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
-            file_path, _ = QFileDialog.getSaveFileName(
-                dlg,
-                "Export Observation History",
-                str(Path.home() / default_name),
-                "CSV files (*.csv)",
-            )
-            if not file_path:
-                return
-            try:
-                with open(file_path, "w", encoding="utf-8", newline="") as fh:
-                    writer = csv.writer(fh)
-                    writer.writerow(["observed_at", "target_name", "target_key", "site_name", "source", "notes"])
-                    for row in current_rows:
-                        writer.writerow(
-                            [
-                                float(row.get("observed_at", 0.0) or 0.0),
-                                str(row.get("target_name", "") or ""),
-                                str(row.get("target_key", "") or ""),
-                                str(row.get("site_name", "") or ""),
-                                str(row.get("source", "") or ""),
-                                str(row.get("notes", "") or ""),
-                            ]
-                        )
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.warning(dlg, "Observation History", f"Could not export CSV:\n{exc}")
-                return
-            self.statusBar().showMessage(f"Exported observation history to {Path(file_path).name}.", 4000)
-
-        search_edit.textChanged.connect(lambda _text: refresh_table())
-        export_btn.clicked.connect(export_csv)
-        buttons.rejected.connect(dlg.reject)
-
-        layout.addWidget(search_edit)
-        layout.addWidget(table, 1)
-        controls = QHBoxLayout()
-        controls.addWidget(export_btn)
-        controls.addStretch(1)
-        layout.addLayout(controls)
-        layout.addWidget(buttons)
-        refresh_table()
-        dlg.exec()
+        self._plan_coordinator.show_observation_history()
 
     def _record_observation_if_needed(self, target: Target, *, was_observed: bool, source: str) -> None:
-        if was_observed or not target.observed:
-            return
-        storage = getattr(self, "app_storage", None)
-        if storage is None:
-            return
-        site_payload = self._current_site_snapshot()
-        site_name = str(site_payload.get("name", self.obs_combo.currentText() if hasattr(self, "obs_combo") else "") or "")
-        try:
-            storage.observation_log.append(
-                target_name=target.name,
-                target_key=self._plan_target_key(target),
-                target_payload=target.model_dump(mode="json"),
-                site_name=site_name,
-                site_payload=site_payload,
-                notes=str(target.notes or ""),
-                source=source,
-                plan_id=self._active_plan_storage_id() or None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to persist observation log entry for %s: %s", target.name, exc)
+        self._plan_coordinator.record_observation_if_needed(target, was_observed=was_observed, source=source)
 
     # .....................................................
     # file / target helpers

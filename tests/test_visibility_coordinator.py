@@ -49,6 +49,23 @@ def test_visibility_coordinator_selection_and_cutout_smoke() -> None:
     assert planner._cutout_updates == [planner.targets[1]]
 
 
+def test_visibility_coordinator_caps_web_html_cache() -> None:
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    planner = _DummyVisibilityPlanner()
+    coordinator = VisibilityCoordinator(planner)
+    coordinator.bind()
+
+    for idx in range(10):
+        coordinator.store_visibility_web_html_cache(f"key-{idx}", f"html-{idx}")
+
+    assert len(planner._visibility_web_html_cache) == 8
+    assert "key-0" not in planner._visibility_web_html_cache
+    assert "key-1" not in planner._visibility_web_html_cache
+    assert planner._visibility_web_html_cache["key-9"] == "html-9"
+
+
 def test_build_polar_visible_path_splits_horizon_and_wraps() -> None:
     theta, radius = VisibilityCoordinator.build_polar_visible_path(
         alt_series=[-1.0, 20.0, 25.0, -2.0, 30.0, 35.0],

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import astro_planner
+from astroplanner.plan_coordinator import PlanCoordinator
 from astroplanner.storage import AppStorage, SettingsAdapter
 
 
@@ -46,8 +47,7 @@ def test_workspace_site_snapshot_does_not_override_existing_observatory() -> Non
         _refresh_observatory_combo=lambda *args, **kwargs: refresh_calls.append((args, kwargs)),
     )
 
-    astro_planner.MainWindow._ensure_named_site_available(
-        dummy,
+    PlanCoordinator(dummy).ensure_named_site_available(
         {
             "name": "WRO",
             "latitude": 10.0,
@@ -118,16 +118,17 @@ def test_persist_ai_messages_keeps_existing_history_until_explicit_clear(tmp_pat
 
     dummy = SimpleNamespace(
         app_storage=storage,
-        _serialize_ai_messages_for_storage=lambda: [],
-        _active_plan_storage_id=lambda: workspace["id"],
+        _active_plan_id=workspace["id"],
+        _workspace_plan_id="",
+        _ai_messages=[],
     )
 
-    astro_planner.MainWindow._persist_ai_messages_to_storage(dummy)
+    PlanCoordinator(dummy).persist_ai_messages_to_storage()
     kept = storage.chat_history.list_messages(workspace["id"])
     assert len(kept) == 1
     assert kept[0]["text"] == "Keep this chat"
 
-    astro_planner.MainWindow._persist_ai_messages_to_storage(dummy, allow_empty_clear=True)
+    PlanCoordinator(dummy).persist_ai_messages_to_storage(allow_empty_clear=True)
     assert storage.chat_history.list_messages(workspace["id"]) == []
 
 

@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
 import ephem
 import numpy as np
-from PySide6.QtCore import QItemSelectionModel, QObject, QTimer
+from PySide6.QtCore import QItemSelectionModel, QObject, QTimer, QUrl
+from PySide6.QtGui import QColor
+
+from astroplanner.theme import DEFAULT_UI_THEME
+from astroplanner.visibility_plotly import PLOTLY_JS_BASE_DIR
 
 if TYPE_CHECKING:
     from astro_planner import MainWindow
     from astroplanner.models import Target
+
+
+def _normalized_css_color(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    color = QColor(text)
+    if not color.isValid():
+        return ""
+    return color.name().lower()
 
 
 class VisibilityCoordinator(QObject):
@@ -77,7 +93,83 @@ class VisibilityCoordinator(QObject):
     def flush_visibility_plot_refresh(self) -> None:
         planner = self._planner
         if isinstance(getattr(planner, "last_payload", None), dict):
-            planner._render_visibility_web_plot(planner.last_payload)
+            self.render_visibility_web_plot(planner.last_payload)
+
+    def visibility_web_render_signature(
+        self,
+        data: dict,
+        *,
+        now_override: Optional[datetime] = None,
+    ) -> str:
+        planner = self._planner
+        current_now = now_override if isinstance(now_override, datetime) else data.get("now_local")
+        now_key = (
+            current_now.strftime("%Y-%m-%d %H:%M")
+            if isinstance(current_now, datetime)
+            else ""
+        )
+        target_signature = [
+            (
+                str(tgt.name),
+                _normalized_css_color(getattr(tgt, "plot_color", "")),
+                bool(planner.table_model.row_enabled[idx]) if idx < len(planner.table_model.row_enabled) else True,
+            )
+            for idx, tgt in enumerate(planner.targets)
+        ]
+        signature_payload = {
+            "context": str(data.get("site_key", "") or planner._current_visibility_context_key()),
+            "mode": "airmass" if planner._plot_airmass else "altitude",
+            "theme": str(getattr(planner, "_theme_name", DEFAULT_UI_THEME)),
+            "dark": bool(getattr(planner, "_dark_enabled", False)),
+            "date": planner.date_edit.date().toString("yyyy-MM-dd") if hasattr(planner, "date_edit") else "",
+            "sun": bool(planner.sun_check.isChecked()) if hasattr(planner, "sun_check") else True,
+            "moon": bool(planner.moon_check.isChecked()) if hasattr(planner, "moon_check") else True,
+            "targets": target_signature,
+            "now": now_key,
+        }
+        serialized = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
+    def store_visibility_web_html_cache(self, cache_key: str, html: str) -> None:
+        planner = self._planner
+        cache = getattr(planner, "_visibility_web_html_cache", {})
+        cache[str(cache_key)] = str(html)
+        while len(cache) > 8:
+            cache.pop(next(iter(cache)))
+        planner._visibility_web_html_cache = cache
+
+    def render_visibility_web_plot(
+        self,
+        data: Optional[dict] = None,
+        *,
+        now_override: Optional[datetime] = None,
+    ) -> None:
+        planner = self._planner
+        payload = data if isinstance(data, dict) else getattr(planner, "last_payload", None)
+        if not isinstance(payload, dict):
+            return
+        if getattr(planner, "_use_visibility_web", False):
+            planner._ensure_visibility_plot_widgets()
+        web_view = getattr(planner, "visibility_web", None)
+        if web_view is None:
+            return
+        cache = getattr(planner, "_visibility_web_html_cache", {})
+        cache_key = self.visibility_web_render_signature(payload, now_override=now_override)
+        html = cache.get(cache_key)
+        if not html:
+            html = planner._build_visibility_plotly_html(payload, now_override=now_override)
+            if html:
+                self.store_visibility_web_html_cache(cache_key, html)
+        if not html:
+            planner._visibility_web_has_content = False
+            planner._set_visibility_loading_state("Unable to render interactive chart.", visible=True)
+            return
+        if not planner._visibility_web_has_content:
+            planner._set_visibility_loading_state("Rendering interactive chart…", visible=True)
+        if PLOTLY_JS_BASE_DIR:
+            web_view.setHtml(html, QUrl.fromLocalFile(str(PLOTLY_JS_BASE_DIR) + "/"))
+            return
+        web_view.setHtml(html)
 
     def apply_visibility_web_selection_style(self, selected_names: Optional[set[str]] = None) -> None:
         planner = self._planner
@@ -130,7 +222,7 @@ class VisibilityCoordinator(QObject):
         if plot_canvas is not None:
             plot_canvas.draw_idle()
         if isinstance(getattr(planner, "last_payload", None), dict):
-            planner._render_visibility_web_plot(planner.last_payload)
+            self.render_visibility_web_plot(planner.last_payload)
 
     def on_plot_mode_switch_changed(self, checked: bool) -> None:
         planner = self._planner
