@@ -37,6 +37,9 @@ and coordinator modules. The dependency direction is intentionally one-way:
 - `astroplanner/bhtom.py`
   BHTOM API fetch/parse helpers, candidate deduplication, local suggestion ranking,
   and BHTOM worker threads.
+- `astroplanner/resolvers.py`
+  Target name/coordinate resolvers, SIMBAD/TNS/Gaia/NED/LSST helpers, SIMBAD
+  metadata enrichment, and resolver worker glue.
 - `astroplanner/seestar.py`
   Seestar domain logic, queue generation, ALP schedule payloads, handoff rendering,
   ALP clients, and device adapters.

@@ -3,16 +3,13 @@ from __future__ import annotations
 import io
 import logging
 import threading
-import warnings
 from typing import Callable, Optional
 
 import matplotlib.pyplot as plt
-import numpy as np
 from astropy import units as u
 from astropy.coordinates import Angle, SkyCoord
 from astroplan import FixedTarget
 from astroplan.plots import plot_finder_image
-from astroquery.simbad import Simbad
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import QThread, Signal, Slot
@@ -34,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from astroplanner.i18n import current_language, localize_widget_tree
 from astroplanner.models import Target
+from astroplanner.resolvers import MetadataLookupWorker, TARGET_SEARCH_SOURCES, _normalize_catalog_token
 from astroplanner.ui.common import _fit_dialog_to_screen
 from astroplanner.ui.theme_utils import (
     _set_button_icon_kind,
@@ -41,117 +39,10 @@ from astroplanner.ui.theme_utils import (
     _style_dialog_button_box,
 )
 
-try:
-    from astroquery.exceptions import NoResultsWarning
-except Exception:  # pragma: no cover - fallback only for older astroquery variants
-    class NoResultsWarning(Warning):
-        pass
-
-
 logger = logging.getLogger(__name__)
-
-TARGET_SEARCH_SOURCES: list[tuple[str, str]] = [
-    ("simbad", "SIMBAD"),
-    ("gaia_dr3", "Gaia DR3"),
-    ("gaia_alerts", "Gaia Alerts"),
-    ("tns", "TNS"),
-    ("ned", "NED"),
-    ("lsst", "LSST"),
-]
 
 FINDER_HTTP_TIMEOUT_S = 5.0
 _FINDER_PATCH_LOCK = threading.Lock()
-
-
-def _normalize_catalog_token(value: object) -> str:
-    if value is None:
-        return ""
-    return str(value).strip().lower()
-
-
-def _decode_simbad_value(value: object) -> str:
-    if isinstance(value, (bytes, bytearray)):
-        return value.decode("utf-8", errors="ignore").strip()
-    return str(value).strip()
-
-
-def _simbad_column(result, *candidates: str) -> Optional[str]:
-    if not hasattr(result, "colnames"):
-        return None
-    lookup = {name.lower(): name for name in result.colnames}
-    for candidate in candidates:
-        hit = lookup.get(candidate.lower())
-        if hit:
-            return hit
-    return None
-
-
-def _simbad_has_row(result, row_idx: int = 0) -> bool:
-    if result is None:
-        return False
-    try:
-        return len(result) > row_idx
-    except Exception:
-        return False
-
-
-def _simbad_cell(result, column_name: str, row_idx: int = 0) -> Optional[object]:
-    if not _simbad_has_row(result, row_idx):
-        return None
-    try:
-        column = result[column_name]
-    except Exception:
-        return None
-    try:
-        if len(column) <= row_idx:
-            return None
-    except Exception:
-        pass
-    try:
-        return column[row_idx]
-    except Exception:
-        return None
-
-
-def _extract_simbad_metadata(result, row_idx: int = 0) -> tuple[Optional[float], str]:
-    magnitude: Optional[float] = None
-    object_type = ""
-    if not _simbad_has_row(result, row_idx):
-        return magnitude, object_type
-
-    for candidates in (("V", "FLUX_V"), ("R", "FLUX_R"), ("B", "FLUX_B")):
-        col = _simbad_column(result, *candidates)
-        if col is None:
-            continue
-        raw = _simbad_cell(result, col, row_idx)
-        if raw is None or np.ma.is_masked(raw):
-            continue
-        try:
-            magnitude = float(raw)
-            break
-        except (TypeError, ValueError):
-            continue
-
-    col = _simbad_column(result, "OTYPE")
-    if col is not None:
-        raw = _simbad_cell(result, col, row_idx)
-        if raw is not None and not np.ma.is_masked(raw):
-            object_type = _decode_simbad_value(raw)
-
-    return magnitude, object_type
-
-
-def _extract_simbad_name(result, fallback: str, row_idx: int = 0) -> str:
-    if not _simbad_has_row(result, row_idx):
-        return fallback
-    col = _simbad_column(result, "MAIN_ID", "main_id", "ID", "matched_id")
-    if col is None:
-        return fallback
-    raw = _simbad_cell(result, col, row_idx)
-    if raw is None or np.ma.is_masked(raw):
-        return fallback
-    value = _decode_simbad_value(raw)
-    return value or fallback
 
 
 def _finder_survey_candidates(key: object) -> list[str]:
@@ -460,59 +351,6 @@ class AddTargetDialog(QDialog):
 
     def selected_source(self) -> str:
         return self._current_source()
-
-
-class MetadataLookupWorker(QThread):
-    """Background metadata fetch for SIMBAD magnitudes/types with cancellation."""
-
-    completed = Signal(int, list)
-
-    def __init__(self, request_id: int, names: list[str], parent=None):
-        super().__init__(parent)
-        self.setObjectName(self.__class__.__name__)
-        self.request_id = request_id
-        self.names = names
-        self._cancelled = False
-
-    def cancel(self):
-        self._cancelled = True
-
-    def run(self):
-        results: list[tuple[str, str, Optional[float], str]] = []
-        if not self.names:
-            self.completed.emit(self.request_id, results)
-            return
-        try:
-            custom = Simbad()
-            custom.add_votable_fields("V", "R", "B", "otype")
-        except Exception:
-            custom = None
-
-        for name in self.names:
-            if self._cancelled:
-                break
-            key = name.strip().lower()
-            if not key:
-                continue
-            magnitude: Optional[float] = None
-            object_type = ""
-            main_id = key
-            try:
-                if custom is not None:
-                    try:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", category=NoResultsWarning)
-                            result = custom.query_object(name)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Metadata worker query failed for '%s': %s", name, exc)
-                        result = None
-                    if _simbad_has_row(result):
-                        magnitude, object_type = _extract_simbad_metadata(result)
-                        main_id = _extract_simbad_name(result, name).strip().lower() or key
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Metadata worker processing failed for '%s': %s", name, exc)
-            results.append((key, main_id, magnitude, object_type))
-        self.completed.emit(self.request_id, results)
 
 
 class FinderChartWorker(QThread):
