@@ -44,7 +44,6 @@ from __future__ import annotations
 
 # Standard library imports
 import argparse
-import base64
 import copy
 import csv
 import hashlib
@@ -83,7 +82,6 @@ except Exception:  # pragma: no cover - fallback only for older astroquery varia
 from pydantic import ValidationError
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-from matplotlib import font_manager as mpl_font_manager
 from matplotlib import patheffects as mpl_patheffects
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
@@ -121,6 +119,19 @@ from astroplanner.ai import (
     _type_matches_requested_class,
 )
 from astroplanner.ai_panel_coordinator import AIPanelCoordinator
+from astroplanner.app_config import (
+    APP_SETTINGS_APP,
+    APP_SETTINGS_ENV_KEY,
+    APP_SETTINGS_ORG,
+    OBSOLETE_APP_SETTINGS_KEYS,
+    OBSOLETE_APP_STATE_KEYS,
+    _cleanup_obsolete_settings,
+    _config_root_dir,
+    _create_app_settings,
+    _resolve_settings_dir,
+    _settings_dir_env_override,
+    _settings_dir_for_org,
+)
 from astroplanner.exporters import export_metrics_csv, export_observation_ics
 from astroplanner.bhtom import (
     BHTOM_API_BASE_URL,
@@ -228,8 +239,8 @@ from astroplanner.i18n import (
     set_translated_tooltip,
     translate_text,
 )
+from astroplanner.observatory_coordinator import ObservatoryCoordinator
 from astroplanner.plan_coordinator import PlanCoordinator
-from astroplanner.storage import AppStorage, SettingsAdapter
 from astroplanner.targets_coordinator import TargetTableCoordinator
 from astroplanner.visibility_coordinator import VisibilityCoordinator
 from astroplanner.ui.common import (
@@ -244,6 +255,20 @@ from astroplanner.ui.settings import GeneralSettingsDialog, TableSettingsDialog
 from astroplanner.ui.seestar import SeestarSessionPlanDialog
 from astroplanner.ui.suggestions import SuggestedTargetsDialog
 from astroplanner.ui.targets import TargetTableModel
+from astroplanner.ui.theme_utils import (
+    UI_FONT_SIZE_MAX,
+    UI_FONT_SIZE_MIN,
+    _embedded_display_font_css,
+    _ensure_display_font_loaded,
+    _normalized_css_color,
+    _pick_font_family,
+    _pick_matplotlib_font_family,
+    _plot_font_css_stack,
+    _preferred_display_font_family,
+    _sanitize_ui_font_size,
+    _swatch_text_color,
+)
+from astroplanner.ui.widgets import CoverImageLabel, NeonToggleSwitch, NoSelectBackgroundDelegate
 from astroplanner.weather import WeatherLiveWorker
 from astroplanner.ui.weather import WeatherDialog
 from astroplanner.visibility_plotly import (
@@ -686,7 +711,6 @@ def _sanitize_cutout_size_px(value: object) -> int:
 
 # GUI imports (PySide6)
 from PySide6.QtCore import (
-    Property,
     QBuffer,
     QByteArray,
     QDate,
@@ -695,9 +719,7 @@ from PySide6.QtCore import (
     QEvent,
     QModelIndex,
     QObject,
-    QPoint,
     QPropertyAnimation,
-    QRectF,
     QSignalBlocker,
     Qt,
     QThread,
@@ -705,9 +727,7 @@ from PySide6.QtCore import (
     Slot,
     QSize,
     QTimer,
-    QCoreApplication,
     QItemSelectionModel,
-    QStandardPaths,
     QUrl,
     QUrlQuery,
     QIODevice,
@@ -720,7 +740,6 @@ from PySide6.QtGui import (
     QColor,
     QDoubleValidator,
     QFont,
-    QFontDatabase,
     QFontMetrics,
     QDesktopServices,
     QIcon,
@@ -743,7 +762,6 @@ except Exception:  # pragma: no cover - optional runtime dependency
     QWebEngineView = None  # type: ignore[assignment]
     _HAS_QTWEBENGINE = False
 from PySide6.QtWidgets import (
-    QAbstractButton,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -770,7 +788,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSlider,
     QStyle,
-    QStyledItemDelegate,
     QSizePolicy,
     QTableView,
     QTabWidget,
@@ -786,90 +803,6 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 _HAS_MPL_CANVAS = True
-
-APP_SETTINGS_ORG = "krzkot"
-APP_SETTINGS_APP = "AstroPlanner"
-APP_SETTINGS_ENV_KEY = "ASTROPLANNER_CONFIG_DIR"
-OBSOLETE_APP_SETTINGS_KEYS = (
-    "general/customObservatories",
-    "general/seestarSessionUserTemplates",
-    "general/seestarCampaignUserPresets",
-    "general/accentSecondaryColor",
-    "__meta/customObservatoriesMigrated",
-    "__meta/seestarSessionTemplatesMigrated",
-    "__meta/legacyMigrated",
-    "__meta/legacyMigratedFromOrg",
-    "__meta/legacyIniMigrated",
-    "__meta/legacyIniMigratedCount",
-    "__meta/legacyIniMigratedFrom",
-    "__meta/storageDirMigrated",
-    "__meta/storageDirMigratedFrom",
-)
-OBSOLETE_APP_STATE_KEYS = ("legacy/settings/imported",)
-
-
-def _config_root_dir() -> Path:
-    """Return a stable config root independent from current executable name."""
-    generic_cfg = str(QStandardPaths.writableLocation(QStandardPaths.GenericConfigLocation) or "").strip()
-    if generic_cfg:
-        return Path(generic_cfg).expanduser()
-    xdg_cfg = str(os.getenv("XDG_CONFIG_HOME", "") or "").strip()
-    if xdg_cfg:
-        return Path(xdg_cfg).expanduser()
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Preferences"
-    return Path.home() / ".config"
-
-
-def _settings_dir_env_override() -> Optional[Path]:
-    env_override = str(os.getenv(APP_SETTINGS_ENV_KEY, "") or "").strip()
-    if not env_override:
-        return None
-    return Path(env_override).expanduser()
-
-
-def _settings_dir_for_org(org_name: str, *, root_dir: Optional[Path] = None) -> Path:
-    root = root_dir if root_dir is not None else _config_root_dir()
-    return Path(root).expanduser() / str(org_name).strip() / APP_SETTINGS_APP
-
-
-def _resolve_settings_dir() -> Path:
-    """Return a stable writable directory for app settings."""
-    try:
-        QCoreApplication.setOrganizationName(APP_SETTINGS_ORG)
-        QCoreApplication.setApplicationName(APP_SETTINGS_APP)
-    except Exception:
-        pass
-
-    env_override = _settings_dir_env_override()
-    if env_override is not None:
-        return env_override
-    return _settings_dir_for_org(APP_SETTINGS_ORG)
-
-def _cleanup_obsolete_settings(storage: AppStorage, settings: SettingsAdapter) -> None:
-    for key in OBSOLETE_APP_SETTINGS_KEYS:
-        if settings.contains(key):
-            settings.remove(key)
-    for key in OBSOLETE_APP_STATE_KEYS:
-        storage.state.remove(key)
-
-
-def _create_app_settings() -> SettingsAdapter:
-    """Create SQLite-backed settings storage."""
-    settings_dir = _resolve_settings_dir()
-    try:
-        settings_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    storage = AppStorage(settings_dir)
-    settings = SettingsAdapter(storage)
-    _cleanup_obsolete_settings(storage, settings)
-    try:
-        settings.setValue("__meta/storageBackend", "sqlite")
-    except Exception:
-        pass
-    return settings
-
 
 def _configure_tab_widget(tab_widget: QTabWidget, *, document_mode: bool = True) -> QTabWidget:
     """Normalize tab widgets so native tab-bar chrome doesn't leak through custom themes."""
@@ -894,62 +827,6 @@ def _configure_tab_widget(tab_widget: QTabWidget, *, document_mode: bool = True)
     return tab_widget
 
 
-_DISPLAY_FONT_PATH = Path(__file__).resolve().parent / "assets" / "fonts" / "Rajdhani-SemiBold.ttf"
-_DISPLAY_FONT_LOADED = False
-_DISPLAY_FONT_CSS_CACHE: Optional[str] = None
-_DISPLAY_WEB_FONT_FAMILY = "Rajdhani Web"
-_DISPLAY_FONT_QT_FAMILY: Optional[str] = None
-_QT_FALLBACK_FONT_FAMILY: Optional[str] = None
-_MPL_AVAILABLE_FONT_NAMES: Optional[set[str]] = None
-
-
-def _preferred_display_font_family() -> str:
-    """Return enforced display font family used across the app and plots."""
-    return str(_DISPLAY_FONT_QT_FAMILY or "Rajdhani").strip() or "Rajdhani"
-
-
-def _split_font_families(value: object) -> list[str]:
-    text = str(value or "").strip()
-    if not text:
-        return []
-    families: list[str] = []
-    for chunk in text.split(","):
-        name = str(chunk or "").strip().strip('"').strip("'").strip()
-        if name:
-            families.append(name)
-    return families
-
-
-def _platform_ui_font_candidates() -> list[str]:
-    if sys.platform == "darwin":
-        return [".AppleSystemUIFont", "SF Pro Text", "Avenir Next", "Helvetica Neue", "Arial"]
-    if sys.platform.startswith("win"):
-        return ["Segoe UI", "Arial"]
-    return ["Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial"]
-
-
-def _resolved_platform_ui_font_family() -> str:
-    global _QT_FALLBACK_FONT_FAMILY
-    if _QT_FALLBACK_FONT_FAMILY:
-        return _QT_FALLBACK_FONT_FAMILY
-    for family in _platform_ui_font_candidates():
-        if family:
-            _QT_FALLBACK_FONT_FAMILY = family
-            return family
-    if _DISPLAY_FONT_QT_FAMILY:
-        _QT_FALLBACK_FONT_FAMILY = _DISPLAY_FONT_QT_FAMILY
-        return _QT_FALLBACK_FONT_FAMILY
-    _QT_FALLBACK_FONT_FAMILY = "Arial"
-    return _QT_FALLBACK_FONT_FAMILY
-
-
-def _available_mpl_font_names() -> set[str]:
-    global _MPL_AVAILABLE_FONT_NAMES
-    if _MPL_AVAILABLE_FONT_NAMES is None:
-        _MPL_AVAILABLE_FONT_NAMES = {str(font.name) for font in mpl_font_manager.fontManager.ttflist}
-    return _MPL_AVAILABLE_FONT_NAMES
-
-
 def _repolish_widget(widget: Optional[QWidget]) -> None:
     if widget is None:
         return
@@ -966,50 +843,6 @@ def _set_dynamic_property(widget: Optional[QWidget], name: str, value: object) -
     if widget is None:
         return
     widget.setProperty(name, value)
-
-
-def _embedded_display_font_css() -> str:
-    global _DISPLAY_FONT_CSS_CACHE
-    if _DISPLAY_FONT_CSS_CACHE is not None:
-        return _DISPLAY_FONT_CSS_CACHE
-    if not _DISPLAY_FONT_PATH.exists():
-        _DISPLAY_FONT_CSS_CACHE = ""
-        return _DISPLAY_FONT_CSS_CACHE
-    try:
-        encoded = base64.b64encode(_DISPLAY_FONT_PATH.read_bytes()).decode("ascii")
-    except Exception:
-        _DISPLAY_FONT_CSS_CACHE = ""
-        return _DISPLAY_FONT_CSS_CACHE
-    _DISPLAY_FONT_CSS_CACHE = (
-        "@font-face{"
-        f"font-family:'{_DISPLAY_WEB_FONT_FAMILY}';"
-        f"src:url(data:font/ttf;base64,{encoded}) format('truetype');"
-        "font-style:normal;"
-        "font-weight:600;"
-        "font-display:swap;"
-        "}"
-    )
-    return _DISPLAY_FONT_CSS_CACHE
-
-
-def _plot_font_css_stack(theme_tokens: Optional[dict[str, str]] = None) -> str:
-    # Enforce Rajdhani-first stack for all web/Plotly charts.
-    fallback_families: list[str] = [_preferred_display_font_family(), "Rajdhani"]
-    if theme_tokens:
-        for body_font in _split_font_families(theme_tokens.get("font_family", "")):
-            if body_font and body_font not in fallback_families:
-                fallback_families.append(body_font)
-    fallback_families.extend(_platform_ui_font_candidates())
-    fallback_families.extend(["Arial", "Helvetica"])
-    deduped: list[str] = []
-    for family in fallback_families:
-        normalized = str(family or "").strip()
-        if normalized and normalized not in deduped and normalized != "Sans Serif":
-            deduped.append(normalized)
-    fallback = ", ".join(f'"{family}"' for family in deduped) or '"Arial"'
-    if _DISPLAY_FONT_PATH.exists():
-        return f'"{_DISPLAY_WEB_FONT_FAMILY}", {fallback}'
-    return fallback
 
 
 def _set_button_variant(button: Optional[QWidget], variant: str) -> None:
@@ -1674,349 +1507,7 @@ def _style_dialog_button_box(
             _set_button_icon_kind(btn, icon_mapping.get(role, "spark"), 14)
 
 
-class NeonToggleSwitch(QAbstractButton):
-    """Compact animated neon switch used for the Altitude/Airmass toggle."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("NeonToggleSwitch")
-        self.setCheckable(True)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._offset = 0.0
-        self._switch_anim = QPropertyAnimation(self, b"offset", self)
-        self._switch_anim.setDuration(170)
-        self._switch_anim.setEasingCurve(QEasingCurve.OutCubic)
-        self.toggled.connect(self._animate_to_checked_state)
-        self.setFixedSize(70, 34)
-
-    def sizeHint(self) -> QSize:  # noqa: D401
-        return QSize(70, 34)
-
-    def minimumSizeHint(self) -> QSize:  # noqa: D401
-        return self.sizeHint()
-
-    def _get_offset(self) -> float:
-        return float(self._offset)
-
-    def _set_offset(self, value: float) -> None:
-        self._offset = max(0.0, min(1.0, float(value)))
-        self.update()
-
-    offset = Property(float, _get_offset, _set_offset)
-
-    def _animate_to_checked_state(self, checked: bool) -> None:
-        try:
-            self._switch_anim.stop()
-        except Exception:
-            pass
-        self._switch_anim.setStartValue(self._offset)
-        self._switch_anim.setEndValue(1.0 if checked else 0.0)
-        self._switch_anim.start()
-
-    def setChecked(self, checked: bool) -> None:  # type: ignore[override]
-        changed = bool(checked) != self.isChecked()
-        super().setChecked(bool(checked))
-        if not changed:
-            self._set_offset(1.0 if self.isChecked() else 0.0)
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: D401
-        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.toggle()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def keyPressEvent(self, event) -> None:  # noqa: D401
-        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
-            self.toggle()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-    def paintEvent(self, event) -> None:  # noqa: D401
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-
-        track_rect = QRectF(1.0, 3.0, float(self.width() - 2), float(self.height() - 6))
-        radius = track_rect.height() / 2.0
-        panel_color = _theme_qcolor_from_widget(self, "plot_panel_bg", "#162334")
-        primary_color = _theme_qcolor_from_widget(self, "accent_primary", "#18d8f2")
-        secondary_color = _theme_qcolor_from_widget(self, "accent_secondary", "#ff4fd8")
-        state_color = QColor(secondary_color if self.isChecked() else primary_color)
-        border_color = _theme_qcolor_from_widget(self, "panel_border", "#20506a")
-        knob_color = _theme_qcolor_from_widget(self, "btn_text", "#f6fbff")
-        if self.isChecked():
-            off_color = QColor(panel_color)
-            mix_ratio = 0.26 + max(0.0, min(1.0, self._offset * 0.72))
-        else:
-            off_color = QColor(panel_color)
-            mix_ratio = 0.74
-        groove_mix = QColor(
-            round(off_color.red() + (state_color.red() - off_color.red()) * mix_ratio),
-            round(off_color.green() + (state_color.green() - off_color.green()) * mix_ratio),
-            round(off_color.blue() + (state_color.blue() - off_color.blue()) * mix_ratio),
-            round(off_color.alpha() + (state_color.alpha() - off_color.alpha()) * mix_ratio),
-        )
-
-        if self.isEnabled():
-            glow_color = QColor(state_color)
-            glow_color.setAlpha(int(76 + (72 * self._offset if self.isChecked() else 28)))
-            painter.setPen(QPen(glow_color, 3.0))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(track_rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
-
-        painter.setPen(QPen(border_color, 1.2))
-        painter.setBrush(groove_mix)
-        painter.drawRoundedRect(track_rect, radius, radius)
-
-        highlight_rect = QRectF(track_rect.left() + 2.0, track_rect.top() + 2.0, track_rect.width() * 0.42, max(2.0, track_rect.height() * 0.28))
-        highlight = QColor(state_color)
-        highlight.setAlpha(46 if self.isEnabled() else 18)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(highlight)
-        painter.drawRoundedRect(highlight_rect, highlight_rect.height() / 2.0, highlight_rect.height() / 2.0)
-
-        scan_color = QColor(knob_color)
-        scan_color.setAlpha(18 if self.isEnabled() else 8)
-        painter.setPen(QPen(scan_color, 1.0))
-        for idx in range(3):
-            y = track_rect.top() + 5.0 + idx * 5.0
-            painter.drawLine(track_rect.left() + 8.0, y, track_rect.right() - 8.0, y)
-
-        handle_d = track_rect.height() - 4.0
-        min_x = track_rect.left() + 2.0
-        max_x = track_rect.right() - handle_d - 2.0
-        handle_x = min_x + (max_x - min_x) * self._offset
-        handle_rect = QRectF(handle_x, track_rect.top() + 2.0, handle_d, handle_d)
-
-        handle_glow = QColor(state_color if self.isEnabled() else border_color)
-        handle_glow.setAlpha(96 if self.isEnabled() else 28)
-        painter.setPen(QPen(handle_glow, 2.0))
-        painter.setBrush(knob_color)
-        painter.drawEllipse(handle_rect)
-
-        inner_dot = QColor(state_color if self.isChecked() else border_color)
-        inner_dot.setAlpha(200 if self.isEnabled() else 90)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(inner_dot)
-        painter.drawEllipse(handle_rect.center(), 2.1, 2.1)
-
-
-class CoverImageLabel(QLabel):
-    """Render pixmap preserving aspect ratio, centered in available space."""
-
-    resized = Signal(int, int)
-    zoomOutLimitReached = Signal()
-
-    def __init__(self, text: str = "", parent=None):
-        super().__init__(text, parent)
-        self._source_pixmap = QPixmap()
-        self._overlay_painter: Optional[Callable[..., None]] = None
-        self._zoom_enabled = False
-        self._zoom_factor = 1.0
-        self._zoom_min = 1.0
-        self._zoom_max = 18.0
-        self._pan_offset = QPoint(0, 0)
-        self._drag_active = False
-        self._drag_start = QPoint(0, 0)
-        self._drag_origin = QPoint(0, 0)
-
-    def setPixmap(self, pixmap):  # type: ignore[override]
-        if pixmap is None or pixmap.isNull():
-            self._source_pixmap = QPixmap()
-            self._drag_active = False
-            super().setPixmap(QPixmap())
-            self.reset_zoom()
-            return
-        self._source_pixmap = pixmap.copy()
-        self._apply_cover_pixmap()
-
-    def setText(self, text: str):  # type: ignore[override]
-        self._source_pixmap = QPixmap()
-        self._drag_active = False
-        super().setText(text)
-        self.reset_zoom()
-
-    def resizeEvent(self, event):  # noqa: D401
-        super().resizeEvent(event)
-        if not self._source_pixmap.isNull():
-            self._apply_cover_pixmap()
-        self.resized.emit(self.width(), self.height())
-
-    def wheelEvent(self, event):  # noqa: D401
-        if not self._zoom_enabled or self._source_pixmap.isNull():
-            super().wheelEvent(event)
-            return
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-        if delta < 0 and self._zoom_factor <= (self._zoom_min + 1e-3):
-            self.zoomOutLimitReached.emit()
-            event.accept()
-            return
-        step = float(delta) / 120.0
-        factor = 1.17 ** step
-        self.set_zoom(self._zoom_factor * factor)
-        event.accept()
-
-    def mousePressEvent(self, event):  # noqa: D401
-        if (
-            self._zoom_enabled
-            and not self._source_pixmap.isNull()
-            and event.button() == Qt.MouseButton.LeftButton
-            and self._can_pan_current_view()
-        ):
-            self._drag_active = True
-            self._drag_start = event.position().toPoint()
-            self._drag_origin = QPoint(self._pan_offset)
-            self._update_cursor()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):  # noqa: D401
-        if self._drag_active and self._zoom_enabled:
-            delta = event.position().toPoint() - self._drag_start
-            self._pan_offset = self._drag_origin + delta
-            self._apply_cover_pixmap()
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):  # noqa: D401
-        if self._drag_active and event.button() == Qt.MouseButton.LeftButton:
-            self._drag_active = False
-            self._update_cursor()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def mouseDoubleClickEvent(self, event):  # noqa: D401
-        if self._zoom_enabled and event.button() == Qt.MouseButton.LeftButton:
-            self.reset_zoom()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-    def set_zoom_enabled(self, enabled: bool) -> None:
-        self._zoom_enabled = bool(enabled)
-        self._update_cursor()
-
-    def set_overlay_painter(self, callback: Optional[Callable[..., None]]) -> None:
-        self._overlay_painter = callback
-        if not self._source_pixmap.isNull():
-            self._apply_cover_pixmap()
-
-    def set_zoom(self, factor: float) -> None:
-        try:
-            value = float(factor)
-        except (TypeError, ValueError):
-            value = 1.0
-        value = max(self._zoom_min, min(self._zoom_max, value))
-        if abs(value - self._zoom_factor) < 1e-4:
-            return
-        self._zoom_factor = value
-        if abs(self._zoom_factor - 1.0) <= 1e-3:
-            self._pan_offset = QPoint(0, 0)
-        self._apply_cover_pixmap()
-        self._update_cursor()
-
-    def zoom_factor(self) -> float:
-        return float(self._zoom_factor)
-
-    def reset_zoom(self) -> None:
-        self._zoom_factor = 1.0
-        self._pan_offset = QPoint(0, 0)
-        if not self._source_pixmap.isNull():
-            self._apply_cover_pixmap()
-        self._update_cursor()
-
-    def _update_cursor(self) -> None:
-        if not self._zoom_enabled or self._source_pixmap.isNull() or not self._can_pan_current_view():
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            return
-        self.setCursor(Qt.CursorShape.ClosedHandCursor if self._drag_active else Qt.CursorShape.OpenHandCursor)
-
-    def _can_pan_current_view(self) -> bool:
-        if not self._zoom_enabled or self._source_pixmap.isNull():
-            return False
-        w = max(1, self.width())
-        h = max(1, self.height())
-        scale_target_w = max(1, int(round(w * self._zoom_factor)))
-        scale_target_h = max(1, int(round(h * self._zoom_factor)))
-        scaled = self._source_pixmap.scaled(
-            scale_target_w,
-            scale_target_h,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        return abs(int(scaled.width()) - int(w)) > 1 or abs(int(scaled.height()) - int(h)) > 1
-
-    def _apply_cover_pixmap(self):
-        if self._source_pixmap.isNull():
-            super().setPixmap(QPixmap())
-            self._update_cursor()
-            return
-        w = max(1, self.width())
-        h = max(1, self.height())
-        scale_target_w = max(1, int(round(w * self._zoom_factor)))
-        scale_target_h = max(1, int(round(h * self._zoom_factor)))
-        scaled = self._source_pixmap.scaled(
-            scale_target_w,
-            scale_target_h,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        max_dx = max(0, abs(scaled.width() - w) // 2)
-        max_dy = max(0, abs(scaled.height() - h) // 2)
-        self._pan_offset.setX(max(-max_dx, min(max_dx, self._pan_offset.x())))
-        self._pan_offset.setY(max(-max_dy, min(max_dy, self._pan_offset.y())))
-        canvas = QPixmap(w, h)
-        canvas.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(canvas)
-        x = ((w - scaled.width()) // 2) + self._pan_offset.x()
-        y = ((h - scaled.height()) // 2) + self._pan_offset.y()
-        painter.drawPixmap(x, y, scaled)
-        if self._overlay_painter is not None:
-            try:
-                # Preferred signature:
-                # overlay(painter, widget_w, widget_h, image_x, image_y, image_w, image_h)
-                self._overlay_painter(painter, w, h, x, y, scaled.width(), scaled.height())
-            except TypeError:
-                try:
-                    self._overlay_painter(painter, w, h)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        painter.end()
-        super().setPixmap(canvas)
-        self._update_cursor()
-
-
-def _normalized_css_color(value: object) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    color = QColor(text)
-    if not color.isValid():
-        return ""
-    return color.name().lower()
-
-
-def _swatch_text_color(value: object, *, dark: str = "#f6fbff", light: str = "#101720") -> str:
-    color = _qcolor_from_token(value)
-    if not color.isValid():
-        return dark
-    return dark if color.lightnessF() < 0.60 else light
-
-
 _VALID_TABLE_COLOR_MODES = {"background", "text_glow"}
-UI_FONT_SIZE_MIN = 9
-UI_FONT_SIZE_MAX = 24
 
 
 def _normalize_table_color_mode(value: object, *, default: str = "background") -> str:
@@ -2024,23 +1515,6 @@ def _normalize_table_color_mode(value: object, *, default: str = "background") -
     if mode in _VALID_TABLE_COLOR_MODES:
         return mode
     return default
-
-
-def _sanitize_ui_font_size(value: object, *, default: int = 11) -> int:
-    try:
-        size = int(value)
-    except (TypeError, ValueError):
-        size = int(default)
-    return max(UI_FONT_SIZE_MIN, min(UI_FONT_SIZE_MAX, size))
-
-
-class NoSelectBackgroundDelegate(QStyledItemDelegate):
-    """Delegate that preserves model background for the target-name column when selected."""
-    def paint(self, painter, option, index):
-        # Disable the selected state to preserve background
-        if option.state & QStyle.State_Selected:
-            option.state &= ~QStyle.State_Selected
-        super().paint(painter, option, index)
 
 
 # --- Table Settings Dialog ---
@@ -2090,49 +1564,13 @@ class MainWindow(QMainWindow):
             self.right_dashboard.setMinimumWidth(max(dashboard_base_min, card_min_w + 22))
 
     def _ensure_display_font_loaded(self) -> None:
-        global _DISPLAY_FONT_LOADED, _DISPLAY_FONT_QT_FAMILY
-        if _DISPLAY_FONT_LOADED:
-            return
-        if not _DISPLAY_FONT_PATH.exists():
-            return
-        try:
-            mpl_font_manager.fontManager.addfont(str(_DISPLAY_FONT_PATH))
-        except Exception:
-            pass
-        try:
-            font_id = QFontDatabase.addApplicationFont(str(_DISPLAY_FONT_PATH))
-        except Exception:
-            font_id = -1
-        if font_id >= 0:
-            try:
-                families = QFontDatabase.applicationFontFamilies(font_id)
-            except Exception:
-                families = []
-            if families:
-                _DISPLAY_FONT_QT_FAMILY = str(families[0] or "").strip() or None
-                if _DISPLAY_FONT_QT_FAMILY:
-                    if _MPL_AVAILABLE_FONT_NAMES is not None:
-                        _MPL_AVAILABLE_FONT_NAMES.add(_DISPLAY_FONT_QT_FAMILY)
-            _DISPLAY_FONT_LOADED = True
+        _ensure_display_font_loaded()
 
     def _pick_font_family(self, candidates: list[str]) -> str:
-        self._ensure_display_font_loaded()
-        if _DISPLAY_FONT_QT_FAMILY and _DISPLAY_FONT_QT_FAMILY in candidates:
-            return _DISPLAY_FONT_QT_FAMILY
-        for family in _platform_ui_font_candidates():
-            if family in candidates:
-                return family
-        for family in candidates:
-            if family and family != "Sans Serif":
-                return family
-        return _resolved_platform_ui_font_family()
+        return _pick_font_family(candidates)
 
     def _pick_matplotlib_font_family(self, candidates: list[str]) -> str:
-        available = _available_mpl_font_names()
-        for family in candidates:
-            if family in available:
-                return family
-        return "DejaVu Sans"
+        return _pick_matplotlib_font_family(candidates)
 
     def _set_dark_mode_enabled(self, enabled: bool, persist: bool = True):
         enabled = bool(enabled)
@@ -5333,100 +4771,16 @@ class MainWindow(QMainWindow):
         adapter.open_handoff_dialog(bundle, parent=self)
 
     def _observatories_config_path(self) -> Path:
-        return Path(__file__).resolve().parent / "config" / "default_observatories.json"
+        return self._observatory_coordinator.observatories_config_path()
 
     def _update_obs_combo_widths(self):
-        if not hasattr(self, "obs_combo"):
-            return
-        names = list(self.observatories.keys()) if hasattr(self, "observatories") else []
-        fm = self.obs_combo.fontMetrics()
-        longest_px = max((fm.horizontalAdvance(name) for name in names), default=220)
-        combo_w = int(min(max(250, longest_px + 52), 460))
-        popup_w = int(min(max(340, longest_px + 88), 700))
-        self.obs_combo.setMinimumWidth(combo_w)
-        self.obs_combo.setMaximumWidth(460)
-        view = self.obs_combo.view()
-        if view is not None:
-            view.setMinimumWidth(popup_w)
-            view.setTextElideMode(Qt.ElideNone)
+        self._observatory_coordinator.update_obs_combo_widths()
 
     def _parse_custom_observatories_payload(self, payload: object) -> tuple[dict[str, Site], dict[str, str]]:
-        items: list[dict[str, object]] = []
-        if isinstance(payload, dict) and isinstance(payload.get("observatories"), list):
-            payload = payload["observatories"]
-        if isinstance(payload, list):
-            items = [item for item in payload if isinstance(item, dict)]
-        elif isinstance(payload, dict):
-            for key, value in payload.items():
-                if isinstance(value, dict):
-                    entry = dict(value)
-                    entry.setdefault("name", key)
-                    items.append(entry)
-
-        loaded: dict[str, Site] = {}
-        preset_keys: dict[str, str] = {}
-        for item in items:
-            name = str(item.get("name", "")).strip()
-            if not name:
-                continue
-            try:
-                lim_mag = _safe_float(item.get("limiting_magnitude", item.get("limitingMagnitude", DEFAULT_LIMITING_MAGNITUDE)))
-                diameter_mm = _safe_float(
-                    item.get("telescope_diameter_mm", item.get("telescopeDiameterMm", item.get("diameter_mm", 0.0)))
-                )
-                if diameter_mm is None:
-                    diameter_m = _safe_float(item.get("telescope_diameter_m", item.get("telescopeDiameterM", 0.0)))
-                    if diameter_m is not None:
-                        diameter_mm = float(diameter_m) * 1000.0
-                focal_mm = _safe_float(item.get("focal_length_mm", item.get("focalLengthMm", 0.0)))
-                pixel_um = _safe_float(item.get("pixel_size_um", item.get("pixelSizeUm", item.get("pixel_um", 0.0))))
-                detector_w = _safe_int(
-                    item.get("detector_width_px", item.get("detectorWidthPx", item.get("detector_width", 0)))
-                )
-                detector_h = _safe_int(
-                    item.get("detector_height_px", item.get("detectorHeightPx", item.get("detector_height", 0)))
-                )
-                loaded[name] = Site(
-                    name=name,
-                    latitude=float(item.get("latitude", 0.0)),
-                    longitude=float(item.get("longitude", 0.0)),
-                    elevation=float(item.get("elevation", 0.0)),
-                    limiting_magnitude=float(lim_mag if lim_mag is not None else DEFAULT_LIMITING_MAGNITUDE),
-                    telescope_diameter_mm=float(diameter_mm if diameter_mm is not None else 0.0),
-                    focal_length_mm=float(focal_mm if focal_mm is not None else 0.0),
-                    pixel_size_um=float(pixel_um if pixel_um is not None else 0.0),
-                    detector_width_px=int(detector_w if detector_w is not None else 0),
-                    detector_height_px=int(detector_h if detector_h is not None else 0),
-                    custom_conditions_url=str(
-                        item.get("custom_conditions_url", item.get("customConditionsUrl", item.get("weather_custom_conditions_url", "")))
-                        or ""
-                    ).strip(),
-                )
-                preset_key_raw = item.get("preset_key", item.get("presetKey", item.get("bhtom_preset_key", "custom")))
-                preset_key = str(preset_key_raw or "custom").strip() or "custom"
-                preset_keys[name] = preset_key
-            except Exception as exc:
-                logger.warning("Skipping invalid saved observatory %r: %s", name, exc)
-        return loaded, preset_keys
+        return self._observatory_coordinator.parse_custom_observatories_payload(payload)
 
     def _load_custom_observatories(self) -> tuple[dict[str, Site], dict[str, str]]:
-        storage = getattr(self, "app_storage", None)
-        if storage is not None:
-            try:
-                stored_items = storage.observatories.list_all()
-                if stored_items:
-                    return self._parse_custom_observatories_payload({"observatories": stored_items})
-            except Exception as exc:
-                logger.warning("Failed to load observatories from storage: %s", exc)
-
-        cfg_path = self._observatories_config_path()
-        if cfg_path.exists():
-            try:
-                payload = json.loads(cfg_path.read_text(encoding="utf-8"))
-                return self._parse_custom_observatories_payload(payload)
-            except Exception as exc:
-                logger.warning("Failed to parse %s: %s", cfg_path, exc)
-        return {}, {}
+        return self._observatory_coordinator.load_custom_observatories()
 
     def _save_custom_observatories(
         self,
@@ -5434,43 +4788,10 @@ class MainWindow(QMainWindow):
         *,
         preset_keys: Optional[dict[str, str]] = None,
     ):
-        if custom_sites is None:
-            source_sites = self.observatories if hasattr(self, "observatories") else {}
-        else:
-            source_sites = custom_sites
-        if preset_keys is None:
-            source_preset_keys = getattr(self, "_observatory_preset_keys", {})
-        else:
-            source_preset_keys = preset_keys
-        observatory_items: list[dict[str, object]] = []
-        for name in sorted(source_sites.keys(), key=str.lower):
-            site = source_sites[name]
-            preset_key = str(source_preset_keys.get(name, "custom") or "custom")
-            observatory_items.append(
-                {
-                    "name": name,
-                    "latitude": float(site.latitude),
-                    "longitude": float(site.longitude),
-                    "elevation": float(site.elevation),
-                    "limiting_magnitude": float(site.limiting_magnitude),
-                    "telescope_diameter_mm": float(site.telescope_diameter_mm),
-                    "telescope_diameter_m": float(site.telescope_diameter_mm) / 1000.0,
-                    "focal_length_mm": float(site.focal_length_mm),
-                    "pixel_size_um": float(site.pixel_size_um),
-                    "detector_width_px": int(site.detector_width_px),
-                    "detector_height_px": int(site.detector_height_px),
-                    "custom_conditions_url": str(site.custom_conditions_url or "").strip(),
-                    "preset_key": preset_key,
-                }
-            )
-        storage = getattr(self, "app_storage", None)
-        if storage is not None:
-            try:
-                storage.observatories.replace_all(observatory_items)
-                return
-            except Exception as exc:
-                logger.warning("Failed to save observatories to storage: %s", exc)
-                return
+        self._observatory_coordinator.save_custom_observatories(
+            custom_sites,
+            preset_keys=preset_keys,
+        )
 
     def _refresh_observatory_combo(
         self,
@@ -5478,77 +4799,13 @@ class MainWindow(QMainWindow):
         *,
         emit_selection_change: bool = False,
     ):
-        current = selected_name or self.obs_combo.currentText()
-        self.obs_combo.blockSignals(True)
-        self.obs_combo.clear()
-        self.obs_combo.addItems(self.observatories.keys())
-        if current in self.observatories:
-            self.obs_combo.setCurrentText(current)
-        elif self.obs_combo.count() > 0:
-            self.obs_combo.setCurrentIndex(0)
-        self.obs_combo.blockSignals(False)
-        self._update_obs_combo_widths()
-        if emit_selection_change:
-            selected = self.obs_combo.currentText().strip()
-            if selected:
-                self._on_obs_change(selected)
+        self._observatory_coordinator.refresh_observatory_combo(
+            selected_name=selected_name,
+            emit_selection_change=emit_selection_change,
+        )
 
     def _lookup_observatory_coordinates(self, query: str) -> tuple[float, float, Optional[float], str]:
-        q = query.strip()
-        if not q:
-            raise ValueError("Name cannot be empty.")
-
-        # 1) Geocode place name to lat/lon (OpenStreetMap Nominatim)
-        params = urlencode({"format": "jsonv2", "limit": 1, "q": q})
-        url = f"https://nominatim.openstreetmap.org/search?{params}"
-        req = Request(
-            url,
-            headers={
-                "User-Agent": "AstroPlanner/1.0 (desktop app)",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urlopen(req, timeout=10) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
-            raise RuntimeError(f"Location lookup failed: {exc}") from exc
-
-        if not isinstance(payload, list) or not payload:
-            raise ValueError("No location found for this name.")
-
-        hit = payload[0]
-        try:
-            lat = float(hit.get("lat"))
-            lon = float(hit.get("lon"))
-        except Exception as exc:
-            raise ValueError("Location found, but coordinates are invalid.") from exc
-        display_name = str(hit.get("display_name", q))
-
-        # 2) Optional elevation fetch (Open-Meteo)
-        elevation: Optional[float] = None
-        elev_params = urlencode({"latitude": f"{lat:.6f}", "longitude": f"{lon:.6f}"})
-        elev_url = f"https://api.open-meteo.com/v1/elevation?{elev_params}"
-        elev_req = Request(
-            elev_url,
-            headers={
-                "User-Agent": "AstroPlanner/1.0 (desktop app)",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urlopen(elev_req, timeout=10) as resp:
-                elev_payload = json.loads(resp.read().decode("utf-8"))
-            elev_value = elev_payload.get("elevation")
-            if isinstance(elev_value, list) and elev_value:
-                elevation = float(elev_value[0])
-            elif elev_value is not None:
-                elevation = float(elev_value)
-        except Exception:
-            # Elevation is optional for this feature.
-            elevation = None
-
-        return lat, lon, elevation, display_name
+        return self._observatory_coordinator.lookup_observatory_coordinates(query)
 
     @Slot()
     def _open_observatory_manager(self):
@@ -5628,6 +4885,7 @@ class MainWindow(QMainWindow):
         # Persistent user settings
         self.settings = _create_app_settings()
         self.app_storage = getattr(self.settings, "storage", None)
+        self._observatory_coordinator = ObservatoryCoordinator(self)
         try:
             self._system_locale_name = str(QLocale.system().name() or "")
         except Exception:

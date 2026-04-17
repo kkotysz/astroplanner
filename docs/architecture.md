@@ -27,6 +27,9 @@ and coordinator modules. The dependency direction is intentionally one-way:
 - `astroplanner/models.py`
   Stable domain models: `Target`, `Site`, `SessionSettings`, `CalcRunStats`, and
   `targets_match`.
+- `astroplanner/app_config.py`
+  App settings directory resolution, SQLite settings factory, and obsolete-key
+  cleanup.
 - `astroplanner/scoring.py`
   Deterministic per-target night scoring and `TargetNightMetrics`.
 - `astroplanner/astronomy.py`
@@ -61,6 +64,9 @@ and coordinator modules. The dependency direction is intentionally one-way:
   sizing, and loading skeleton widgets.
 - `astroplanner/ui/theme_utils.py`
   Narrow theme-aware helpers used by extracted UI modules.
+- `astroplanner/ui/widgets.py`
+  Shared custom widgets used by the shell, including the neon toggle and zoomable
+  cover image label.
 - `astroplanner/ui/targets.py`
   Main target table model and delegate: `TargetTableModel` and
   `TargetTableGlowDelegate`.
@@ -91,6 +97,9 @@ The current coordinator layer extracts orchestration that is tightly coupled to
   Visibility plot refresh scheduling, selected-target/cutout synchronization,
   Plotly web rendering/cache, Plotly selection styling, polar selection, and
   show/hide orchestration.
+- `astroplanner/observatory_coordinator.py`
+  Observatory persistence, default config loading, coordinate lookup, and combo
+  refresh glue.
 - `astroplanner/ai_panel_coordinator.py`
   AI Assistant window composition, chat transcript rendering, warm-up lifecycle,
   LLM dispatch, streaming updates, and AI status handling.

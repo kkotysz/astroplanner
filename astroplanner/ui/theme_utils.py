@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 import re
+import sys
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QSize, Qt
@@ -20,6 +23,160 @@ def _set_button_variant(button: Optional[QWidget], variant: str) -> None:
 
 def _set_label_tone(label: Optional[QWidget], tone: str) -> None:
     _set_dynamic_property(label, "tone", str(tone))
+
+
+_DISPLAY_FONT_PATH = Path(__file__).resolve().parents[2] / "assets" / "fonts" / "Rajdhani-SemiBold.ttf"
+_DISPLAY_FONT_LOADED = False
+_DISPLAY_FONT_CSS_CACHE: Optional[str] = None
+_DISPLAY_WEB_FONT_FAMILY = "Rajdhani Web"
+_DISPLAY_FONT_QT_FAMILY: Optional[str] = None
+_QT_FALLBACK_FONT_FAMILY: Optional[str] = None
+_MPL_AVAILABLE_FONT_NAMES: Optional[set[str]] = None
+
+
+def _preferred_display_font_family() -> str:
+    """Return enforced display font family used across the app and plots."""
+    return str(_DISPLAY_FONT_QT_FAMILY or "Rajdhani").strip() or "Rajdhani"
+
+
+def _split_font_families(value: object) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    families: list[str] = []
+    for chunk in text.split(","):
+        name = str(chunk or "").strip().strip('"').strip("'").strip()
+        if name:
+            families.append(name)
+    return families
+
+
+def _platform_ui_font_candidates() -> list[str]:
+    if sys.platform == "darwin":
+        return [".AppleSystemUIFont", "SF Pro Text", "Avenir Next", "Helvetica Neue", "Arial"]
+    if sys.platform.startswith("win"):
+        return ["Segoe UI", "Arial"]
+    return ["Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial"]
+
+
+def _resolved_platform_ui_font_family() -> str:
+    global _QT_FALLBACK_FONT_FAMILY
+    if _QT_FALLBACK_FONT_FAMILY:
+        return _QT_FALLBACK_FONT_FAMILY
+    for family in _platform_ui_font_candidates():
+        if family:
+            _QT_FALLBACK_FONT_FAMILY = family
+            return family
+    if _DISPLAY_FONT_QT_FAMILY:
+        _QT_FALLBACK_FONT_FAMILY = _DISPLAY_FONT_QT_FAMILY
+        return _QT_FALLBACK_FONT_FAMILY
+    _QT_FALLBACK_FONT_FAMILY = "Arial"
+    return _QT_FALLBACK_FONT_FAMILY
+
+
+def _available_mpl_font_names() -> set[str]:
+    global _MPL_AVAILABLE_FONT_NAMES
+    if _MPL_AVAILABLE_FONT_NAMES is None:
+        from matplotlib import font_manager as mpl_font_manager
+
+        _MPL_AVAILABLE_FONT_NAMES = {str(font.name) for font in mpl_font_manager.fontManager.ttflist}
+    return _MPL_AVAILABLE_FONT_NAMES
+
+
+def _ensure_display_font_loaded() -> None:
+    global _DISPLAY_FONT_LOADED, _DISPLAY_FONT_QT_FAMILY
+    if _DISPLAY_FONT_LOADED:
+        return
+    if not _DISPLAY_FONT_PATH.exists():
+        return
+    try:
+        from matplotlib import font_manager as mpl_font_manager
+
+        mpl_font_manager.fontManager.addfont(str(_DISPLAY_FONT_PATH))
+    except Exception:
+        pass
+    try:
+        from PySide6.QtGui import QFontDatabase
+
+        font_id = QFontDatabase.addApplicationFont(str(_DISPLAY_FONT_PATH))
+    except Exception:
+        font_id = -1
+    if font_id >= 0:
+        try:
+            from PySide6.QtGui import QFontDatabase
+
+            families = QFontDatabase.applicationFontFamilies(font_id)
+        except Exception:
+            families = []
+        if families:
+            _DISPLAY_FONT_QT_FAMILY = str(families[0] or "").strip() or None
+            if _DISPLAY_FONT_QT_FAMILY and _MPL_AVAILABLE_FONT_NAMES is not None:
+                _MPL_AVAILABLE_FONT_NAMES.add(_DISPLAY_FONT_QT_FAMILY)
+        _DISPLAY_FONT_LOADED = True
+
+
+def _pick_font_family(candidates: list[str]) -> str:
+    _ensure_display_font_loaded()
+    if _DISPLAY_FONT_QT_FAMILY and _DISPLAY_FONT_QT_FAMILY in candidates:
+        return _DISPLAY_FONT_QT_FAMILY
+    for family in _platform_ui_font_candidates():
+        if family in candidates:
+            return family
+    for family in candidates:
+        if family and family != "Sans Serif":
+            return family
+    return _resolved_platform_ui_font_family()
+
+
+def _pick_matplotlib_font_family(candidates: list[str]) -> str:
+    available = _available_mpl_font_names()
+    for family in candidates:
+        if family in available:
+            return family
+    return "DejaVu Sans"
+
+
+def _embedded_display_font_css() -> str:
+    global _DISPLAY_FONT_CSS_CACHE
+    if _DISPLAY_FONT_CSS_CACHE is not None:
+        return _DISPLAY_FONT_CSS_CACHE
+    if not _DISPLAY_FONT_PATH.exists():
+        _DISPLAY_FONT_CSS_CACHE = ""
+        return _DISPLAY_FONT_CSS_CACHE
+    try:
+        encoded = base64.b64encode(_DISPLAY_FONT_PATH.read_bytes()).decode("ascii")
+    except Exception:
+        _DISPLAY_FONT_CSS_CACHE = ""
+        return _DISPLAY_FONT_CSS_CACHE
+    _DISPLAY_FONT_CSS_CACHE = (
+        "@font-face{"
+        f"font-family:'{_DISPLAY_WEB_FONT_FAMILY}';"
+        f"src:url(data:font/ttf;base64,{encoded}) format('truetype');"
+        "font-style:normal;"
+        "font-weight:600;"
+        "font-display:swap;"
+        "}"
+    )
+    return _DISPLAY_FONT_CSS_CACHE
+
+
+def _plot_font_css_stack(theme_tokens: Optional[dict[str, str]] = None) -> str:
+    fallback_families: list[str] = [_preferred_display_font_family(), "Rajdhani"]
+    if theme_tokens:
+        for body_font in _split_font_families(theme_tokens.get("font_family", "")):
+            if body_font and body_font not in fallback_families:
+                fallback_families.append(body_font)
+    fallback_families.extend(_platform_ui_font_candidates())
+    fallback_families.extend(["Arial", "Helvetica"])
+    deduped: list[str] = []
+    for family in fallback_families:
+        normalized = str(family or "").strip()
+        if normalized and normalized not in deduped and normalized != "Sans Serif":
+            deduped.append(normalized)
+    fallback = ", ".join(f'"{family}"' for family in deduped) or '"Arial"'
+    if _DISPLAY_FONT_PATH.exists():
+        return f'"{_DISPLAY_WEB_FONT_FAMILY}", {fallback}'
+    return fallback
 
 
 def _theme_tokens_from_widget(widget: object) -> dict[str, str]:
@@ -95,6 +252,35 @@ def _theme_qcolor_from_widget(widget: object, key: str, fallback: str) -> QColor
     if color.isValid():
         return color
     return _qcolor_from_token(fallback)
+
+
+def _normalized_css_color(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    color = QColor(text)
+    if not color.isValid():
+        return ""
+    return color.name().lower()
+
+
+def _swatch_text_color(value: object, *, dark: str = "#f6fbff", light: str = "#101720") -> str:
+    color = _qcolor_from_token(value)
+    if not color.isValid():
+        return dark
+    return dark if color.lightnessF() < 0.60 else light
+
+
+UI_FONT_SIZE_MIN = 9
+UI_FONT_SIZE_MAX = 24
+
+
+def _sanitize_ui_font_size(value: object, *, default: int = 11) -> int:
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        size = int(default)
+    return max(UI_FONT_SIZE_MIN, min(UI_FONT_SIZE_MAX, size))
 
 
 def _icon_pen(color: QColor, width: float) -> QPen:
@@ -281,11 +467,24 @@ def _style_dialog_button_box(
 
 
 __all__ = [
+    "UI_FONT_SIZE_MAX",
+    "UI_FONT_SIZE_MIN",
+    "_embedded_display_font_css",
+    "_ensure_display_font_loaded",
+    "_normalized_css_color",
+    "_pick_font_family",
+    "_pick_matplotlib_font_family",
+    "_platform_ui_font_candidates",
+    "_plot_font_css_stack",
+    "_preferred_display_font_family",
     "_qcolor_from_token",
+    "_resolved_platform_ui_font_family",
+    "_sanitize_ui_font_size",
     "_set_button_icon_kind",
     "_set_button_variant",
     "_set_label_tone",
     "_style_dialog_button_box",
+    "_swatch_text_color",
     "_theme_color_from_widget",
     "_theme_qcolor_from_widget",
 ]
