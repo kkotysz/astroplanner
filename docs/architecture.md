@@ -67,6 +67,8 @@ and coordinator modules. The dependency direction is intentionally one-way:
 - `astroplanner/ui/widgets.py`
   Shared custom widgets used by the shell, including the neon toggle and zoomable
   cover image label.
+- `astroplanner/ui/preview.py`
+  Shared Aladin/finder image-stack helpers and loading placeholders.
 - `astroplanner/ui/targets.py`
   Main target table model and delegate: `TargetTableModel` and
   `TargetTableGlowDelegate`.
@@ -100,6 +102,9 @@ The current coordinator layer extracts orchestration that is tightly coupled to
 - `astroplanner/observatory_coordinator.py`
   Observatory persistence, default config loading, coordinate lookup, and combo
   refresh glue.
+- `astroplanner/preview_coordinator.py`
+  Aladin cutout and finder-chart cache keys, in-memory/disk pixmap cache, worker
+  lifecycle, prefetch queues, resize refresh, overlays, and zoom actions.
 - `astroplanner/ai_panel_coordinator.py`
   AI Assistant window composition, chat transcript rendering, warm-up lifecycle,
   LLM dispatch, streaming updates, and AI status handling.
