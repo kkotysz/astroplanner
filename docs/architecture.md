@@ -52,7 +52,7 @@ and coordinator modules. The dependency direction is intentionally one-way:
   Matplotlib visibility rendering, target line coloring, altitude/airmass axis
   switching, current-night plot refresh, and radar/polar plot helpers.
 - `astroplanner/ai.py`
-  Knowledge-note parsing, deterministic AI intent helpers, OpenAI-compatible model
+  Knowledge-note data structures and parsing helpers, OpenAI-compatible model
   discovery, LLM config, and LLM request workers.
 - `astroplanner/storage/`
   SQLite-backed settings, state, cache, observatories, plans, templates,
@@ -119,6 +119,10 @@ The current coordinator layer extracts orchestration that is tightly coupled to
 - `astroplanner/ai_panel_coordinator.py`
   AI Assistant window composition, chat transcript rendering, warm-up lifecycle,
   LLM dispatch, streaming updates, and AI status handling.
+- `astroplanner/ai_context.py`
+  Deterministic AI session context, knowledge-note selection, local class/object
+  answers, chat-memory prompt snippets, compact SIMBAD-backed object descriptions,
+  and LLM prompt assembly.
 - `astroplanner/plan_coordinator.py`
   Plan snapshots, workspace autosave, named-plan load/save, JSON plan import,
   per-plan AI chat persistence, and observation-log writes.
@@ -177,8 +181,8 @@ largest remaining candidates are:
   to refresh timing, especially the shell-level refresh triggers around
   visibility, cutout, and finder preview paths;
 - Aladin integration call sites and preview cache glue;
-- AI context/rendering helpers that still mix deterministic local answers,
-  knowledge-note selection, BHTOM shortlist text, and LLM prompt assembly;
+- remaining AI rendering helpers and compatibility wrappers around the extracted
+  AI context and panel coordinators;
 - remaining menu/action wiring and app-wide settings application;
 - cross-feature workflows that still span table state, selected target state,
   weather, Seestar, and AI.
