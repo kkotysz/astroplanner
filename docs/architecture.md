@@ -106,6 +106,10 @@ The current coordinator layer extracts orchestration that is tightly coupled to
   Plotly web rendering/cache, Plotly selection styling, polar selection, and
   show/hide orchestration. The heavier Matplotlib redraw path lives in
   `astroplanner/visibility_matplotlib.py`.
+- `astroplanner/bhtom_coordinator.py`
+  BHTOM cache identity, disk cache serialization, startup prefetch, worker
+  lifecycle, quick-target imports, observatory preset prefetch, and
+  `Suggest Targets` dialog glue.
 - `astroplanner/observatory_coordinator.py`
   Observatory persistence, default config loading, coordinate lookup, and combo
   refresh glue.
@@ -173,6 +177,8 @@ largest remaining candidates are:
   to refresh timing, especially the shell-level refresh triggers around
   visibility, cutout, and finder preview paths;
 - Aladin integration call sites and preview cache glue;
+- AI context/rendering helpers that still mix deterministic local answers,
+  knowledge-note selection, BHTOM shortlist text, and LLM prompt assembly;
 - remaining menu/action wiring and app-wide settings application;
 - cross-feature workflows that still span table state, selected target state,
   weather, Seestar, and AI.
