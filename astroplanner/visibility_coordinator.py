@@ -10,6 +10,7 @@ import ephem
 import numpy as np
 from PySide6.QtCore import QItemSelectionModel, QObject, QTimer, QUrl
 from PySide6.QtGui import QColor
+from matplotlib.lines import Line2D
 
 from astroplanner.theme import DEFAULT_UI_THEME
 from astroplanner.visibility_plotly import PLOTLY_JS_BASE_DIR
@@ -30,6 +31,10 @@ def _normalized_css_color(value: object) -> str:
 
 
 class VisibilityCoordinator(QObject):
+    SUN_PATH_LINESTYLE = "--"
+    MOON_PATH_LINESTYLE = "--"
+    POLAR_AXES_HORIZON_RADIUS = 0.494
+
     def __init__(self, planner: "MainWindow") -> None:
         super().__init__(planner)
         self._planner = planner
@@ -192,18 +197,42 @@ class VisibilityCoordinator(QObject):
             f"const selected = new Set({selected_json});"
             "const gd=document.querySelector('.plotly-graph-div');"
             "if(!gd||!window.Plotly||!Array.isArray(gd.data)){return 0;}"
-            "const indices=[];const widths=[];const opacities=[];"
+            "const indices=[];const widths=[];const opacities=[];const selectedHighIndices=[];"
             "for(let i=0;i<gd.data.length;i++){"
             "const tr=gd.data[i]||{};const meta=tr.meta;"
             "if(!meta||typeof meta!=='object'||meta.kind!=='target'){continue;}"
             "const name=String(meta.target||'');if(!name){continue;}"
             "const seg=String(meta.segment||'');"
             "const isSelected=selected.has(name);"
-            "if(seg==='base'){indices.push(i);widths.push(1.4);opacities.push(isSelected?0.40:0.28);}"
-            "else if(seg==='high'){indices.push(i);widths.push(isSelected?2.8:1.9);opacities.push(isSelected?1.00:0.92);}"
+            "if(seg==='base'){indices.push(i);widths.push(1.4);opacities.push(isSelected?0.42:0.28);}"
+            "else if(seg==='high'){if(isSelected){selectedHighIndices.push(i);}"
+            "indices.push(i);widths.push(isSelected?4.1:1.9);opacities.push(isSelected?1.00:0.92);}"
             "}"
             "if(!indices.length){return 0;}"
-            "Plotly.restyle(gd, {'line.width': widths, 'opacity': opacities}, indices);"
+            "const applyGlow=()=>{"
+            "const nodes=Array.from(gd.querySelectorAll('.scatterlayer .trace'));"
+            "for(let i=0;i<nodes.length;i++){"
+            "const tr=gd.data[i]||{};const meta=tr.meta||{};"
+            "const on=meta.kind==='target'&&meta.segment==='high'&&selected.has(String(meta.target||''));"
+            "const paths=nodes[i].querySelectorAll('path.js-line');"
+            "for(let j=0;j<paths.length;j++){"
+            "const path=paths[j];"
+            "if(on){"
+            "const stroke=path.getAttribute('stroke')||((tr.line||{}).color)||'#59f3ff';"
+            "path.style.filter=`drop-shadow(0 0 2px ${stroke}) drop-shadow(0 0 7px ${stroke}) drop-shadow(0 0 15px ${stroke})`;"
+            "path.style.strokeLinecap='round';path.style.strokeLinejoin='round';"
+            "}else{path.style.filter='';}"
+            "}"
+            "}"
+            "};"
+            "let op=Plotly.restyle(gd, {'line.width': widths, 'opacity': opacities}, indices);"
+            "if(selectedHighIndices.length&&typeof Plotly.moveTraces==='function'){"
+            "op=Promise.resolve(op).then(()=>{"
+            "const targetIndices=selectedHighIndices.map((_,j)=>gd.data.length-selectedHighIndices.length+j);"
+            "return Plotly.moveTraces(gd, selectedHighIndices, targetIndices);"
+            "});"
+            "}"
+            "Promise.resolve(op).then(()=>requestAnimationFrame(applyGlow)).catch(()=>requestAnimationFrame(applyGlow));"
             "return indices.length;"
             "})();"
         )
@@ -295,29 +324,16 @@ class VisibilityCoordinator(QObject):
                 planner.selected_trace_line = None
                 planner.polar_canvas.draw_idle()
                 return
-            alt_arr = np.array(planner.full_payload[name]["altitude"])
-            az_arr = np.array(planner.full_payload[name]["azimuth"])
-            mask = alt_arr > 0
-            vis_idx = np.where(mask)[0]
-            if vis_idx.size == 0:
+            alt_arr = np.array(planner.full_payload[name]["altitude"], dtype=float)
+            az_arr = np.array(planner.full_payload[name]["azimuth"], dtype=float)
+            path_x, path_y = self.build_polar_axes_path(alt_arr, az_arr)
+            if path_x.size == 0 or path_y.size == 0:
                 planner.selected_trace_line = None
                 planner.polar_canvas.draw_idle()
                 return
-            theta_full = np.array([], dtype=float)
-            r_full = np.array([], dtype=float)
-            runs = np.split(vis_idx, np.where(np.diff(vis_idx) != 1)[0] + 1)
-            for run in runs:
-                theta_seg = np.deg2rad(az_arr[run])
-                r_seg = 90 - alt_arr[run]
-                wrap_pts = np.where(np.abs(np.diff(theta_seg)) > np.pi)[0] + 1
-                for wp in reversed(wrap_pts):
-                    theta_seg = np.insert(theta_seg, wp, np.nan)
-                    r_seg = np.insert(r_seg, wp, np.nan)
-                theta_full = np.concatenate([theta_full, theta_seg, [np.nan]])
-                r_full = np.concatenate([r_full, r_seg, [np.nan]])
-            trace, = planner.polar_ax.plot(
-                theta_full,
-                r_full,
+            trace = self.add_polar_axes_path_line(
+                path_x,
+                path_y,
                 color=planner._theme_color("polar_selected_path", "#8cff84"),
                 linewidth=0.8,
                 linestyle=":",
@@ -380,42 +396,190 @@ class VisibilityCoordinator(QObject):
             self.apply_visibility_web_selection_style(sel_names)
 
     @staticmethod
-    def build_polar_visible_path(
+    def _build_visible_polar_segments(
         alt_series: object,
         az_series: object,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
         alt_arr = np.array(alt_series, dtype=float).ravel()
         az_arr = np.array(az_series, dtype=float).ravel()
         n = min(alt_arr.size, az_arr.size)
         if n <= 0:
-            return np.array([], dtype=float), np.array([], dtype=float)
+            return []
         alt_arr = alt_arr[:n]
         az_arr = np.mod(az_arr[:n], 360.0)
-        mask = np.isfinite(alt_arr) & np.isfinite(az_arr) & (alt_arr > 0.0)
-        vis_idx = np.where(mask)[0]
-        if vis_idx.size == 0:
-            return np.array([], dtype=float), np.array([], dtype=float)
+        finite_idx = np.where(np.isfinite(alt_arr) & np.isfinite(az_arr))[0]
+        if finite_idx.size == 0:
+            return []
 
-        theta_segments: list[np.ndarray] = []
-        r_segments: list[np.ndarray] = []
-        runs = np.split(vis_idx, np.where(np.diff(vis_idx) != 1)[0] + 1)
+        segments: list[tuple[np.ndarray, np.ndarray]] = []
+        runs = np.split(finite_idx, np.where(np.diff(finite_idx) != 1)[0] + 1)
         for run in runs:
             if run.size == 0:
                 continue
-            theta_seg = np.deg2rad(az_arr[run])
-            r_seg = 90.0 - alt_arr[run]
-            wrap_pts = np.where(np.abs(np.diff(theta_seg)) > np.pi)[0] + 1
-            for wp in reversed(wrap_pts):
-                theta_seg = np.insert(theta_seg, int(wp), np.nan)
-                r_seg = np.insert(r_seg, int(wp), np.nan)
+            theta_run = np.unwrap(np.deg2rad(az_arr[run]))
+            alt_run = alt_arr[run]
+            current_theta: list[float] = []
+            current_alt: list[float] = []
+
+            def append_point(theta: float, alt: float) -> None:
+                if current_theta and math.isclose(current_theta[-1], theta) and math.isclose(current_alt[-1], alt):
+                    return
+                current_theta.append(float(theta))
+                current_alt.append(float(np.clip(alt, 0.0, 90.0)))
+
+            def append_crossing(t0: float, a0: float, t1: float, a1: float) -> None:
+                denom = a1 - a0
+                if math.isclose(float(denom), 0.0):
+                    return
+                frac = (0.0 - a0) / denom
+                if 0.0 <= frac <= 1.0:
+                    append_point(t0 + frac * (t1 - t0), 0.0)
+
+            def flush_segment() -> None:
+                if len(current_theta) >= 2:
+                    segments.append(
+                        (
+                            np.array(current_theta, dtype=float),
+                            np.array(current_alt, dtype=float),
+                        )
+                    )
+                current_theta.clear()
+                current_alt.clear()
+
+            if alt_run.size == 1:
+                if alt_run[0] > 0.0:
+                    append_point(float(theta_run[0]), float(alt_run[0]))
+                    flush_segment()
+                continue
+
+            for idx in range(1, alt_run.size):
+                a0 = float(alt_run[idx - 1])
+                a1 = float(alt_run[idx])
+                t0 = float(theta_run[idx - 1])
+                t1 = float(theta_run[idx])
+                v0 = a0 > 0.0
+                v1 = a1 > 0.0
+                if v0 and v1:
+                    if not current_theta:
+                        append_point(t0, a0)
+                    append_point(t1, a1)
+                elif v0 and not v1:
+                    if not current_theta:
+                        append_point(t0, a0)
+                    append_crossing(t0, a0, t1, a1)
+                    flush_segment()
+                elif not v0 and v1:
+                    append_crossing(t0, a0, t1, a1)
+                    append_point(t1, a1)
+                else:
+                    flush_segment()
+            flush_segment()
+
+        return segments
+
+    @staticmethod
+    def build_polar_visible_path(
+        alt_series: object,
+        az_series: object,
+        *,
+        clip_to_horizon: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not clip_to_horizon:
+            alt_arr = np.array(alt_series, dtype=float).ravel()
+            az_arr = np.array(az_series, dtype=float).ravel()
+            n = min(alt_arr.size, az_arr.size)
+            if n <= 0:
+                return np.array([], dtype=float), np.array([], dtype=float)
+            alt_arr = alt_arr[:n]
+            az_arr = np.mod(az_arr[:n], 360.0)
+            finite_idx = np.where(np.isfinite(alt_arr) & np.isfinite(az_arr))[0]
+            if finite_idx.size == 0:
+                return np.array([], dtype=float), np.array([], dtype=float)
+            theta_segments: list[np.ndarray] = []
+            r_segments: list[np.ndarray] = []
+            runs = np.split(finite_idx, np.where(np.diff(finite_idx) != 1)[0] + 1)
+            for run in runs:
+                if run.size == 0:
+                    continue
+                theta_segments.append(np.unwrap(np.deg2rad(az_arr[run])))
+                r_segments.append(90.0 - alt_arr[run])
+                theta_segments.append(np.array([np.nan], dtype=float))
+                r_segments.append(np.array([np.nan], dtype=float))
+            if not theta_segments:
+                return np.array([], dtype=float), np.array([], dtype=float)
+            return np.concatenate(theta_segments), np.concatenate(r_segments)
+
+        visible_segments = VisibilityCoordinator._build_visible_polar_segments(alt_series, az_series)
+        if not visible_segments:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        theta_segments: list[np.ndarray] = []
+        r_segments: list[np.ndarray] = []
+        for theta_seg, alt_seg in visible_segments:
             theta_segments.append(theta_seg)
-            r_segments.append(r_seg)
+            r_segments.append(90.0 - alt_seg)
             theta_segments.append(np.array([np.nan], dtype=float))
             r_segments.append(np.array([np.nan], dtype=float))
-
-        if not theta_segments:
-            return np.array([], dtype=float), np.array([], dtype=float)
         return np.concatenate(theta_segments), np.concatenate(r_segments)
+
+    @staticmethod
+    def build_polar_axes_path(
+        alt_series: object,
+        az_series: object,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        visible_segments = VisibilityCoordinator._build_visible_polar_segments(alt_series, az_series)
+        if not visible_segments:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        x_segments: list[np.ndarray] = []
+        y_segments: list[np.ndarray] = []
+        for theta_seg, alt_seg in visible_segments:
+            radius = np.minimum((90.0 - alt_seg) / 180.0, VisibilityCoordinator.POLAR_AXES_HORIZON_RADIUS)
+            x_segments.append(0.5 + radius * np.sin(theta_seg))
+            y_segments.append(0.5 + radius * np.cos(theta_seg))
+            x_segments.append(np.array([np.nan], dtype=float))
+            y_segments.append(np.array([np.nan], dtype=float))
+
+        if not x_segments:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        return np.concatenate(x_segments), np.concatenate(y_segments)
+
+    def add_polar_axes_path_line(
+        self,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        *,
+        color: str,
+        linewidth: float,
+        linestyle: str,
+        alpha: float,
+        zorder: float,
+        dash_pattern: Optional[tuple[float, ...]] = None,
+        gap_alpha: float = 0.0,
+    ) -> Line2D:
+        planner = self._planner
+        line = Line2D(
+            x_values,
+            y_values,
+            color=color,
+            linewidth=linewidth,
+            linestyle=linestyle,
+            alpha=alpha,
+            zorder=zorder,
+            transform=planner.polar_ax.transAxes,
+            clip_on=True,
+        )
+        line.set_solid_capstyle("round")
+        line.set_solid_joinstyle("round")
+        line.set_dash_capstyle("round")
+        line.set_dash_joinstyle("round")
+        if dash_pattern:
+            line.set_dashes(dash_pattern)
+        if gap_alpha > 0 and hasattr(line, "set_gapcolor"):
+            gap_color = QColor(str(color))
+            if gap_color.isValid():
+                line.set_gapcolor((gap_color.redF(), gap_color.greenF(), gap_color.blueF(), float(gap_alpha)))
+        line.set_clip_path(planner.polar_ax.patch)
+        planner.polar_ax.add_line(line)
+        return line
 
     def update_polar_positions(self, data: dict, dynamic_only: bool = False) -> None:
         planner = self._planner
@@ -501,29 +665,29 @@ class VisibilityCoordinator(QObject):
                 setattr(planner, line_attr, None)
 
             if planner.show_sun_path and has_sun_path:
-                theta, r = self.build_polar_visible_path(data["sun_alt"], data["sun_az"])
-                if theta.size > 0 and r.size > 0:
-                    planner.sun_path_line, = planner.polar_ax.plot(
-                        theta,
-                        r,
+                path_x, path_y = self.build_polar_axes_path(data["sun_alt"], data["sun_az"])
+                if path_x.size > 0 and path_y.size > 0:
+                    planner.sun_path_line = self.add_polar_axes_path_line(
+                        path_x,
+                        path_y,
                         color=planner._theme_color("polar_sun", "gold"),
-                        linewidth=0.9,
-                        linestyle="--",
-                        alpha=0.7,
-                        zorder=1,
+                        linewidth=1.0,
+                        linestyle=self.SUN_PATH_LINESTYLE,
+                        alpha=0.75,
+                        zorder=2.2,
                     )
 
             if planner.show_moon_path and has_moon_path:
-                theta, r = self.build_polar_visible_path(data["moon_alt"], data["moon_az"])
-                if theta.size > 0 and r.size > 0:
-                    planner.moon_path_line, = planner.polar_ax.plot(
-                        theta,
-                        r,
+                path_x, path_y = self.build_polar_axes_path(data["moon_alt"], data["moon_az"])
+                if path_x.size > 0 and path_y.size > 0:
+                    planner.moon_path_line = self.add_polar_axes_path_line(
+                        path_x,
+                        path_y,
                         color=planner._theme_color("polar_moon", "silver"),
-                        linewidth=0.9,
-                        linestyle="--",
-                        alpha=0.7,
-                        zorder=1,
+                        linewidth=1.15,
+                        linestyle=self.MOON_PATH_LINESTYLE,
+                        alpha=0.88,
+                        zorder=2.4,
                     )
 
             signature = (round(site.latitude, 6), int(planner.limit_spin.value()))

@@ -31,6 +31,22 @@ class _DummyVisibilityPlanner(QWidget):
         self._cutout_updates.append(target)
 
 
+class _DummyWebPage:
+    def __init__(self) -> None:
+        self.scripts: list[str] = []
+
+    def runJavaScript(self, script: str) -> None:
+        self.scripts.append(script)
+
+
+class _DummyWebView:
+    def __init__(self) -> None:
+        self._page = _DummyWebPage()
+
+    def page(self) -> _DummyWebPage:
+        return self._page
+
+
 def test_visibility_coordinator_selection_and_cutout_smoke() -> None:
     app = QApplication.instance() or QApplication([])
     assert app is not None
@@ -66,7 +82,51 @@ def test_visibility_coordinator_caps_web_html_cache() -> None:
     assert planner._visibility_web_html_cache["key-9"] == "html-9"
 
 
-def test_build_polar_visible_path_splits_horizon_and_wraps() -> None:
+def test_visibility_web_selection_style_moves_selected_traces_to_front() -> None:
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    planner = _DummyVisibilityPlanner()
+    planner._use_visibility_web = True
+    planner._visibility_web_has_content = True
+    planner.visibility_web = _DummyWebView()
+    coordinator = VisibilityCoordinator(planner)
+
+    coordinator.apply_visibility_web_selection_style({"M42"})
+
+    script = planner.visibility_web.page().scripts[-1]
+    assert "Plotly.moveTraces" in script
+    assert "selectedHighIndices.map((_,j)=>gd.data.length-selectedHighIndices.length+j)" in script
+    assert "widths.push(1.4)" in script
+    assert "widths.push(isSelected?4.1:1.9)" in script
+    assert "drop-shadow(0 0 15px" in script
+    assert "7.6" not in script
+
+
+def test_polar_axes_path_line_keeps_moon_path_dashed() -> None:
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    planner = _DummyVisibilityPlanner()
+    from matplotlib.figure import Figure
+    planner.polar_ax = Figure().add_subplot(projection="polar")
+    coordinator = VisibilityCoordinator(planner)
+
+    line = coordinator.add_polar_axes_path_line(
+        np.array([0.2, 0.4]),
+        np.array([0.8, 0.7]),
+        color="silver",
+        linewidth=1.15,
+        linestyle=VisibilityCoordinator.MOON_PATH_LINESTYLE,
+        alpha=0.88,
+        zorder=2.4,
+    )
+
+    assert line.is_dashed()
+    assert line.get_gapcolor() is None
+
+
+def test_build_polar_visible_path_splits_below_horizon_without_horizon_arc() -> None:
     theta, radius = VisibilityCoordinator.build_polar_visible_path(
         alt_series=[-1.0, 20.0, 25.0, -2.0, 30.0, 35.0],
         az_series=[0.0, 350.0, 10.0, 20.0, 355.0, 5.0],
@@ -74,5 +134,40 @@ def test_build_polar_visible_path_splits_horizon_and_wraps() -> None:
 
     assert theta.size == radius.size
     assert theta.size > 0
-    assert np.isnan(theta).any()
-    assert np.all(radius[np.isfinite(radius)] < 90.0)
+    assert np.isnan(theta[:-1]).any()
+    assert np.all(radius[np.isfinite(radius)] <= 90.0)
+    assert 90.0 in set(radius[np.isfinite(radius)])
+
+
+def test_build_polar_visible_path_unwraps_azimuth_without_breaking() -> None:
+    theta, radius = VisibilityCoordinator.build_polar_visible_path(
+        alt_series=[20.0, 25.0, 30.0],
+        az_series=[350.0, 10.0, 20.0],
+    )
+
+    assert theta.size == radius.size
+    finite_theta = theta[np.isfinite(theta)]
+    assert finite_theta.size == 3
+    assert np.rad2deg(finite_theta[1]) > 360.0
+
+
+def test_build_polar_axes_path_splits_below_horizon_without_horizon_arc() -> None:
+    x, y = VisibilityCoordinator.build_polar_axes_path(
+        alt_series=[20.0, -10.0, 25.0],
+        az_series=[350.0, 0.0, 10.0],
+    )
+
+    assert x.size == y.size
+    finite_x = x[np.isfinite(x)]
+    finite_y = y[np.isfinite(y)]
+    assert finite_x.size == 4
+    assert finite_y.size == 4
+    assert np.isnan(x[:-1]).any()
+    assert np.all((finite_x >= 0.0) & (finite_x <= 1.0))
+    assert np.all((finite_y >= 0.0) & (finite_y <= 1.0))
+    assert 0.98 < finite_y.max() < 1.0
+
+
+def test_polar_moon_path_uses_dashed_line() -> None:
+    assert VisibilityCoordinator.MOON_PATH_LINESTYLE == "--"
+    assert VisibilityCoordinator.SUN_PATH_LINESTYLE == "--"

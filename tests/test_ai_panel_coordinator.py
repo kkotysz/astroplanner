@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from time import perf_counter
 
@@ -88,3 +89,35 @@ def test_ai_panel_coordinator_smoke() -> None:
     planner._llm_last_warmup_key = coordinator.warmup_cache_key()
     planner._llm_last_warmup_at = perf_counter()
     assert coordinator.is_warm() is True
+
+
+def test_silent_startup_warmup_error_does_not_warn(caplog) -> None:
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    planner = _DummyAIPlanner()
+    planner._llm_active_tag = "warmup"
+    planner._llm_warmup_silent = True
+    coordinator = AIPanelCoordinator(planner)
+
+    with caplog.at_level(logging.WARNING):
+        coordinator.on_error("Cannot reach LLM server")
+
+    assert "LLM warm-up error" not in caplog.text
+    assert planner._ai_runtime_status == ""
+
+
+def test_manual_warmup_error_still_warns(caplog) -> None:
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    planner = _DummyAIPlanner()
+    planner._llm_active_tag = "warmup"
+    planner._llm_warmup_silent = False
+    coordinator = AIPanelCoordinator(planner)
+
+    with caplog.at_level(logging.WARNING):
+        coordinator.on_error("Cannot reach LLM server")
+
+    assert "LLM warm-up error" in caplog.text
+    assert planner._ai_runtime_status == "Warm-up failed"

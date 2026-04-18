@@ -563,11 +563,12 @@ class AIPanelCoordinator(QObject):
     def on_error(self, message: str) -> None:
         planner = self._planner
         if planner._llm_active_tag == "warmup":
-            logger.warning("LLM warm-up error: %s", message)
             if planner._llm_warmup_silent:
+                logger.debug("Silent LLM warm-up failed: %s", message)
                 planner._ai_runtime_status = ""
                 self.refresh_warm_indicator()
             else:
+                logger.warning("LLM warm-up error: %s", message)
                 self.set_status("Warm-up failed", tone="warning")
             return
         logger.warning("LLM error: %s", message)

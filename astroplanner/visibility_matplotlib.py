@@ -15,7 +15,7 @@ from astropy.coordinates import Angle, SkyCoord
 from astropy.time import Time
 from astroplan import FixedTarget, Observer
 from matplotlib import patheffects as mpl_patheffects
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, to_rgba
 from PySide6.QtCore import QEasingCurve, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetrics
 
@@ -683,43 +683,38 @@ class VisibilityMatplotlibCoordinator:
         if line is None:
             return
         try:
+            highlight = bool(is_over and is_selected)
             line.set_solid_capstyle("round")
             line.set_solid_joinstyle("round")
-            line.set_linewidth(2.3 if (is_over and is_selected) else 1.4)
-            line.set_alpha(1.0 if (is_over and is_selected) else (0.7 if is_over else 0.3))
-            if is_over and is_selected:
-                line_color = QColor(str(getattr(line, "get_color", lambda: "")()))
-                if not line_color.isValid():
-                    line_color = self._theme_qcolor("accent_secondary", "#ff4fd8")
+            line.set_linewidth(2.8 if highlight else 1.4)
+            line.set_alpha(1.0 if highlight else (0.7 if is_over else (0.42 if is_selected else 0.3)))
+            line.set_zorder(80 if highlight else (2 if is_over or is_selected else 1))
+            if highlight:
+                line_color = getattr(line, "get_color", lambda: "#ff4fd8")()
+
+                def glow_color(alpha: float) -> object:
+                    try:
+                        return to_rgba(line_color, alpha=alpha)
+                    except (TypeError, ValueError):
+                        return self._qcolor_rgba_mpl(self._theme_qcolor("accent_secondary", "#ff4fd8"), alpha)
+
                 line.set_path_effects(
                     [
                         mpl_patheffects.Stroke(
+                            linewidth=38.0,
+                            foreground=glow_color(0.160),
+                        ),
+                        mpl_patheffects.Stroke(
+                            linewidth=26.0,
+                            foreground=glow_color(0.260),
+                        ),
+                        mpl_patheffects.Stroke(
                             linewidth=16.0,
-                            foreground=self._qcolor_rgba_mpl(line_color, 0.012),
+                            foreground=glow_color(0.460),
                         ),
                         mpl_patheffects.Stroke(
-                            linewidth=13.7,
-                            foreground=self._qcolor_rgba_mpl(line_color, 0.020),
-                        ),
-                        mpl_patheffects.Stroke(
-                            linewidth=11.5,
-                            foreground=self._qcolor_rgba_mpl(line_color, 0.032),
-                        ),
-                        mpl_patheffects.Stroke(
-                            linewidth=9.2,
-                            foreground=self._qcolor_rgba_mpl(line_color, 0.048),
-                        ),
-                        mpl_patheffects.Stroke(
-                            linewidth=7.2,
-                            foreground=self._qcolor_rgba_mpl(line_color, 0.070),
-                        ),
-                        mpl_patheffects.Stroke(
-                            linewidth=5.6,
-                            foreground=self._qcolor_rgba_mpl(line_color, 0.102),
-                        ),
-                        mpl_patheffects.Stroke(
-                            linewidth=4.3,
-                            foreground=self._qcolor_rgba_mpl(line_color, 0.142),
+                            linewidth=8.0,
+                            foreground=glow_color(0.900),
                         ),
                         mpl_patheffects.Normal(),
                     ]
