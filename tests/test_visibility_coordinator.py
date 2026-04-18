@@ -139,6 +139,21 @@ def test_build_polar_visible_path_splits_below_horizon_without_horizon_arc() -> 
     assert 90.0 in set(radius[np.isfinite(radius)])
 
 
+def test_observing_pass_selects_single_rise_to_set_segment_overlapping_night() -> None:
+    selected_alt, selected_az = VisibilityCoordinator.observing_pass_series(
+        times_series=[0.0, 6.0, 12.0, 18.0, 24.0],
+        alt_series=[20.0, 25.0, -10.0, -12.0, 22.0],
+        az_series=[80.0, 100.0, 140.0, 180.0, 220.0],
+        night_start_num=18.1,
+        night_end_num=23.9,
+    )
+
+    assert selected_alt.size == selected_az.size
+    assert selected_alt.size >= 2
+    assert np.all(selected_az > 180.0)
+    assert 90.0 in set(90.0 - selected_alt)
+
+
 def test_build_polar_visible_path_unwraps_azimuth_without_breaking() -> None:
     theta, radius = VisibilityCoordinator.build_polar_visible_path(
         alt_series=[20.0, 25.0, 30.0],

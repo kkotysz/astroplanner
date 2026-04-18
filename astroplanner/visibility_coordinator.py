@@ -7,7 +7,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
 import ephem
+import matplotlib.dates as mdates
 import numpy as np
+from astroplan import FixedTarget, Observer
+from astropy.time import Time
 from PySide6.QtCore import QItemSelectionModel, QObject, QTimer, QUrl
 from PySide6.QtGui import QColor
 from matplotlib.lines import Line2D
@@ -34,6 +37,8 @@ class VisibilityCoordinator(QObject):
     SUN_PATH_LINESTYLE = "--"
     MOON_PATH_LINESTYLE = "--"
     POLAR_AXES_HORIZON_RADIUS = 0.494
+    POLAR_PASS_PADDING_DAYS = 1.0
+    POLAR_PASS_SAMPLE_COUNT = 480
 
     def __init__(self, planner: "MainWindow") -> None:
         super().__init__(planner)
@@ -326,6 +331,8 @@ class VisibilityCoordinator(QObject):
                 return
             alt_arr = np.array(planner.full_payload[name]["altitude"], dtype=float)
             az_arr = np.array(planner.full_payload[name]["azimuth"], dtype=float)
+            selected_target = planner.targets[idx0]
+            alt_arr, az_arr = self.target_observing_pass_series(planner.full_payload, selected_target, alt_arr, az_arr)
             path_x, path_y = self.build_polar_axes_path(alt_arr, az_arr)
             if path_x.size == 0 or path_y.size == 0:
                 planner.selected_trace_line = None
@@ -542,6 +549,226 @@ class VisibilityCoordinator(QObject):
             return np.array([], dtype=float), np.array([], dtype=float)
         return np.concatenate(x_segments), np.concatenate(y_segments)
 
+    @staticmethod
+    def observing_night_bounds(data: dict) -> Optional[tuple[float, float]]:
+        for start_key, end_key in (("sunset", "sunrise"), ("dusk_civ", "dawn_civ"), ("dusk", "dawn")):
+            try:
+                start_num = float(data[start_key])
+                end_num = float(data[end_key])
+            except Exception:
+                continue
+            if np.isfinite(start_num) and np.isfinite(end_num) and end_num > start_num:
+                return start_num, end_num
+        return None
+
+    @staticmethod
+    def visible_time_segments(
+        times_series: object,
+        alt_series: object,
+        az_series: object,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        time_arr = np.array(times_series, dtype=float).ravel()
+        alt_arr = np.array(alt_series, dtype=float).ravel()
+        az_arr = np.array(az_series, dtype=float).ravel()
+        n = min(time_arr.size, alt_arr.size, az_arr.size)
+        if n <= 0:
+            return []
+        time_arr = time_arr[:n]
+        alt_arr = alt_arr[:n]
+        az_arr = np.mod(az_arr[:n], 360.0)
+        finite = np.isfinite(time_arr) & np.isfinite(alt_arr) & np.isfinite(az_arr)
+        if not finite.any():
+            return []
+
+        time_arr = time_arr[finite]
+        alt_arr = alt_arr[finite]
+        az_arr = az_arr[finite]
+        order = np.argsort(time_arr)
+        time_arr = time_arr[order]
+        alt_arr = alt_arr[order]
+        az_arr = az_arr[order]
+        time_arr, unique_indices = np.unique(time_arr, return_index=True)
+        alt_arr = alt_arr[unique_indices]
+        az_arr = az_arr[unique_indices]
+        az_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(az_arr)))
+
+        segments: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        current_t: list[float] = []
+        current_alt: list[float] = []
+        current_az: list[float] = []
+
+        def append_point(time_value: float, alt_value: float, az_value: float) -> None:
+            if current_t and math.isclose(current_t[-1], time_value):
+                return
+            current_t.append(float(time_value))
+            current_alt.append(float(np.clip(alt_value, 0.0, 90.0)))
+            current_az.append(float(az_value))
+
+        def append_crossing(t0: float, a0: float, z0: float, t1: float, a1: float, z1: float) -> None:
+            denom = a1 - a0
+            if math.isclose(float(denom), 0.0):
+                return
+            frac = (0.0 - a0) / denom
+            if 0.0 <= frac <= 1.0:
+                append_point(t0 + frac * (t1 - t0), 0.0, z0 + frac * (z1 - z0))
+
+        def flush_segment() -> None:
+            if len(current_t) >= 2:
+                segments.append(
+                    (
+                        np.array(current_t, dtype=float),
+                        np.array(current_alt, dtype=float),
+                        np.mod(np.array(current_az, dtype=float), 360.0),
+                    )
+                )
+            current_t.clear()
+            current_alt.clear()
+            current_az.clear()
+
+        for idx in range(1, time_arr.size):
+            t0 = float(time_arr[idx - 1])
+            t1 = float(time_arr[idx])
+            a0 = float(alt_arr[idx - 1])
+            a1 = float(alt_arr[idx])
+            z0 = float(az_unwrapped[idx - 1])
+            z1 = float(az_unwrapped[idx])
+            v0 = a0 > 0.0
+            v1 = a1 > 0.0
+            if v0 and v1:
+                if not current_t:
+                    append_point(t0, a0, z0)
+                append_point(t1, a1, z1)
+            elif v0 and not v1:
+                if not current_t:
+                    append_point(t0, a0, z0)
+                append_crossing(t0, a0, z0, t1, a1, z1)
+                flush_segment()
+            elif not v0 and v1:
+                append_crossing(t0, a0, z0, t1, a1, z1)
+                append_point(t1, a1, z1)
+            else:
+                flush_segment()
+        flush_segment()
+        return segments
+
+    @classmethod
+    def observing_pass_series(
+        cls,
+        times_series: object,
+        alt_series: object,
+        az_series: object,
+        *,
+        night_start_num: float,
+        night_end_num: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        segments = cls.visible_time_segments(times_series, alt_series, az_series)
+        if not segments:
+            return np.array([], dtype=float), np.array([], dtype=float)
+
+        best_segment: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        best_overlap = 0.0
+        for segment in segments:
+            times, _alts, _azs = segment
+            overlap = min(float(times[-1]), float(night_end_num)) - max(float(times[0]), float(night_start_num))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_segment = segment
+
+        if best_segment is None or best_overlap <= 0.0:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        _times, alts, azs = best_segment
+        return alts, azs
+
+    def pass_sample_times_for_observing_night(self, data: dict) -> tuple[np.ndarray, Optional[tuple[float, float]]]:
+        bounds = self.observing_night_bounds(data)
+        if bounds is None:
+            return np.array([], dtype=float), None
+        night_start, night_end = bounds
+        sample_count = max(
+            self.POLAR_PASS_SAMPLE_COUNT,
+            int(np.array(data.get("times", []), dtype=float).size) * 2,
+        )
+        start_num = float(night_start) - self.POLAR_PASS_PADDING_DAYS
+        end_num = float(night_end) + self.POLAR_PASS_PADDING_DAYS
+        return np.linspace(start_num, end_num, sample_count), bounds
+
+    def moon_observing_pass_series(self, data: dict) -> tuple[np.ndarray, np.ndarray]:
+        sample_times, bounds = self.pass_sample_times_for_observing_night(data)
+        if bounds is None or sample_times.size == 0:
+            return np.array(data.get("moon_alt", []), dtype=float), np.array(data.get("moon_az", []), dtype=float)
+        planner = self._planner
+        site = getattr(getattr(planner, "table_model", None), "site", None)
+        if site is None:
+            return self.observing_pass_series(
+                data.get("times", []),
+                data.get("moon_alt", []),
+                data.get("moon_az", []),
+                night_start_num=bounds[0],
+                night_end_num=bounds[1],
+            )
+
+        eph_obs = ephem.Observer()
+        eph_obs.lat = str(site.latitude)
+        eph_obs.lon = str(site.longitude)
+        eph_obs.elevation = site.elevation
+        moon = ephem.Moon()
+        moon_alt: list[float] = []
+        moon_az: list[float] = []
+        for time_num in sample_times:
+            eph_obs.date = mdates.num2date(float(time_num))
+            moon.compute(eph_obs)
+            moon_alt.append(float(moon.alt * 180.0 / math.pi))
+            moon_az.append(float(moon.az * 180.0 / math.pi))
+        return self.observing_pass_series(
+            sample_times,
+            moon_alt,
+            moon_az,
+            night_start_num=bounds[0],
+            night_end_num=bounds[1],
+        )
+
+    def target_observing_pass_series(
+        self,
+        data: dict,
+        target: "Target",
+        fallback_alt: object,
+        fallback_az: object,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sample_times, bounds = self.pass_sample_times_for_observing_night(data)
+        if bounds is None or sample_times.size == 0:
+            return np.array(fallback_alt, dtype=float), np.array(fallback_az, dtype=float)
+        planner = self._planner
+        site = getattr(getattr(planner, "table_model", None), "site", None)
+        if site is None:
+            return self.observing_pass_series(
+                data.get("times", []),
+                fallback_alt,
+                fallback_az,
+                night_start_num=bounds[0],
+                night_end_num=bounds[1],
+            )
+
+        try:
+            observer = Observer(location=site.to_earthlocation(), timezone=site.timezone_name)
+            fixed = FixedTarget(name=target.name, coord=target.skycoord)
+            dt_values = [mdates.num2date(float(time_num)) for time_num in sample_times]
+            altaz = observer.altaz(Time(dt_values), fixed)
+            return self.observing_pass_series(
+                sample_times,
+                altaz.alt.deg,  # type: ignore[arg-type]
+                altaz.az.deg,  # type: ignore[arg-type]
+                night_start_num=bounds[0],
+                night_end_num=bounds[1],
+            )
+        except Exception:
+            return self.observing_pass_series(
+                data.get("times", []),
+                fallback_alt,
+                fallback_az,
+                night_start_num=bounds[0],
+                night_end_num=bounds[1],
+            )
+
     def add_polar_axes_path_line(
         self,
         x_values: np.ndarray,
@@ -678,7 +905,8 @@ class VisibilityCoordinator(QObject):
                     )
 
             if planner.show_moon_path and has_moon_path:
-                path_x, path_y = self.build_polar_axes_path(data["moon_alt"], data["moon_az"])
+                moon_alt, moon_az = self.moon_observing_pass_series(data)
+                path_x, path_y = self.build_polar_axes_path(moon_alt, moon_az)
                 if path_x.size > 0 and path_y.size > 0:
                     planner.moon_path_line = self.add_polar_axes_path_line(
                         path_x,
