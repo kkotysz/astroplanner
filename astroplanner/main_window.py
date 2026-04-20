@@ -3030,6 +3030,14 @@ class MainWindow(QMainWindow):
         self._replot_timer.setInterval(300)  # ms
         self._replot_timer.timeout.connect(self._run_plan)
 
+        # Debounce/coalesce UI updates coming from the clock worker to avoid scheduling
+        # heavy Matplotlib redraws and table refreshes synchronously on every tick.
+        self._clock_ui_debounce_timer = QTimer(self)
+        self._clock_ui_debounce_timer.setSingleShot(True)
+        self._clock_ui_debounce_timer.setInterval(120)  # ms; coalescing window
+        self._clock_ui_debounce_timer.timeout.connect(self._flush_clock_ui_updates)
+        self._pending_clock_update = None
+
         self.date_edit = QDateEdit()
         # Initialize to current observing night
         self._change_to_today()
@@ -5105,44 +5113,107 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _handle_clock_update(self, data):
-        self.localtime_label.setText(data["now_local"].strftime("%Y-%m-%d %H:%M:%S"))
-        self.utctime_label.setText(data["now_utc"].strftime("%Y-%m-%d %H:%M:%S"))
-        self._refresh_weather_window_context(rebuild=False)
-        self.sun_alt_label.setText(f"{data['sun_alt']:.1f}°")
-        self.moon_alt_label.setText(f"{data['moon_alt']:.1f}°")
-        self.table_model.current_alts = data["alts"]
-        self.table_model.current_azs = data["azs"]
-        self.table_model.current_seps = data["seps"]
-        self.table_model.row_enabled = self._recompute_row_enabled_from_current()
-        self._reapply_current_table_sort()
-        self._apply_table_row_visibility()
-        self._emit_table_data_changed()
-        self._update_status_bar()
+        # Quick label updates to keep the clock responsive
+        try:
+            self.localtime_label.setText(data["now_local"].strftime("%Y-%m-%d %H:%M:%S"))
+            self.utctime_label.setText(data["now_utc"].strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
 
-        # Update sidereal time based on local time and site longitude
-        if hasattr(self, 'last_payload') and self.last_payload:
-            now = data["now_local"]
-            # sidereal time calculation
-            from astropy.time import Time
-            if self.table_model.site is not None:
-                sidereal = Time(data["now_local"]).sidereal_time('apparent', self.table_model.site.to_earthlocation().lon)
-                # Format as HH:MM:SS
-                self.sidereal_label.setText(sidereal.to_string(unit=u.hour, sep=":", pad=True, precision=0))
-            else:
-                self.sidereal_label.setText("-")
-            if hasattr(self, 'now_line') and self.now_line:
-                self.now_line.set_xdata([float(mdates.date2num(now)), float(mdates.date2num(now))])
-            else:
-                self.now_line = self.ax_alt.axvline(
-                    float(mdates.date2num(now)), color="magenta", linestyle=":", linewidth=1.2, label="Now"
-                )
-            self.plot_canvas.draw_idle()
-            current_minute_key = now.strftime("%Y-%m-%d %H:%M")
-            if getattr(self, "_visibility_web_minute_key", "") != current_minute_key:
-                self._visibility_web_minute_key = current_minute_key
-                self.last_payload["now_local"] = now
-                self._render_visibility_web_plot(self.last_payload, now_override=now)
-            self._update_polar_positions(data, dynamic_only=True)
+        # Defer heavier UI work (table refresh, plot redraws) to a short debounce timer
+        # so multiple fast updates coalesce and the main thread doesn't hiccup.
+        self._pending_clock_update = data
+        try:
+            self._clock_ui_debounce_timer.start()
+        except Exception:
+            # If timer isn't available for some reason, schedule an immediate flush.
+            QTimer.singleShot(0, self._flush_clock_ui_updates)
+
+    def _flush_clock_ui_updates(self) -> None:
+        data = getattr(self, "_pending_clock_update", None)
+        if data is None:
+            return
+        # Clear pending payload immediately
+        self._pending_clock_update = None
+
+        if getattr(self, "_shutting_down", False):
+            return
+
+        # Refresh a few widgets and labels
+        try:
+            self._refresh_weather_window_context(rebuild=False)
+        except Exception:
+            pass
+
+        try:
+            self.sun_alt_label.setText(f"{data['sun_alt']:.1f}°")
+            self.moon_alt_label.setText(f"{data['moon_alt']:.1f}°")
+        except Exception:
+            pass
+
+        # Update model caches
+        try:
+            self.table_model.current_alts = data.get("alts", [])
+            self.table_model.current_azs = data.get("azs", [])
+            self.table_model.current_seps = data.get("seps", [])
+            self.table_model.row_enabled = self._recompute_row_enabled_from_current()
+        except Exception:
+            pass
+
+        # Table and status updates (may trigger repaints)
+        try:
+            self._reapply_current_table_sort()
+            self._apply_table_row_visibility()
+            self._emit_table_data_changed()
+            self._update_status_bar()
+        except Exception:
+            pass
+
+        # Update sidereal, now-line and schedule plot/polar redraws
+        try:
+            if hasattr(self, 'last_payload') and self.last_payload:
+                now = data["now_local"]
+                from astropy.time import Time
+                if self.table_model.site is not None:
+                    sidereal = Time(now).sidereal_time('apparent', self.table_model.site.to_earthlocation().lon)
+                    self.sidereal_label.setText(sidereal.to_string(unit=u.hour, sep=":", pad=True, precision=0))
+                else:
+                    self.sidereal_label.setText("-")
+
+                if hasattr(self, 'now_line') and self.now_line:
+                    try:
+                        self.now_line.set_xdata([float(mdates.date2num(now)), float(mdates.date2num(now))])
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.now_line = self.ax_alt.axvline(float(mdates.date2num(now)), color="magenta", linestyle=":", linewidth=1.2, label="Now")
+                    except Exception:
+                        pass
+
+                # Request non-blocking canvas redraws
+                try:
+                    self.plot_canvas.draw_idle()
+                except Exception:
+                    pass
+
+                current_minute_key = now.strftime("%Y-%m-%d %H:%M")
+                if getattr(self, "_visibility_web_minute_key", "") != current_minute_key:
+                    self._visibility_web_minute_key = current_minute_key
+                    self.last_payload["now_local"] = now
+                    # render only once per minute (may be heavy)
+                    try:
+                        self._render_visibility_web_plot(self.last_payload, now_override=now)
+                    except Exception:
+                        pass
+
+                # Update polar positions (this will call polar_canvas.draw_idle())
+                try:
+                    self._update_polar_positions(data, dynamic_only=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
     @Slot()
