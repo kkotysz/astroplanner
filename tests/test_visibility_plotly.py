@@ -80,7 +80,7 @@ def test_build_visibility_plotly_html_contains_targets_and_resize_script() -> No
     )
 
     assert html is not None
-    assert "id='plot-host'" in html or 'id="plot-host"' in html
+    assert "id='plot-host'" in html
     assert "M31" in html
     assert "M42" in html
     assert "Plotly.Plots.resize" in html
