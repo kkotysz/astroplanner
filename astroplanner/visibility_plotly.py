@@ -303,7 +303,11 @@ def build_visibility_plotly_html(
             "modeBarButtonsToRemove": ["lasso2d", "select2d"],
         },
     )
-    html_fragment = html_fragment.replace("<div>", "<div id='plot-host' style='width:100%;height:100%;min-height:100%;'>", 1)
+    html_fragment = (
+        "<div id='plot-host' style='width:100%;height:100%;min-height:100%;'>"
+        f"{html_fragment}"
+        "</div>"
+    )
     graph_id_match = re.search(r'<div id="([^"]+)" class="plotly-graph-div"', html_fragment)
     graph_id = graph_id_match.group(1) if graph_id_match else ""
     resize_script = ""
